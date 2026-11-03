@@ -30,6 +30,7 @@ OAuth 客户端注册对应关系：
 """
 
 import os
+import re
 import subprocess
 import logging
 import datetime
@@ -38,10 +39,15 @@ import hashlib
 import base64
 import html
 import time
+import threading
 import urllib.parse
 from pathlib import Path
 
 from fastmcp import FastMCP
+try:  # fastmcp 4.x 的 Image 位于 utilities.types
+    from fastmcp.utilities.types import Image
+except ImportError:  # pragma: no cover
+    from fastmcp import Image
 from starlette.middleware import Middleware
 from starlette.responses import (
     JSONResponse,
@@ -73,6 +79,9 @@ PORT = int(os.environ.get("MCP_PORT", "8765"))
 BIND = os.environ.get("MCP_BIND", "127.0.0.1")
 WORKDIR = os.environ.get("MCP_WORKDIR", "/workspace")
 ALLOWED_PREFIXES = [p for p in os.environ.get("MCP_ALLOWED_PREFIXES", "").split("|") if p]
+# 危险命令黑名单（追加到毁灭级硬禁止）与自定义需确认规则（追加到破坏性），均可由环境变量覆盖
+DENY_PREFIXES = [p for p in os.environ.get("MCP_DENY_PREFIXES", "").replace(",", "|").split("|") if p]
+REQUIRE_CONFIRM = [p for p in os.environ.get("MCP_REQUIRE_CONFIRM", "").replace(",", "|").split("|") if p]
 
 logging.basicConfig(
     filename=str(CONFIG_DIR / "audit.log"),
@@ -270,8 +279,75 @@ async def token_endpoint(request):
 mcp = FastMCP("cnb-command-gateway")
 
 
-def _exec(command: str, cwd: str = WORKDIR, timeout: int = 60) -> str:
-    """实际执行 shell 命令（含白名单与审计），MCP 工具与 REST 共用。"""
+# ---------------------------------------------------------------------------
+# 命令分类与权限（默认全开放 + 破坏性确认门 + 危险黑名单安全网）
+# ---------------------------------------------------------------------------
+
+def _normalize(cmd: str) -> str:
+    """归一化命令：去首尾空白、折叠空白、去掉 sudo 前缀，降低绕过风险。"""
+    c = cmd.strip()
+    c = re.sub(r"\s+", " ", c)
+    c = re.sub(r"^sudo\s+", "", c, flags=re.IGNORECASE)
+    return c
+
+
+# 毁灭级：硬禁止，即便 confirm=True 也拒绝（防自杀安全网）
+CATASTROPHIC_PATTERNS = [
+    r"^rm\s+-rf\s+/\s*($|\*|;)",            # rm -rf / 及其 */; 变体
+    r"^rm\s+-rf\s+/\.\s*($|;)",             # rm -rf /.
+    r"\bmkfs\.",
+    r"\b(shutdown|halt|reboot|poweroff)\b",
+    r"dd\b.*\bof=/dev/",
+    r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;",
+    r">\s*/dev/sd",
+    r"chmod\s+-R\s+.*\s+/\s*$",             # chmod -R ... /（根目录）
+]
+# 可恢复/可逆的破坏性指令：需 confirm=True 才执行
+DESTRUCTIVE_PATTERNS = [
+    r"rm\s+-rf?\b",
+    r"rm\s+-r\b",
+    r"git\s+reset\s+--hard",
+    r"git\s+clean\s+-[a-z]*f",
+    r"docker\s+rmi?\s+-f?\b",
+    r"\bchmod\s+-R\b",
+    r"\bchown\s+-R\b",
+    r"\bmv\b.*\s/(bin|etc|usr|lib|sbin|boot)\b",
+    r"git\s+push\s+(-f|--force)\b",
+    r"\b(drop|truncate)\s+table\b",
+    r":>\s*/",
+]
+
+
+def _classify(cmd: str) -> str:
+    """返回 'catastrophic' | 'destructive' | 'normal'。catastrophic 优先级最高。"""
+    n = _normalize(cmd)
+    for pat in CATASTROPHIC_PATTERNS + DENY_PREFIXES:
+        if re.search(pat, n):
+            return "catastrophic"
+    for pat in DESTRUCTIVE_PATTERNS + REQUIRE_CONFIRM:
+        if re.search(pat, n):
+            return "destructive"
+    return "normal"
+
+
+def _exec(command: str, cwd: str = WORKDIR, timeout: int = 60, confirm: bool = False) -> str:
+    """实际执行 shell 命令（含分类权限控制、白名单与审计），MCP 工具与 REST 共用。
+
+    权限三态：
+      - catastrophic：硬禁止（防自杀安全网），即便 confirm=True 也拒绝。
+      - destructive：需 confirm=True 才放行，否则返回「需确认」且不执行。
+      - normal（或 destructive 且已确认）：走原执行/白名单逻辑。
+    """
+    kind = _classify(command)
+    if kind == "catastrophic":
+        audit(f"DENIED(catastrophic) cmd={command!r}")
+        return ("ERROR: 这是毁灭级危险指令，已被安全网硬禁止（即便确认也不执行）："
+                f"\n  {command}\n如需此操作，请在宿主机手动执行。")
+    if kind == "destructive" and not confirm:
+        audit(f"NEED_CONFIRM cmd={command!r}")
+        return ("⚠️ 这是破坏性指令，执行前需明确确认。请带上 confirm=true 重新调用本工具，"
+                "例如 run_command(command=..., confirm=true)。\n"
+                f"  待确认命令：{command}")
     if ALLOWED_PREFIXES:
         if not any(command.strip().startswith(p) for p in ALLOWED_PREFIXES):
             audit(f"DENIED(prefix) cmd={command!r}")
@@ -301,18 +377,166 @@ def _exec(command: str, cwd: str = WORKDIR, timeout: int = 60) -> str:
 
 
 @mcp.tool()
-def run_command(command: str, cwd: str = WORKDIR, timeout: int = 60) -> str:
-    """在 CNB 服务器上执行一条 shell 命令。
+def run_command(command: str, cwd: str = WORKDIR, timeout: int = 60, confirm: bool = False) -> str:
+    """在服务器上执行一条 shell 命令。
 
     Args:
-        command: 要执行的 shell 命令（经 OAuth/token 鉴权后执行，当前为 root）。
+        command: 要执行的 shell 命令（经 token 鉴权后执行）。
         cwd: 工作目录，默认 /workspace。
         timeout: 超时秒数，默认 60。
+        confirm: 对破坏性指令（如 rm -rf、git reset --hard、docker rm -f 等）
+                 必须设为 true 才放行；毁灭级指令（rm -rf /、mkfs、shutdown 等）
+                 即便 confirm=true 也会被安全网硬禁止。
 
     Returns:
-        命令的退出码、stdout、stderr 拼接文本。
+        命令的退出码、stdout、stderr 拼接文本；或被拒绝/需确认提示。
     """
-    return _exec(command, cwd, timeout)
+    return _exec(command, cwd, timeout, confirm)
+
+
+# ---------------------------------------------------------------------------
+# 后台长任务执行（让 agent 能跑长时间训练/推理，不被同步超时掐断）
+# ---------------------------------------------------------------------------
+
+_TASKS: dict = {}
+_TASK_LOCK = threading.Lock()
+_TASK_DIR = Path("/tmp/mcp_tasks")
+_TASK_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _task_watchdog(task_id: str, timeout: int):
+    time.sleep(timeout)
+    with _TASK_LOCK:
+        rec = _TASKS.get(task_id)
+        if rec and rec["proc"].poll() is None:
+            rec["proc"].terminate()
+            rec["status"] = "killed-timeout"
+            audit(f"TASK_TIMEOUT task_id={task_id}")
+
+
+@mcp.tool()
+def run_command_background(command: str, cwd: str = WORKDIR, confirm: bool = False, timeout: int = 0) -> str:
+    """后台执行一条 shell 命令（不阻塞），返回 task_id 用于后续查询/停止。
+
+    适用于长耗时任务（训练、推理、数据处理）。权限规则同 run_command：
+    毁灭级指令被安全网硬禁止；破坏性指令需 confirm=true。
+
+    Args:
+        command: 要执行的 shell 命令。
+        cwd: 工作目录，默认 /workspace。
+        confirm: 破坏性指令需设为 true。
+        timeout: 可选超时秒数，>0 时到时自动终止该任务。
+
+    Returns:
+        包含 task_id 的提示文本。
+    """
+    kind = _classify(command)
+    if kind == "catastrophic":
+        audit(f"BG DENIED(catastrophic) cmd={command!r}")
+        return f"ERROR: 毁灭级危险指令，已被安全网硬禁止：{command}"
+    if kind == "destructive" and not confirm:
+        audit(f"BG NEED_CONFIRM cmd={command!r}")
+        return ("⚠️ 破坏性指令，后台执行前需确认。请带 confirm=true 重新调用："
+                f"run_command_background(command=..., confirm=true)。\n  命令：{command}")
+    try:
+        task_id = secrets.token_hex(8)
+        log_path = _TASK_DIR / f"{task_id}.log"
+        logf = open(log_path, "wb")
+        proc = subprocess.Popen(
+            command, shell=True, cwd=cwd, stdout=logf, stderr=subprocess.STDOUT,
+        )
+        with _TASK_LOCK:
+            _TASKS[task_id] = {
+                "proc": proc, "log": log_path, "cwd": cwd,
+                "cmd": command, "start": time.time(), "timeout": timeout,
+                "status": "running",
+            }
+        if timeout and timeout > 0:
+            threading.Thread(target=_task_watchdog, args=(task_id, timeout), daemon=True).start()
+        audit(f"BG START task_id={task_id} cmd={command!r}")
+        return (f"OK: 后台任务已启动。\n  task_id={task_id}\n"
+                f"  查询状态: get_task_status(task_id=\"{task_id}\")\n"
+                f"  取输出: get_task_output(task_id=\"{task_id}\")\n"
+                f"  停止: stop_task(task_id=\"{task_id}\")")
+    except Exception as e:
+        audit(f"BG ERR cmd={command!r} exc={e!r}")
+        return f"ERROR: {e}"
+
+
+def _read_log(log_path: Path, tail: int, offset: int) -> str:
+    try:
+        lines = log_path.read_text(errors="replace").splitlines()
+    except Exception:
+        return "(无输出或日志不可读)"
+    if offset:
+        lines = lines[offset:]
+    if tail:
+        lines = lines[-tail:]
+    return "\n".join(lines) if lines else "(暂无任何输出)"
+
+
+@mcp.tool()
+def get_task_status(task_id: str) -> str:
+    """查询后台任务状态（running / done / killed-timeout / killed / not-found）。"""
+    with _TASK_LOCK:
+        rec = _TASKS.get(task_id)
+        if not rec:
+            return f"ERROR: 找不到任务 {task_id}（可能已过期或容器重启过）。"
+        proc = rec["proc"]
+        rc = proc.poll()
+        if rc is None:
+            status = "running"
+        else:
+            status = rec.get("status", "done")
+            if status == "running":
+                status = "done"
+    audit(f"TASK_STATUS task_id={task_id} status={status}")
+    return (f"task_id={task_id}\nstatus={status}\n"
+            f"exit_code={rc}\ncmd={rec['cmd']}\nlog={rec['log']}")
+
+
+@mcp.tool()
+def get_task_output(task_id: str, tail: int = 50, offset: int = 0) -> str:
+    """读取后台任务的输出。
+
+    Args:
+        task_id: 任务 ID。
+        tail: 仅返回最后 N 行（默认 50）；设为 0 则返回从 offset 起的完整输出。
+        offset: 起始行偏移（与 tail 互斥，tail>0 时忽略 offset）。
+
+    Returns:
+        任务输出文本。
+    """
+    with _TASK_LOCK:
+        rec = _TASKS.get(task_id)
+        if not rec:
+            return f"ERROR: 找不到任务 {task_id}。"
+        log_path = rec["log"]
+    out = _read_log(log_path, tail, offset)
+    audit(f"TASK_OUTPUT task_id={task_id} tail={tail} offset={offset}")
+    return out
+
+
+@mcp.tool()
+def tail_task(task_id: str, n: int = 50) -> str:
+    """语义化跟随后台任务输出（返回最后 n 行）。"""
+    return get_task_output(task_id, tail=n, offset=0)
+
+
+@mcp.tool()
+def stop_task(task_id: str) -> str:
+    """终止一个后台任务。"""
+    with _TASK_LOCK:
+        rec = _TASKS.get(task_id)
+        if not rec:
+            return f"ERROR: 找不到任务 {task_id}。"
+        proc = rec["proc"]
+        if proc.poll() is None:
+            proc.terminate()
+            rec["status"] = "killed"
+            audit(f"TASK STOP task_id={task_id}")
+            return f"OK: 已发送 TERM 信号终止任务 {task_id}。"
+    return f"任务 {task_id} 已结束（exit={proc.poll()}），无需停止。"
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +729,9 @@ def kill_process(pid: int = 0, name: str = "") -> str:
         操作结果。
     """
     try:
+        if pid == 1 or (name and name in ("init", "systemd")):
+            audit(f"KILL DENIED pid={pid} name={name} (protected)")
+            return "ERROR: 禁止终止 PID 1 / init / systemd（防自杀安全网）。"
         if pid:
             subprocess.run(["kill", "-TERM", str(pid)], check=True,
                            capture_output=True, text=True, timeout=10)
@@ -555,6 +782,45 @@ def get_environment_variables() -> str:
         lines.append(f"{k}={v}")
     audit("ENV_DUMP")
     return "\n".join(lines)
+
+
+@mcp.tool()
+def read_image(path: str, max_dim: int = 1024):
+    """读取图片文件并以图像形式返回，使多模态 agent 能直接「看见」图片（如实验结果图、报错截图）。
+
+    Args:
+        path: 图片文件路径（png/jpg/jpeg/gif/bmp/webp/tiff 等）。
+        max_dim: 最长边像素上限，默认 1024；超出则等比缩放以控制 token 成本。
+
+    Returns:
+        fastmcp.Image 对象（客户端渲染为图片）；非图片或读取失败返回错误文本。
+    """
+    try:
+        p = Path(path).expanduser()
+        if not p.exists():
+            return f"ERROR: 文件不存在: {path}"
+        if p.is_dir():
+            return f"ERROR: 这是目录: {path}"
+        suffix = p.suffix.lower().lstrip(".")
+        PIL_TYPES = {"png", "jpg", "jpeg", "gif", "bmp", "webp", "tiff"}
+        if suffix and suffix not in PIL_TYPES:
+            return f"ERROR: 不支持的图片类型: .{suffix}（支持 {sorted(PIL_TYPES)}）"
+        from PIL import Image as PILImage
+        import io as _io
+        with PILImage.open(p) as im:
+            im = im.convert("RGB")
+            if max_dim and max(im.size) > max_dim:
+                scale = max_dim / max(im.size)
+                im = im.resize((int(im.size[0] * scale), int(im.size[1] * scale)))
+            buf = _io.BytesIO()
+            fmt = "PNG" if suffix not in ("jpg", "jpeg") else "JPEG"
+            im.save(buf, format=fmt)
+            data = buf.getvalue()
+        audit(f"READ_IMAGE file={path} bytes={len(data)}")
+        return Image(data=data, format=fmt.lower())
+    except Exception as e:
+        audit(f"READ_IMAGE ERR {path} {e!r}")
+        return f"ERROR: 读取图片失败: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -628,11 +894,12 @@ async def run_command_rest(request):
         return JSONResponse({"output": "ERROR: 请求体必须是 JSON"}, status_code=400)
     command = str(body.get("command", ""))
     cwd = str(body.get("cwd", WORKDIR))
+    confirm = bool(body.get("confirm", False))
     try:
         timeout = int(body.get("timeout", 60))
     except Exception:  # noqa: BLE001
         timeout = 60
-    return JSONResponse({"output": _exec(command, cwd, timeout)})
+    return JSONResponse({"output": _exec(command, cwd, timeout, confirm)})
 
 
 async def plugin_manifest(request):

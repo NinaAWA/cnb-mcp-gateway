@@ -12,7 +12,7 @@ docker rm -f cnb-mcp-gateway 2>/dev/null || true
 
 docker run -d --name cnb-mcp-gateway --restart unless-stopped \
   -e MCP_TOKEN="${MCP_TOKEN:-}" \
-  -e MCP_ALLOWED_PREFIXES="${MCP_ALLOWED_PREFIXES:-git status|ls|python3 /workspace}" \
+  -e MCP_ALLOWED_PREFIXES="${MCP_ALLOWED_PREFIXES:-}" \
   -e CF_TUNNEL_TOKEN="${CF_TUNNEL_TOKEN:-}" \
   -e MCP_WORKDIR="${MCP_WORKDIR:-/workspace}" \
   -v "${MCP_WORKDIR_MOUNT:-$PWD}:/workspace" \

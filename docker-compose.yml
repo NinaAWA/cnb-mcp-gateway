@@ -6,7 +6,7 @@ services:
     restart: unless-stopped
     environment:
       - MCP_TOKEN=${MCP_TOKEN:-}
-      - MCP_ALLOWED_PREFIXES=${MCP_ALLOWED_PREFIXES:-git status|ls|python3 /workspace}
+      - MCP_ALLOWED_PREFIXES=${MCP_ALLOWED_PREFIXES:-}
       - CF_TUNNEL_TOKEN=${CF_TUNNEL_TOKEN:-}
       - MCP_WORKDIR=/workspace
     volumes:
