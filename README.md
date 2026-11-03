@@ -1,5 +1,7 @@
 # CNB MCP Gateway
 
+> 📖 English | [中文文档](./README.zh-CN.md)
+
 A self-hosted **MCP (Model Context Protocol) server** that exposes a single,
 sandboxed tool — `run_command` — on your own machine/server, reachable by **any**
 MCP client (Claude Desktop, Cursor, VS Code, Codex, ChatGPT connectors, or your
