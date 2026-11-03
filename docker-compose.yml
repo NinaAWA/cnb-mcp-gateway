@@ -1,0 +1,15 @@
+services:
+  mcp-gateway:
+    # 把 <your-github-username> 换成你的 GitHub 用户名（或改成本地 build 的镜像名）
+    image: ghcr.io/NinaAWA/cnb-mcp-gateway:latest
+    container_name: cnb-mcp-gateway
+    restart: unless-stopped
+    environment:
+      - MCP_TOKEN=${MCP_TOKEN:-}
+      - MCP_ALLOWED_PREFIXES=${MCP_ALLOWED_PREFIXES:-git status|ls|python3 /workspace}
+      - CF_TUNNEL_TOKEN=${CF_TUNNEL_TOKEN:-}
+      - MCP_WORKDIR=/workspace
+    volumes:
+      # 把当前目录挂进容器的 /workspace，run_command 就能在你的代码目录里执行
+      - ./workspace:/workspace
+    # 无需暴露宿主机端口：cloudflared 隧道负责公网入口

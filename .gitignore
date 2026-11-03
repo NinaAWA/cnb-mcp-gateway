@@ -1,0 +1,12 @@
+# 生成的产物，勿提交
+*.zip
+plugin-package/
+plugins/
+marketplace.json
+
+# 运行期敏感/临时文件
+.env
+audit*.log
+tunnel.out
+__pycache__/
+*.pyc
