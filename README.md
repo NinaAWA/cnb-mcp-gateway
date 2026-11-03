@@ -25,7 +25,13 @@ with a token gate, an optional command-prefix allow-list, and a full audit log.
   - **OAuth 2.1 (PKCE + DCR)** for clients that only support OAuth (e.g. ChatGPT
     connectors). `redirect_uri` accepts any valid absolute URI (`https://`,
     `http://`, custom schemes) so non-ChatGPT agents are not blocked.
-- **One tool**: `run_command { "command": "echo hi" }` → `{ "exit_code", "stdout", "stderr" }`.
+- **Remote-control toolkit** (inspired by Remote Desktop Commander, adapted to Linux):
+  - `run_command` — execute a shell command (the original tool).
+  - `list_directory` / `read_file` / `write_file` — browse & edit the filesystem.
+  - `search_files` / `grep_content` — find files by name or search their contents.
+  - `list_processes` / `kill_process` — inspect and terminate processes.
+  - `get_system_info` — kernel, uptime, CPU, memory, disk.
+  - `get_environment_variables` — current env (secret values masked).
 - **Sandbox knobs**: `MCP_ALLOWED_PREFIXES` allow-list, working dir, audit log.
 - **Zero config ingress**: cloudflared quick tunnel gives you a public HTTPS URL
   automatically (URL rotates each restart; set `CF_TUNNEL_TOKEN` for a fixed URL).

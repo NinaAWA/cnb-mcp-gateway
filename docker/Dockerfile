@@ -3,7 +3,7 @@ FROM python:3.12-slim
 WORKDIR /app
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl ca-certificates \
+ && apt-get install -y --no-install-recommends curl ca-certificates procps \
  && rm -rf /var/lib/apt/lists/*
 
 # cloudflared（固定版本，保证构建可复现）

@@ -1,7 +1,9 @@
 """
 CNB Command MCP Gateway（OAuth 版，通用 MCP）
 ============================================
-把当前 CNB 服务器暴露成 MCP server，唯一工具 `run_command`。
+把当前服务器暴露成 MCP server，提供一组远程系统管理工具
+（run_command、文件读写/检索、进程列表与结束、系统信息、环境变量等），
+灵感来自 Remote Desktop Commander，但适配 Linux 云服务器。
 面向所有 MCP 客户端（ChatGPT、Claude、Cursor、VS Code、Codex、各类 agent）。
 
 两种接入方式：
@@ -311,6 +313,248 @@ def run_command(command: str, cwd: str = WORKDIR, timeout: int = 60) -> str:
         命令的退出码、stdout、stderr 拼接文本。
     """
     return _exec(command, cwd, timeout)
+
+
+# ---------------------------------------------------------------------------
+# 系统管理工具集（参考 Remote Desktop Commander，适配 Linux 服务器）
+# 这些是结构化的“窄接口”，不经由 run_command 的白名单，但全部写审计日志；
+# 危险操作（写文件、杀进程）均记录参数便于追溯。容器即“远程机器”，工具作用于容器内。
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def list_directory(path: str = WORKDIR) -> str:
+    """列出目录内容（类型 + 大小 + 名称）。
+
+    Args:
+        path: 目录路径，默认 /workspace。
+
+    Returns:
+        每行一个条目，例如 'd      4096 logs' 或 'f      1234 app.py'。
+    """
+    try:
+        p = Path(path).expanduser()
+        if not p.exists():
+            return f"ERROR: 路径不存在: {path}"
+        if p.is_file():
+            return f"(这是文件，不是目录) {path}"
+        rows = []
+        for e in sorted(p.iterdir()):
+            try:
+                st = e.stat()
+                t = "d" if e.is_dir() else ("l" if e.is_symlink() else "f")
+                rows.append(f"{t} {st.st_size:>10} {e.name}")
+            except Exception:
+                rows.append(f"? ? {e.name}")
+        audit(f"LIST dir={path}")
+        return "\n".join(rows) if rows else "(空目录)"
+    except Exception as e:
+        audit(f"LIST ERR {path} {e!r}")
+        return f"ERROR: {e}"
+
+
+@mcp.tool()
+def read_file(path: str, max_bytes: int = 50000) -> str:
+    """读取文本文件内容（过大自动截断）。
+
+    Args:
+        path: 文件路径。
+        max_bytes: 最多读取字节数，默认 50000。
+
+    Returns:
+        文件文本内容；超长则截断并提示原大小。
+    """
+    try:
+        p = Path(path).expanduser()
+        if not p.exists():
+            return f"ERROR: 文件不存在: {path}"
+        if p.is_dir():
+            return f"ERROR: 这是目录: {path}"
+        size = p.stat().st_size
+        data = p.read_text(errors="replace")
+        if len(data.encode()) > max_bytes:
+            data = data[:max_bytes] + f"\n...[已截断，原文件 {size} 字节，仅显示前 {max_bytes} 字节]"
+        audit(f"READ file={path} bytes={size}")
+        return data
+    except Exception as e:
+        audit(f"READ ERR {path} {e!r}")
+        return f"ERROR: {e}"
+
+
+@mcp.tool()
+def write_file(path: str, content: str, append: bool = False) -> str:
+    """写入或创建文本文件（覆盖或追加）。
+
+    Args:
+        path: 目标文件路径。
+        content: 要写入的文本。
+        append: True 则追加到末尾，False（默认）则覆盖。
+
+    Returns:
+        写入结果摘要。
+    """
+    try:
+        p = Path(path).expanduser()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        mode = "追加" if append else "覆盖"
+        if append:
+            with p.open("a") as f:
+                f.write(content)
+        else:
+            p.write_text(content)
+        audit(f"WRITE file={path} mode={mode} len={len(content)}")
+        return f"OK: 已{mode}写入 {path}（{len(content)} 字节）"
+    except Exception as e:
+        audit(f"WRITE ERR {path} {e!r}")
+        return f"ERROR: {e}"
+
+
+@mcp.tool()
+def search_files(pattern: str, path: str = WORKDIR, max_results: int = 50) -> str:
+    """按文件名通配符递归查找文件（类似 find）。
+
+    Args:
+        pattern: 文件名 glob，如 '*.py' 或 'config*'。
+        path: 搜索根目录，默认 /workspace。
+        max_results: 最多返回条数，默认 50。
+
+    Returns:
+        匹配的文件路径列表。
+    """
+    try:
+        base = Path(path).expanduser()
+        hits = []
+        for p in base.rglob(pattern):
+            if p.is_file():
+                hits.append(str(p))
+            if len(hits) >= max_results:
+                break
+        audit(f"SEARCH name={pattern} in={path} hits={len(hits)}")
+        return "\n".join(hits) if hits else "(无匹配)"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp.tool()
+def grep_content(pattern: str, path: str = WORKDIR, max_matches: int = 50) -> str:
+    """递归搜索文件内容（类似 grep -rn）。
+
+    Args:
+        pattern: 子串或正则。
+        path: 搜索根目录，默认 /workspace。
+        max_matches: 最多返回匹配行数，默认 50。
+
+    Returns:
+        匹配行（含文件路径）。
+    """
+    import re as _re
+    try:
+        base = Path(path).expanduser()
+        out = []
+        for f in base.rglob("*"):
+            if not f.is_file():
+                continue
+            try:
+                text = f.read_text(errors="ignore")
+            except Exception:
+                continue
+            for ln in text.splitlines():
+                hit = False
+                try:
+                    if _re.search(pattern, ln):
+                        hit = True
+                except _re.error:
+                    if pattern in ln:
+                        hit = True
+                if hit:
+                    out.append(f"{f}: {ln}")
+                    if len(out) >= max_matches:
+                        break
+            if len(out) >= max_matches:
+                break
+        audit(f"GREP pattern={pattern} in={path} hits={len(out)}")
+        return "\n".join(out) if out else "(无匹配)"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp.tool()
+def list_processes() -> str:
+    """列出运行中的进程（pid, user, cpu%, mem%, cmd），按 CPU 降序取前 40。"""
+    try:
+        res = subprocess.run(
+            ["ps", "-eo", "pid,user,pcpu,pmem,comm", "--sort=-pcpu"],
+            capture_output=True, text=True, timeout=15,
+        )
+        lines = (res.stdout or "").splitlines()[:41]
+        audit("LIST_PROCESSES")
+        return "\n".join(lines) if lines else "(无进程信息)"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp.tool()
+def kill_process(pid: int = 0, name: str = "") -> str:
+    """终止进程（提供 pid 或 name 其一）。
+
+    Args:
+        pid: 进程号。
+        name: 进程名（精确匹配 comm，终止所有匹配项）。
+
+    Returns:
+        操作结果。
+    """
+    try:
+        if pid:
+            subprocess.run(["kill", "-TERM", str(pid)], check=True,
+                           capture_output=True, text=True, timeout=10)
+            audit(f"KILL pid={pid}")
+            return f"OK: 已发送 TERM 信号给 pid={pid}"
+        if name:
+            res = subprocess.run(["pkill", "-TERM", "-x", name],
+                                 capture_output=True, text=True, timeout=10)
+            audit(f"KILL name={name} rc={res.returncode}")
+            return (f"OK: pkill -x {name} 返回 {res.returncode}（0=已信号）"
+                    if res.returncode == 0 else f"未找到匹配 '{name}' 的进程")
+        return "ERROR: 请提供 pid 或 name"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp.tool()
+def get_system_info() -> str:
+    """返回服务器系统信息：内核、运行时间、CPU、内存、磁盘。"""
+    try:
+        lines = []
+        uname = subprocess.run(["uname", "-a"], capture_output=True, text=True).stdout.strip()
+        lines.append(f"uname: {uname}")
+        up = subprocess.run(["uptime"], capture_output=True, text=True).stdout.strip()
+        lines.append(f"uptime: {up}")
+        cpu = subprocess.run(["nproc"], capture_output=True, text=True).stdout.strip()
+        lines.append(f"cpu_cores: {cpu}")
+        mem = subprocess.run(["free", "-h"], capture_output=True, text=True).stdout.strip()
+        lines.append("memory:\n" + mem)
+        disk = subprocess.run(["df", "-h", "/"], capture_output=True, text=True).stdout.strip()
+        lines.append("disk /:\n" + disk)
+        audit("SYSINFO")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+_SECRET_KEYS = ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "KEY", "PRIVATE")
+
+
+@mcp.tool()
+def get_environment_variables() -> str:
+    """返回当前进程的环境变量（密钥类值会被隐藏）。"""
+    lines = []
+    for k, v in sorted(os.environ.items()):
+        if any(s in k.upper() for s in _SECRET_KEYS):
+            v = "***(已隐藏)***"
+        lines.append(f"{k}={v}")
+    audit("ENV_DUMP")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
