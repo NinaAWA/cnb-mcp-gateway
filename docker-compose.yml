@@ -1,7 +1,7 @@
 services:
   mcp-gateway:
     # 把 <your-github-username> 换成你的 GitHub 用户名（或改成本地 build 的镜像名）
-    image: ghcr.io/NinaAWA/cnb-mcp-gateway:latest
+    image: ghcr.io/ninaawa/cnb-mcp-gateway:latest
     container_name: cnb-mcp-gateway
     restart: unless-stopped
     environment:

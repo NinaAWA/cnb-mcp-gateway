@@ -41,7 +41,7 @@ with a token gate, an optional command-prefix allow-list, and a full audit log.
 docker run -d --name cnb-mcp-gateway --restart unless-stopped \
   -e MCP_ALLOWED_PREFIXES="git status|ls|python3 /workspace" \
   -v "$PWD:/workspace" \
-  ghcr.io/NinaAWA/cnb-mcp-gateway:latest
+  ghcr.io/ninaawa/cnb-mcp-gateway:latest
 
 docker logs -f cnb-mcp-gateway   # prints BASE_URL, /mcp, openapi, MCP_TOKEN
 ```
