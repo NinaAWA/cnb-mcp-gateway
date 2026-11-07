@@ -182,14 +182,22 @@
 （该文件在接手前已存在，仅覆盖 `cnb.cool`，本次不写入、不修改）；
 两个 remote URL 均为无凭据的纯 HTTPS 地址。
 
-### 7.3 交付回填
+### 7.3 交付回填（真实执行结果）
 
-> 本节在提交与双远端推送完成后回填；若推送未完成，保留「未执行」标注，不声称成功。
-
-- 规范提交：见回填
-- 功能分支 PR：见回填
-- `origin` / `github` 双远端推送：见回填
-- 推送后文件哈希复核：见回填
+- **规范提交**：功能分支 `upgrade/v3-full-admin-research` 上提交
+  `592eafa1ed49720a39b03edd5be14ea6c1c49794`
+  (`feat(v3): 升级为全权限科研服务器并完成 A–F 验收`)，74 文件 / +10,789 / -357；
+  本节回填另有一个纯文档提交。未改写 `main` 与历史，未强推。
+- **功能分支 PR**：CNB [PR #1](https://cnb.cool/webgamer-2026/cnb-mcp-gateway/-/pulls/1)
+  `main <- upgrade/v3-full-admin-research`，state=open，**未合并**；`cnb pulls get` 返回 200。
+- **`origin` 推送**：已执行，`* [new branch] HEAD -> upgrade/v3-full-admin-research`。
+- **`github` 推送**：已执行，同一分支推送到
+  `https://github.com/NinaAWA/cnb-mcp-gateway.git`（纯 HTTPS remote URL，不含凭据）。
+- **凭据使用**：两枚明文 PAT 仅在单次 Python 进程内存中作为 `credential.helper` 输出，
+  未进入 argv / `.git/config` / `.git/.git-credentials` / remote URL / 任何仓库文件；
+  使用前视为已泄露，**请在使用后立即吊销并轮换**。
+- **哈希复核**：推送前后 `.git/config` 与 `.git/.git-credentials` 的 SHA-256 与 7.2 基线
+  **完全一致**（脚本内断言校验），两个 remote URL 仍为无凭据的纯 HTTPS 地址。
 
 ---
 
