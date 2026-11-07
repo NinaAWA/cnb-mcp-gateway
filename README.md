@@ -2,13 +2,14 @@
 
 > 📖 English | [中文文档](./README.zh-CN.md)
 
-A self-hosted **MCP (Model Context Protocol) server** that exposes a single,
-sandboxed tool — `run_command` — on your own machine/server, reachable by **any**
-MCP client (Claude Desktop, Cursor, VS Code, Codex, ChatGPT connectors, or your
-own agents) over the public internet via a Cloudflare quick tunnel.
+A self-hosted **MCP (Model Context Protocol) server** that exposes a controlled
+toolkit — shell commands, files, processes, images, plus web and academic paper
+search — on your own machine/server, reachable by **any** MCP client (Claude
+Desktop, Cursor, VS Code, Codex, ChatGPT connectors, or your own agents) over
+the public internet via a Cloudflare quick tunnel.
 
 ```
- your server  ──►  run_command (bash, sandboxed)   ◄──  any MCP client
+ your server  ──►  commands / files / processes / images / web & paper search  ◄──  any MCP client
    │
    └─ cloudflared quick tunnel (random https URL) ◄── auth: Bearer token / OAuth2 PKCE
 ```
@@ -16,8 +17,9 @@ own agents) over the public internet via a Cloudflare quick tunnel.
 ## Why
 
 You want to let an AI agent run commands **on your server** from anywhere, but
-you don't want to hand out an open shell. This gateway exposes exactly one tool
-with a token gate, an optional command-prefix allow-list, and a full audit log.
+you don't want to hand out an open shell. This gateway exposes a controlled
+toolkit with a token gate, an optional command-prefix allow-list, and a full
+audit log.
 
 ## Features
 
@@ -39,6 +41,17 @@ with a token gate, an optional command-prefix allow-list, and a full audit log.
   - `read_image` — return an image (plots, screenshots) so a multimodal agent can **see** it.
   - `get_system_info` — kernel, uptime, CPU, memory, disk.
   - `get_environment_variables` — current env (secret values masked).
+- **Web & paper search (zero API key)** — see the
+  [free/open-source source survey](./docs/search-sources-research.md):
+  - `search_papers` — aggregate OpenAlex, arXiv, CrossRef, PubMed and Europe PMC
+    (plus optional OpenReview / dblp / Semantic Scholar); results are interleaved
+    across sources with DOI, citations, abstract and open-access links.
+  - `search_arxiv` / `get_paper` — field-specific arXiv queries and single-paper
+    lookup by DOI / arXiv ID / PMID.
+  - `search_web` — pluggable providers, default Hacker News + StackExchange
+    (no key); optional GitHub, self-hosted SearXNG, Tavily.
+  - `read_web_page` — optional HTTPS page text extraction with SSRF guards
+    (disabled by default).
 - **Safety model**: default open (no allow-list) + a **confirm gate** for destructive
   commands + a **catastrophic blacklist** (e.g. `rm -rf /`, `mkfs`, `shutdown`) that
   can't be bypassed even with confirmation. Full audit log of every action.
@@ -122,6 +135,19 @@ Example `claude_desktop_config.json`:
 | `CF_TUNNEL_TOKEN` | (empty → quick tunnel) | Named Cloudflare tunnel token → **fixed URL**. |
 | `MCP_WORKDIR` | `/workspace` | Working directory for executed commands (auto-created). |
 | `MCP_WORKDIR_MOUNT` | (unset) | Host path mounted into the container at `/workspace`. |
+| `MCP_SEARCH_TIMEOUT` | `10` | Per-request timeout in seconds. |
+| `MCP_SEARCH_MAX_RESULTS` | `8` | Max results per source / provider (final output ≤ 30). |
+| `MCP_SEARCH_MAX_BYTES` | `2000000` | Max response body size in bytes. |
+| `MCP_SEARCH_RETRIES` | `1` | Retries on 429 / 5xx / network errors with exponential backoff. |
+| `MCP_SEARCH_CACHE_TTL` | `300` | In-memory GET cache TTL in seconds (`0` disables). |
+| `MCP_SEARCH_ARXIV_MIN_INTERVAL` | `3` | Minimum arXiv request interval in seconds. |
+| `MCP_SEARCH_MAILTO` | (empty) | Polite-pool email (OpenAlex / CrossRef / NCBI / Unpaywall); masked in env dumps. |
+| `MCP_SEARCH_WEB_PROVIDERS` | `hn,stackexchange` | Default `search_web` providers (comma-separated). |
+| `MCP_SEARCH_SEARXNG_URL` | (empty) | Base URL of a self-hosted SearXNG; enables the `searxng` provider. |
+| `MCP_SEARCH_TAVILY_KEY` | (empty) | Optional Tavily key (free tier); masked in env dumps. |
+| `MCP_SEARCH_FETCH_ENABLED` | `0` | Set to `1` to enable `read_web_page`. |
+| `MCP_SEARCH_FETCH_MAX_CHARS` | `8000` | Max extracted page text length. |
+| `MCP_SEARCH_FETCH_ALLOW_HOSTS` | (empty) | Optional comma-separated host allow-list for page fetching. |
 
 ## Tools reference
 
@@ -135,6 +161,26 @@ Example `claude_desktop_config.json`:
 | `search_files` / `grep_content` | Find files / search contents | — |
 | `list_processes` / `kill_process` | Processes (PID 1 protected) | — |
 | `get_system_info` / `get_environment_variables` | Host info / env (secrets masked) | — |
+| `search_papers` | Search papers across open sources | Zero key; `sources=...`, `from_year`, `sort=date`. |
+| `search_arxiv` | arXiv field search | `author`, `category`, `from_year`, PDF links. |
+| `get_paper` | Look up one paper | By `doi` / `arxiv_id` / `pmid`; Unpaywall OA link needs `MCP_SEARCH_MAILTO`. |
+| `search_web` | Web / tech-community search | Default HN + StackExchange; optional GitHub / SearXNG / Tavily. |
+| `read_web_page` | Extract page text | Off by default (`MCP_SEARCH_FETCH_ENABLED=1`); HTTPS + SSRF guards. |
+
+### Search examples
+
+```text
+search_papers(query="retrieval augmented generation", sources="openalex,arxiv,crossref", max_results=5, from_year=2024)
+search_arxiv(query="diffusion model", category="cs.CV", from_year=2025)
+get_paper(doi="10.1038/nature12373")
+search_web(query="model context protocol", providers="hn,stackexchange", max_results=5)
+read_web_page(url="https://example.com/article")
+```
+
+Default paper sources need no credentials. `search_web` defaults to vertical
+community search rather than a general web index; see the
+[survey](./docs/search-sources-research.md) for trade-offs and optional providers.
+Every result is labelled as untrusted external content in the tool output.
 
 ## Security notes
 
@@ -143,7 +189,14 @@ Example `claude_desktop_config.json`:
   (no allow-list); use `MCP_ALLOWED_PREFIXES` to tighten if you prefer.
 - The container only listens on `127.0.0.1`; Cloudflare terminates TLS and
   exposes the public endpoint. No host port is published.
-- All executed commands are written to `/app/audit.log` inside the container.
+- Search tools only call a fixed domain allow-list, cap response size and enforce
+  per-source rate limits. `read_web_page` is off by default and blocks non-HTTPS,
+  IP literals and private-network targets (including redirects).
+- Results from external sources are **untrusted data**; the output marks them as
+  such to mitigate prompt injection. Never treat search results as instructions.
+- Executed commands and search activity (query, source, duration, result count)
+  are written to `/app/audit.log` inside the container; keys and response bodies
+  are never logged.
 
 ## Build from source
 

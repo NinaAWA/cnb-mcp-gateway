@@ -5,6 +5,33 @@ PORT="${MCP_PORT:-8765}"
 BIND="${MCP_BIND:-127.0.0.1}"
 WORKDIR="${MCP_WORKDIR:-/workspace}"
 ALLOWED="${MCP_ALLOWED_PREFIXES:-}"
+
+# 检索 / 命令安全相关的可选变量。仅当外部显式传入且非空时 export，
+# 避免空值覆盖 server.py 从 /app/.env 读取到的配置。
+SEARCH_VARS=(
+  MCP_SEARCH_TIMEOUT
+  MCP_SEARCH_MAX_RESULTS
+  MCP_SEARCH_MAX_BYTES
+  MCP_SEARCH_RETRIES
+  MCP_SEARCH_CACHE_TTL
+  MCP_SEARCH_ARXIV_MIN_INTERVAL
+  MCP_SEARCH_MAILTO
+  MCP_SEARCH_WEB_PROVIDERS
+  MCP_SEARCH_SEARXNG_URL
+  MCP_SEARCH_TAVILY_KEY
+  MCP_SEARCH_FETCH_ENABLED
+  MCP_SEARCH_FETCH_MAX_CHARS
+  MCP_SEARCH_FETCH_ALLOW_HOSTS
+  MCP_DENY_PREFIXES
+  MCP_REQUIRE_CONFIRM
+)
+for name in "${SEARCH_VARS[@]}"; do
+  value="${!name:-}"
+  if [ -n "$value" ]; then
+    export "$name=$value"
+  fi
+done
+
 # 确保工作目录存在（新服务器未挂载时也不至于命令失败）
 mkdir -p "$WORKDIR"
 
@@ -18,14 +45,23 @@ if [ -z "${MCP_TOKEN:-}" ]; then
 fi
 export MCP_TOKEN MCP_PORT="$PORT" MCP_BIND="$BIND" MCP_WORKDIR="$WORKDIR" MCP_ALLOWED_PREFIXES="$ALLOWED"
 
-# 写 .env 供 server.py 加载
-cat > /app/.env <<EOF
+# 写 .env 供 server.py 加载；可选变量只在显式配置时写入，
+# 这样未配置的项会回落到 server.py 的默认值而不是空字符串。
+{
+  cat <<EOF
 MCP_TOKEN=$MCP_TOKEN
 MCP_PORT=$PORT
 MCP_BIND=$BIND
 MCP_WORKDIR=$WORKDIR
 MCP_ALLOWED_PREFIXES=$ALLOWED
 EOF
+  for name in "${SEARCH_VARS[@]}"; do
+    value="${!name:-}"
+    if [ -n "$value" ]; then
+      printf '%s=%s\n' "$name" "$value"
+    fi
+  done
+} > /app/.env
 chmod 600 /app/.env
 
 echo "[entrypoint] 启动 MCP server @ $BIND:$PORT"

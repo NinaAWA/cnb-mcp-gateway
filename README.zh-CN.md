@@ -2,10 +2,10 @@
 
 # CNB MCP Gateway（中文文档）
 
-一个**自托管的 MCP（模型上下文协议）服务器**：把你自己机器/服务器上的能力，通过一个 Cloudflare 快速隧道，暴露给**任意** MCP 客户端（Claude Desktop、Cursor、VS Code、Codex、ChatGPT 连接器，或你自己写的 agent），让 AI 能像操作「远程桌面」一样在你的服务器上**跑实验、配环境、看数据、看图片**。
+一个**自托管的 MCP（模型上下文协议）服务器**：把你自己机器/服务器上的能力，通过一个 Cloudflare 快速隧道，暴露给**任意** MCP 客户端（Claude Desktop、Cursor、VS Code、Codex、ChatGPT 连接器，或你自己写的 agent），让 AI 能像操作「远程桌面」一样在你的服务器上**跑实验、配环境、看数据、看图片、检索网页与论文**。
 
 ```
- 你的服务器  ──►  run_command / 文件 / 进程 / 图片 / 后台任务   ◄──  任意 MCP 客户端
+ 你的服务器  ──►  命令 / 文件 / 进程 / 图片 / 后台任务 / 网页与论文检索   ◄──  任意 MCP 客户端
    │
    └─ cloudflared 快速隧道（随机 https 地址） ◄── 鉴权：Bearer 令牌 / OAuth2 PKCE
 ```
@@ -28,6 +28,11 @@
   - `read_image` —— 返回一张图片（图表、截图），让多模态 agent 能**看见**它。
   - `get_system_info` —— 内核、运行时间、CPU、内存、磁盘。
   - `get_environment_variables` —— 当前环境变量（密钥值已脱敏）。
+- **网页搜索 + 论文检索（零 API Key）**，方案调研见 [免费/开源数据源选型](./docs/search-sources-research.md)：
+  - `search_papers` —— 聚合 OpenAlex、arXiv、CrossRef、PubMed、Europe PMC（另可选 OpenReview / dblp / Semantic Scholar）；多源结果轮流交错，带 DOI、引用数、摘要与开放全文链接。
+  - `search_arxiv` / `get_paper` —— 按作者/分类查 arXiv；按 DOI / arXiv ID / PMID 查单篇论文。
+  - `search_web` —— 可插拔 provider，默认 Hacker News + StackExchange（免密钥）；可选 GitHub、自建 SearXNG、Tavily。
+  - `read_web_page` —— 可选抓取网页正文（默认关闭），带 SSRF 防护与不可信内容标注。
 - **安全模型**：默认开放（无白名单）+ 对破坏性命令的**确认门** + 一份**毁灭级黑名单**（`rm -rf /`、`mkfs`、`shutdown` 等）即便确认也无法绕过。每次操作都有完整审计日志。
 - **可调旋钮（Sandbox knobs）**：可选的 `MCP_ALLOWED_PREFIXES` 白名单、`MCP_DENY_PREFIXES`、`MCP_REQUIRE_CONFIRM`、工作目录、审计日志。
 - **零配置入口**：cloudflared 快速隧道自动给你一个公网 HTTPS 地址（每次重启地址会变；设置 `CF_TUNNEL_TOKEN` 可固定地址）。
@@ -106,6 +111,19 @@ Authorization: Bearer <MCP_TOKEN>
 | `CF_TUNNEL_TOKEN` | （空 → 快速隧道） | 命名 Cloudflare 隧道令牌 → **固定地址**。 |
 | `MCP_WORKDIR` | `/workspace` | 命令执行的工作目录（自动创建）。 |
 | `MCP_WORKDIR_MOUNT` | （未设置） | 宿主机挂载到容器内 `/workspace` 的路径。 |
+| `MCP_SEARCH_TIMEOUT` | `10` | 单次外部请求超时（秒）。 |
+| `MCP_SEARCH_MAX_RESULTS` | `8` | 每个来源 / provider 的条数上限（最终输出最多 30 条）。 |
+| `MCP_SEARCH_MAX_BYTES` | `2000000` | 响应体体积上限（字节）。 |
+| `MCP_SEARCH_RETRIES` | `1` | 429 / 5xx / 网络错误重试次数（指数退避）。 |
+| `MCP_SEARCH_CACHE_TTL` | `300` | 内存 GET 缓存有效期（秒），`0` 关闭。 |
+| `MCP_SEARCH_ARXIV_MIN_INTERVAL` | `3` | arXiv 最小请求间隔（秒）。 |
+| `MCP_SEARCH_MAILTO` | （空） | 礼貌池邮箱（OpenAlex / CrossRef / NCBI / Unpaywall），环境变量转储中自动脱敏。 |
+| `MCP_SEARCH_WEB_PROVIDERS` | `hn,stackexchange` | `search_web` 默认 provider（逗号分隔）。 |
+| `MCP_SEARCH_SEARXNG_URL` | （空） | 自建 SearXNG 地址，配置后启用 `searxng` provider。 |
+| `MCP_SEARCH_TAVILY_KEY` | （空） | 可选 Tavily 免费额度密钥，自动脱敏。 |
+| `MCP_SEARCH_FETCH_ENABLED` | `0` | 设为 `1` 才启用 `read_web_page`。 |
+| `MCP_SEARCH_FETCH_MAX_CHARS` | `8000` | 抓取正文最大字符数。 |
+| `MCP_SEARCH_FETCH_ALLOW_HOSTS` | （空） | 页面抓取主机白名单（逗号分隔），留空允许任意公网 HTTPS 主机。 |
 
 ## 权限模型：开放 + 确认门 + 黑名单
 
@@ -137,6 +155,25 @@ Authorization: Bearer <MCP_TOKEN>
 | `search_files` / `grep_content` | 按名查找 / 搜内容 | — |
 | `list_processes` / `kill_process` | 进程（PID 1 受保护） | — |
 | `get_system_info` / `get_environment_variables` | 主机信息 / 环境变量（密钥脱敏） | — |
+| `search_papers` | 跨开放数据源检索论文 | 零密钥；`sources=...`、`from_year`、`sort=date`。 |
+| `search_arxiv` | arXiv 字段检索 | `author`、`category`、`from_year`，返回 PDF 链接。 |
+| `get_paper` | 查单篇论文 | 按 `doi` / `arxiv_id` / `pmid`；Unpaywall 开放全文需 `MCP_SEARCH_MAILTO`。 |
+| `search_web` | 网页 / 技术社区检索 | 默认 HN + StackExchange；可选 GitHub / SearXNG / Tavily。 |
+| `read_web_page` | 抓取网页正文 | 默认关闭（`MCP_SEARCH_FETCH_ENABLED=1`）；仅 HTTPS + SSRF 防护。 |
+
+### 检索示例
+
+```text
+search_papers(query="retrieval augmented generation", sources="openalex,arxiv,crossref", max_results=5, from_year=2024)
+search_arxiv(query="diffusion model", category="cs.CV", from_year=2025)
+get_paper(doi="10.1038/nature12373")
+search_web(query="model context protocol", providers="hn,stackexchange", max_results=5)
+read_web_page(url="https://example.com/article")
+```
+
+论文数据源默认零密钥即可使用。`search_web` 默认是**技术社区垂直检索**而非全网通用搜索，
+三条网页搜索路线的取舍与可选 provider 见 [调研文档](./docs/search-sources-research.md)。
+所有外部结果在返回文本中都会标注为不可信内容。
 
 ### 后台长任务示例
 
@@ -164,7 +201,9 @@ read_image(path="/workspace/results/loss_curve.png", max_dim=1024)
 
 - `MCP_TOKEN` 本质上是一把**远程 shell 钥匙**。像密码一样对待它，只分享给你信任的 agent。默认网关是**开放**的（无白名单）；如果你更保守，可以用 `MCP_ALLOWED_PREFIXES` 收紧。
 - 容器只监听 `127.0.0.1`；由 Cloudflare 终结 TLS 并暴露公网端点。不会发布任何宿主机端口。
-- 所有被执行过的命令都会写入容器内的 `/app/audit.log`。
+- 检索工具只访问固定域名白名单，限制响应体积并按来源限速；`read_web_page` 默认关闭，开启后也会拦截非 HTTPS、IP 字面量与私网地址（含跳转目标）。
+- 外部数据源返回的标题、摘要与正文都是**不可信数据**，工具输出会明确标注，避免提示注入；不要把它们当作指令执行。
+- 被执行过的命令，以及检索活动（查询词、来源、耗时、结果条数）都会写入容器内的 `/app/audit.log`；密钥与响应体不会写入日志。
 - ⚠️ **密钥提醒**：如果你用的是共享/明文出现的 PAT 或令牌，建议用完后立即在对应平台撤销并轮换。
 
 ## 从源码构建

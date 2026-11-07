@@ -10,3 +10,10 @@ audit*.log
 tunnel.out
 __pycache__/
 *.pyc
+
+# 本地开发虚拟环境
+.venv/
+
+# IDE 本地数据（计划、会话状态），不纳入版本库
+.codebuddy/
+
