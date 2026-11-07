@@ -27,8 +27,9 @@ audit log.
   - **Bearer direct** (simplest): send `Authorization: Bearer <MCP_TOKEN>` to
     `/mcp`. No OAuth round-trip needed. Claude Desktop / Cursor / VS Code / SDKs.
   - **OAuth 2.1 (PKCE + DCR)** for clients that only support OAuth (e.g. ChatGPT
-    connectors). `redirect_uri` accepts any valid absolute URI (`https://`,
-    `http://`, custom schemes) so non-ChatGPT agents are not blocked.
+    connectors). S256 PKCE is required by default; `redirect_uri` must match the
+    DCR registration, and unregistered clients may only use HTTPS or loopback HTTP
+    (custom schemes must be registered first). Issued tokens expire and are pruned.
 - **Remote-control toolkit** (inspired by Remote Desktop Commander, adapted to Linux) —
   run experiments, set up environments, view data **and images**, exactly like RDC:
   - `run_command` — execute a shell command (default **open**; destructive commands
@@ -60,7 +61,13 @@ audit log.
 - **Zero config ingress**: cloudflared quick tunnel gives you a public HTTPS URL
   automatically (URL rotates each restart; set `CF_TUNNEL_TOKEN` for a fixed URL).
 - **Self-contained Docker image**: server + tunnel in one container.
-- **MCP Admin Dashboard (four-service Compose deployment)**: separate admin login,
+- **Git deletion protection (hard constraint)**: deleting branches/repositories,
+  delete-style refspecs, git aliases and obfuscated execution are hard-blocked at the
+  command layer, by an in-image `git` wrapper and by file-tool path checks. Structured
+  `git_*` tools provide commit / switch / push with no delete API. See
+  [Git deletion protection](#git-deletion-protection).
+- **MCP Admin Dashboard (multi-service Compose deployment, 3 containers by default +
+  2 optional profiles)**: separate admin login,
   live call monitoring, complete call audit, Git/experiment views, per-container metrics,
   charts and exports. SQLite WAL storage with redaction by default; large outputs are stored
   as protected references. See the [Chinese deployment guide](./docs/admin-dashboard.zh-CN.md).
@@ -74,9 +81,10 @@ audit log.
 # 2) run it (default is fully open; tighten with -e MCP_ALLOWED_PREFIXES="git|python3|ls" if you like)
 docker run -d --name cnb-mcp-gateway --restart unless-stopped \
   -v "$PWD:/workspace" \
-  ghcr.io/ninaawa/cnb-mcp-gateway:latest
+  ghcr.io/ninaawa/cnb-mcp-gateway-plus:latest
 
-docker logs -f cnb-mcp-gateway   # prints BASE_URL, /mcp, openapi, MCP_TOKEN
+docker logs -f cnb-mcp-gateway              # prints BASE_URL, /mcp, openapi (no secrets by default)
+docker exec cnb-mcp-gateway cat /app/.env   # read MCP_TOKEN
 ```
 
 Or use the bundled helper (env-overridable):
@@ -85,13 +93,13 @@ Or use the bundled helper (env-overridable):
 ./run.sh
 ```
 
-### Four-service deployment with the audit dashboard (recommended for server management)
+### Multi-service deployment with the audit dashboard (recommended for server management)
 
 ```bash
 cp docker/.env.template .env
 # Pin MCP_TOKEN and ADMIN_PASSWORD in .env for production
 docker compose up -d --build
-docker logs cnb-mcp-admin-web       # prints the generated admin password if unset
+docker exec cnb-mcp-admin-web cat /data/audit/.admin_password   # read the generated admin password
 ```
 
 The dashboard listens on `http://127.0.0.1:8788` only and uses a **separate admin account**
@@ -106,11 +114,13 @@ For single-container mode, the startup banner prints everything you need:
  公网根地址 (BASE_URL):   https://xxxx.trycloudflare.com
  MCP 连接器地址 (MCP_URL): https://xxxx.trycloudflare.com/mcp
  ChatGPT 插件 OpenAPI 清单: https://xxxx.trycloudflare.com/openapi.yaml
- 密钥 (MCP_TOKEN):        <random-48-char-token>
+ 密钥 (MCP_TOKEN):        written to /app/.env, not printed to logs by default
 ```
 
 > Every container restart → a **new random URL** + **new random token** (unless
-> you pin them, see below). Re-check `docker logs` after each restart.
+> you pin them, see below). Read the token with
+> `docker exec cnb-mcp-gateway cat /app/.env`; set `MCP_PRINT_SECRETS=1` only in
+> isolated environments to print secrets in the container log.
 
 ## Connect your agent
 
@@ -183,6 +193,10 @@ Example `claude_desktop_config.json`:
 | `AUDIT_STRICT` | `0` | `1` rejects high-risk tools when audit storage is unavailable; default is graceful degradation. |
 | `AUDIT_RETENTION_DAYS` / `AUDIT_MAX_DB_MB` | `90` / `512` | Archive retention and DB quota. |
 | `MCP_TUNNEL_DISABLED` | `0` | Set to `1` when using the standalone `cloudflared` service. |
+| `MCP_OAUTH_REQUIRE_PKCE` | `1` | Require OAuth S256 PKCE; set `0` only for legacy clients without a challenge. |
+| `MCP_TRUST_PROXY` / `ADMIN_TRUST_PROXY` | `0` | Trust `X-Forwarded-For` only behind a trusted reverse proxy. |
+| `MCP_GIT_EXTRA_SUBCOMMANDS` | (empty) | Extra allowed git subcommands; unknown ones are refused to block aliases. |
+| `MCP_PRINT_SECRETS` | `0` | `1` prints `MCP_TOKEN` and the admin password to container logs (isolated environments only). |
 
 Full list: [`docker/.env.template`](./docker/.env.template) and the
 [deployment guide](./docs/admin-dashboard.zh-CN.md).
@@ -220,6 +234,43 @@ community search rather than a general web index; see the
 [survey](./docs/search-sources-research.md) for trade-offs and optional providers.
 Every result is labelled as untrusted external content in the tool output.
 
+## Git deletion protection
+
+Agents may commit, switch / create branches, fetch / pull and push, but **cannot delete
+Git repositories or branches**; `confirm=true` never bypasses this rule.
+
+- **Command layer** (`gateway/git_guard.py`): quote-aware parsing of every
+  `run_command` / `run_command_background` / REST command blocks `git branch -D/-d/-m`,
+  `git push --delete/--mirror/--prune`, `:branch` / `branch:` / `+branch` refspecs,
+  `git update-ref`, `remote/worktree prune`, `fetch --prune`, writes into `.git/**`,
+  deletion of directories containing `.git`, and obfuscated execution (`bash -c`,
+  `python -c`, generated scripts, `base64 -d | sh`).
+- **Process layer** (`docker/git-guard-wrapper.py`): the image replaces `/usr/bin/git`
+  with a wrapper, so git calls from scripts, Python subprocesses and background
+  tasks are checked too. Unknown subcommands (possible aliases) are refused;
+  `MCP_GIT_EXTRA_SUBCOMMANDS` can whitelist extras.
+- **File layer**: `write_file` refuses `.git/**` and system credential files.
+
+Use the structured `git_*` tools for daily work (`git_status`, `git_commit`,
+`git_switch`, `git_branch_create`, `git_push`, ...); they use `shell=False` and
+expose no delete operation. `git push --force` and `git reset --hard` remain
+"requires confirmation", not branch deletion.
+
+The image has no host `/etc/gitconfig`. Configure `GIT_USER_NAME` /
+`GIT_USER_EMAIL` and mount a credentials file read-only at
+`/root/.git-credentials` (or set `GIT_CREDENTIALS_FILE`) before using
+`git_commit` / `git_push`, otherwise commits fail with "Please tell me who you
+are" and pushes fail authentication. On platforms that enforce commit signing,
+the author must match the token user.
+
+**This protects against mistakes and prompt injection, not against a malicious
+root user inside the container** (root can edit `.git` directly). For an
+irreversible guarantee you must also enable server-side branch protection
+(no branch deletion / no force push / no repository deletion), use a
+least-privilege deploy key or PAT, keep independent backups, and avoid mounting
+`docker.sock`. On bare repositories also set `receive.denyDeletes=true` and
+`receive.denyNonFastForwards=true`.
+
 ## Security notes
 
 - `MCP_TOKEN` is effectively a **remote shell key**. Treat it like a password,
@@ -234,14 +285,23 @@ Every result is labelled as untrusted external content in the tool output.
   IP literals and private-network targets (including redirects).
 - Results from external sources are **untrusted data**; the output marks them as
   such to mitigate prompt injection. Never treat search results as instructions.
-- Executed commands and search activity (query, source, duration, result count)
-  are written to `/app/audit.log` inside the container; keys and response bodies
-  are never logged.
-- With the four-service deployment, full call records also go to a SQLite WAL audit DB
-  on the shared volume: arguments, outputs and errors are redacted, and large outputs
-  are kept as protected references. Admin login is fully independent from the MCP API;
-  unauthenticated users cannot read any call record. See the
+- Executed commands and search activity are written to `/app/audit.log` inside the
+  container; the log is redacted and truncated before writing, so `TOKEN=...` or
+  connection-string passwords never land in plaintext.
+- With the multi-service deployment, full call records also go to a SQLite WAL audit DB
+  on the shared volume: arguments, outputs, errors and derived rows are redacted, and
+  large outputs are kept as protected references verified by SHA-256 on read.
+  `AUDIT_STRICT=1` now really refuses high-risk tools (including `git_*`) when the
+  audit store is unavailable, for both MCP and REST entry points. Admin login is
+  independent from the MCP API; write operations also check Origin / Sec-Fetch-Site,
+  and login lockout no longer trusts a spoofable `X-Forwarded-For` by default. See the
   [deployment guide](./docs/admin-dashboard.zh-CN.md).
+- The public, unauthenticated `/health` returns only a minimal liveness status;
+  metrics and tool counts moved to the Bearer-protected `/internal/metrics`, which the
+  dashboard reads with `MCP_TOKEN`.
+- `MCP_TOKEN` and the generated admin password are **no longer printed to container
+  logs** by default: read them from `/app/.env` and `/data/audit/.admin_password`.
+  OAuth requires S256 PKCE by default, validates `redirect_uri`, and expires tokens.
 
 ## Build from source
 
@@ -256,7 +316,11 @@ docker logs -f cnb-mcp-gateway
 
 > The build context is now the repository root because the image also contains the
 > `gateway/` audit layer and Admin Web. Use `docker compose up -d --build` for the
-> four-service deployment; run tests with `.venv/bin/python -m pytest tests -q`.
+> multi-service deployment. Tests:
+> `pip install -r docker/requirements.txt -r requirements-dev.txt && pytest tests -q`;
+> the standard-library-only policy tests also run with
+> `python3 -m unittest discover -s tests -p 'test_*.py'`. CI is in
+> `.github/workflows/ci.yml` (ruff + full test suite).
 
 ## License
 

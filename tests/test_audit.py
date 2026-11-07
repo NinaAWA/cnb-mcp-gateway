@@ -111,11 +111,13 @@ def test_write_failure_buffers_then_recovers(isolated_storage):
     assert store.add_event("tool_call", detail="buffered") is False
     assert store.health()["healthy"] is False
     assert store.health()["buffered"] >= 1
-    assert store.available() is True
+    # 有未落库事件时严格审计必须视为不可用（旧实现在此错误地返回 True）
+    assert store.available() is False
     store.db_path = original
     assert store.add_event("tool_call", detail="recovered") is True
     assert store.health()["healthy"] is True
     assert store.health()["buffered"] == 0
+    assert store.available() is True
     details = [e["detail"] for e in store.recent_events(0, 100)]
     assert "buffered" in details and "recovered" in details
 

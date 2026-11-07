@@ -157,6 +157,9 @@
       (num(i.count) / max * 100).toFixed(1) + '%"></div></div><span class="num">' +
       esc(i.count) + '</span></div>').join('');
   }
+  function safeColor(c) {
+    return /^#[0-9a-fA-F]{3,8}$|^var\(--[\w-]+\)$/.test(c || '') ? c : 'var(--accent)';
+  }
   function lineChart(labels, series) {
     const W = 620, H = 190, P = 26;
     const max = Math.max(1, ...series.flatMap((s) => (s.data || []).map(num)));
@@ -166,8 +169,8 @@
     const grid = [0, .25, .5, .75, 1].map((f) => '<line class="axis" x1="' + P + '" y1="' +
       (P + f * (H - 2 * P)) + '" x2="' + (W - P) + '" y2="' + (P + f * (H - 2 * P)) + '"/>').join('');
     const lines = series.map((s) => '<polyline class="line ' + esc(s.cls || '') + '" points="' +
-      (s.data || []).map(xy).join(' ') + '"' + (s.color ? ' stroke="' + s.color + '"' : '') + '/>').join('');
-    const legend = series.map((s) => '<span class="legend" style="color:' + (s.color || 'var(--accent)') +
+      (s.data || []).map(xy).join(' ') + '"' + (s.color ? ' stroke="' + safeColor(s.color) + '"' : '') + '/>').join('');
+    const legend = series.map((s) => '<span class="legend" style="color:' + safeColor(s.color) +
       '">● ' + esc(s.name) + '</span>').join(' ');
     return '<div class="legend-row">' + legend + '<span class="muted">峰值 ' + esc(max) + '</span></div>' +
       '<svg class="chart" viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" role="img" aria-label="调用趋势">' +
@@ -186,6 +189,7 @@
     }).join('');
     return '<div class="table-wrap"><table><thead><tr>' + head + '</tr></thead><tbody>' + body + '</tbody></table></div>';
   }
+  // 调用方必须传入已 esc() 的文本或可信的静态 HTML 片段（如 statusBadge）。
   function kv(pairs) {
     return '<dl class="kv">' + pairs.map(([k, v]) => '<dt>' + esc(k) + '</dt><dd>' +
       (v === undefined || v === null || v === '' ? '—' : v) + '</dd>').join('') + '</dl>';
@@ -273,9 +277,9 @@
         card('网关与审计状态', kv([
           ['网关状态', gw.online ? '<span class="badge ok">在线</span>' : '<span class="badge err">离线</span>'],
           ['启动时间', fmtTime(gw.started_at)],
-          ['注册工具数', gw.tools_registered],
-          ['审计后端', audit.backend || '—'],
-          ['降级缓冲', audit.buffered],
+          ['注册工具数', esc(gw.tools_registered)],
+          ['审计后端', esc(audit.backend || '—')],
+          ['降级缓冲', esc(audit.buffered)],
           ['严格模式', audit.strict ? '已开启' : '关闭']
         ]) + (gw.online ? '' : '<p class="hint">网关 /health 不可达：' + esc((gw.detail || {}).error || '') + '</p>')) +
         '</div>' +
@@ -320,7 +324,7 @@
     const recent = await api('/api/live/recent?after=0');
     if (!alive()) return;
     (recent.events || []).filter((e) => ['tool_call', 'task_lifecycle', 'admin_auth'].indexOf(e.kind) >= 0)
-      .slice(-40).forEach((e) => add(e, false));
+      .slice(-40).reverse().forEach((e) => add(e, false));
     if (!list.children.length) list.innerHTML = '<p class="empty muted">暂无事件，等待新的工具调用…</p>';
     const es = new EventSource('/api/live/stream');
     cleanup = () => es.close();
@@ -338,6 +342,10 @@
     es.onerror = () => {
       const el = $('#sse-state');
       if (el) el.innerHTML = '<i class="live-dot off"></i>连接断开，浏览器将自动重连';
+      // EventSource 拿不到 HTTP 状态码；会话失效时主动探测并跳转登录
+      fetch('/api/me', { credentials: 'same-origin' })
+        .then((r) => { if (r.status === 401) location.href = '/login'; })
+        .catch(() => {});
     };
     $('#rt-clear').addEventListener('click', () => {
       list.innerHTML = '<p class="empty muted">已清空，等待新的事件…</p>';
@@ -385,6 +393,8 @@
       '<span class="sub" id="calls-total"></span></h3>' +
       '<button class="btn" data-dl="csv">导出 CSV</button><button class="btn" data-dl="jsonl">导出 JSONL</button>' +
       '<button class="btn" data-dl="json">导出 JSON</button>' +
+      '<select id="bg-fmt"><option value="jsonl">JSONL</option><option value="csv">CSV</option>' +
+      '<option value="json">JSON</option></select>' +
       '<button class="btn" id="btn-bg-export">后台大批量导出</button></div>' +
       '<div id="calls-table"><div class="loading">正在加载…</div></div>' +
       '<div class="pager" id="calls-pager"></div></div>';
@@ -448,7 +458,9 @@
       const filters = {};
       p.forEach((v, k) => { filters[k] = v; });
       try {
-        const r = await post('/api/exports', { fmt: 'jsonl', filters: filters });
+        const r = await post('/api/exports', {
+          fmt: ($('#bg-fmt') && $('#bg-fmt').value) || 'jsonl', filters: filters
+        });
         toast('后台导出任务已创建：' + r.job_id);
       } catch (e) { toast('创建失败：' + e.message); }
     });
@@ -546,7 +558,8 @@
       { key: 'command', label: '命令', render: (r) => tr(r.command, 70) },
       { key: 'pid', label: 'PID' },
       { key: 'git_commit', label: '代码版本', render: (r) => tr(r.git_commit, 16) },
-      { key: 'detail', label: '操作', render: (r) => '<button class="btn" data-log="' + esc(r.task_id) + '">查看日志</button>' }
+      { key: 'detail', label: '操作', render: (r) => r.task_id
+        ? '<button class="btn" data-log="' + esc(r.task_id) + '">查看日志</button>' : '—' }
     ], d.rows, { empty: '暂无后台实验运行记录' }) + '<div id="exp-log"></div>';
   }
 
@@ -700,7 +713,10 @@
     $('#page-title').textContent = view.title;
     $('#page-sub').textContent = view.sub;
     rootEl.innerHTML = '<div class="loading">正在加载…</div>';
-    Promise.resolve(view.render(alive, decodeURIComponent(parts.slice(1).join('/'))))
+    let arg = '';
+    try { arg = decodeURIComponent(parts.slice(1).join('/')); }
+    catch (e) { arg = parts.slice(1).join('/'); }  // 畸形 hash 不应让整个视图崩掉
+    Promise.resolve(view.render(alive, arg))
       .catch((err) => { if (alive()) showError(err); });
   }
 

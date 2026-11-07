@@ -29,12 +29,15 @@ REST /run_command ─┼─> 统一采集层 ─> SQLite WAL (/data/audit/audit.
 cp docker/.env.template .env
 # 至少固定 MCP_TOKEN；生产环境建议同时设置 ADMIN_PASSWORD
 docker compose up -d --build
-docker logs cnb-mcp-admin-web | grep -A4 "自动生成"   # 未设置 ADMIN_PASSWORD 时查看初始口令
+docker compose exec mcp-admin-web cat /data/audit/.admin_password   # 未设置 ADMIN_PASSWORD 时读取初始口令
 # 浏览器打开 http://127.0.0.1:8788
 ```
 
 首次启动若未设置 `ADMIN_PASSWORD`，入口脚本会生成随机口令、以 `600` 权限写入共享卷
-`/data/audit/.admin_password`，并打印到容器日志；**重启后口令不变**。`.env` 含密钥，不要提交到仓库。
+`/data/audit/.admin_password`；**重启后口令不变**，默认**不再打印到容器日志**（用上面的 `docker compose exec ... cat` 读取，
+或在隔离环境设 `MCP_PRINT_SECRETS=1` 恢复打印）。`MCP_TOKEN` 同理默认只写入网关容器 `/app/.env`。
+Compose 模式下网关还会把令牌同步到共享卷 `/data/audit/.mcp_token`（权限 600），供后台读取需 Bearer 的
+`/internal/metrics`；该文件等同 `MCP_TOKEN`，请控制共享卷的访问权限。`.env` 含密钥，不要提交到仓库。
 
 单容器快速启动（`./run.sh` / `docker run`）仍保持原有行为：一个容器里运行 MCP 网关与内置 quick tunnel，
 但不会启动管理后台；如需审计后台请使用 Compose 部署。
@@ -45,6 +48,8 @@ docker logs cnb-mcp-admin-web | grep -A4 "自动生成"   # 未设置 ADMIN_PASS
 - 会话 Cookie 为 HMAC 签名、`HttpOnly`、`SameSite=Lax`，默认 8 小时过期。
   未配置 `ADMIN_SESSION_SECRET` 时密钥随容器重启变化，旧会话自动失效（更安全）。
 - 连续 5 次失败登录后锁定 15 分钟（可配置）；设置 `ADMIN_TOTP_SECRET` 后启用 TOTP 双因素。
+  锁定按直连 IP 统计，默认**不信任客户端自报的 `X-Forwarded-For`**（仅在可信反代后设 `ADMIN_TRUST_PROXY=1`）。
+- 所有写操作额外校验 `Origin` / `Sec-Fetch-Site`，作为 `SameSite=Lax` 之外的 CSRF 防护。
 - 未登录时：页面 `/` 重定向 `/login`，所有 `/api/*` 返回 `401`；`/healthz` 只返回后台与审计存储状态，
   不含任何调用数据。管理员可在「客户端与会话」中强制下线任意会话。
 - 导出文件通过 10 分钟有效的 HMAC 签名链接下载；实验日志只能读取任务日志目录内的文件。
@@ -185,7 +190,9 @@ python -m venv .venv
 
 ## 10. 本轮实测记录
 
-- 镜像构建成功；`docker compose up -d` 后三个服务均为 `healthy`；MCP `tools/list` = 21。
+- 镜像构建成功；`docker compose up -d` 后三个服务均为 `healthy`；MCP `tools/list` = 34
+  （原有 21 个 + 13 个结构化 `git_*` 工具）。网关 `/health` 只返回最小存活状态，
+  后台通过需 Bearer 的 `/internal/metrics` 读取网关指标。
 - 真实 MCP 会话（`initialize` / `tools/list` / `tools/call`）与 REST `/run_command` 都产生审计记录；
   `run_command_background` 成功启动并记录独立生命周期。
 - 状态覆盖 `SUCCESS` / `FAILED` / `DENIED`：确认门拒绝曾被误记为 `SUCCESS`，已修复并补回归测试。

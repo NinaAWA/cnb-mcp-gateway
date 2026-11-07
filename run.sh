@@ -5,7 +5,7 @@ set -euo pipefail
 # 镜像默认从 GHCR 拉取；如需本地构建，先执行:
 #   docker build -f docker/Dockerfile -t cnb-mcp-gateway:local .
 # 需要审计管理后台请改用: docker compose up -d --build
-IMG="${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway:latest}"
+IMG="${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway-plus:latest}"
 
 # 拉取（若镜像不存在/私有则需先 docker login ghcr.io）
 docker pull "$IMG" 2>/dev/null || true

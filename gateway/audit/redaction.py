@@ -20,6 +20,7 @@ SENSITIVE_KEY_PARTS = (
     "token", "password", "passwd", "secret", "api_key", "apikey", "access_key",
     "private_key", "credential", "authorization", "auth_header", "cookie",
     "session_key", "ssh_key", "bearer", "otp", "totp", "mfa", "passphrase",
+    "dsn", "connection_string", "conn_str", "database_url",
 )
 
 # 值内容特征：即使键名无害也要替换
@@ -34,13 +35,21 @@ SECRET_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
         r"\bBearer\s+[A-Za-z0-9._~+/=-]{12,}",
         r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key)\s*[:=]\s*[^\s\"'&,;]{4,}",
-        r"https?://[^\s/@]+:[^\s/@]+@",
+        # 任意协议的连接串凭据（postgresql://user:pass@host 等），不只是 http(s)
+        r"\b[a-z][a-z0-9+.\-]*://[^\s/@]+:[^\s/@]+@",
     )
 )
 
 # 环境变量转储里 k=v 形式同样要脱敏
 _ENV_VALUE_RE = re.compile(
-    r"(?im)^([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|KEY|PRIVATE|MAIL|CREDENTIAL)[A-Z0-9_]*)=.*$"
+    r"(?im)^([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|KEY|PRIVATE|MAIL|CREDENTIAL|"
+    r"DSN|CONNECTION|DATABASE_URL)[A-Z0-9_]*)=.*$"
+)
+# 命令文本中的赋值（export SECRET_TOKEN=xxx / FOO_API_KEY=yyy / --password=zzz）：
+# 保留变量名便于排障，只替换值，且不受「行首」限制。
+_ASSIGNMENT_SECRET_RE = re.compile(
+    r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|KEY|PRIVATE|MAIL|CREDENTIAL|"
+    r"DSN|CONNECTION|DATABASE_URL)[A-Z0-9_]*)\s*=\s*(['\"]?)([^\s'\"&,;]{1,})\2"
 )
 
 _MAX_DEPTH = 12
@@ -51,6 +60,7 @@ def redact_text(value: Any, *, limit: int = 0) -> str:
     if value is None:
         return ""
     text = value if isinstance(value, str) else str(value)
+    text = _ASSIGNMENT_SECRET_RE.sub(lambda m: f"{m.group(1)}={REDACTED}", text)
     for pattern in SECRET_PATTERNS:
         text = pattern.sub(REDACTED, text)
     text = _ENV_VALUE_RE.sub(lambda m: f"{m.group(1)}={REDACTED}", text)
@@ -114,8 +124,9 @@ class ArtifactStore:
             return {"text": text, "ref": "", "size": size, "sha256": digest}
         try:
             self.root.mkdir(parents=True, exist_ok=True)
-            # 大输出只保留受控上限，避免磁盘被撑爆
+            # 大输出只保留受控上限，避免磁盘被撑爆；校验和必须对应实际落盘内容
             payload = raw[: self.max_bytes]
+            digest = sha256_bytes(payload)
             path = self.root / f"{digest}.txt"
             if not path.exists():
                 tmp = self.root / f".{digest}.tmp"
@@ -127,6 +138,7 @@ class ArtifactStore:
                 "text": preview + f"\n…[大输出已存为受保护引用，完整内容见 {path.name}]",
                 "ref": f"artifact://{path.name}",
                 "size": size,
+                "stored_size": len(payload),
                 "sha256": digest,
             }
         except OSError as exc:
@@ -138,7 +150,7 @@ class ArtifactStore:
                 "sha256": digest,
             }
 
-    def read(self, ref: str) -> str | None:
+    def read(self, ref: str, expected_sha256: str = "") -> str | None:
         if not ref.startswith("artifact://"):
             return None
         name = Path(ref[len("artifact://"):]).name
@@ -146,6 +158,10 @@ class ArtifactStore:
         if not path.is_file():
             return None
         try:
-            return path.read_text(encoding="utf-8", errors="replace")
+            raw = path.read_bytes()
+            # 引用文件可被容器内进程改写，读取前校验摘要，避免展示被篡改内容
+            if expected_sha256 and sha256_bytes(raw) != expected_sha256:
+                return None
+            return raw.decode("utf-8", errors="replace")
         except OSError:
             return None

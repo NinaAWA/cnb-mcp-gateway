@@ -1,8 +1,12 @@
+# 兼容版本锁定：只允许小版本内的补丁更新，避免无上限 >= 拉入破坏性变更。
+# 如需逐字节可复现，请在构建机上用 `pip freeze > constraints.txt` 固化精确版本。
 fastmcp==4.1.6
-uvicorn
-Pillow
+uvicorn~=0.35.0  # fastmcp-slim 4.1.6 要求 >=0.35
+Pillow~=11.1.0
+# fastapi 不能锁死小版本：fastmcp-slim 4.1.6 依赖 starlette>=1.0.1，
+# 只有较新的 fastapi 才与之兼容，交给解析器选择。
 fastapi>=0.115
-jinja2>=3.1
-python-multipart>=0.0.12
-psutil>=6.0
-psycopg[binary]>=3.2
+jinja2~=3.1.0
+python-multipart~=0.0.20
+psutil~=6.0.0
+psycopg[binary]~=3.2.0

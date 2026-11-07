@@ -16,6 +16,7 @@ import os
 import re
 import threading
 import time
+import urllib.parse
 import urllib.request
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
+from gateway.audit.redaction import redact_text
 from gateway.audit.storage import get_storage
 from gateway.monitoring.system import collect
 from .auth import COOKIE_NAME, get_auth
@@ -40,16 +42,23 @@ GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://mcp-gateway:8765").rstrip("/
 EXPORT_DIR = Path(os.environ.get("AUDIT_EXPORT_DIR", "/data/audit/exports"))
 TASK_LOG_DIR = Path(os.environ.get("MCP_TASK_LOG_DIR", "/tmp/mcp_tasks")).resolve()
 COOKIE_SECURE = os.environ.get("ADMIN_COOKIE_SECURE", "0").strip().lower() in ("1", "true", "yes")
+# 默认不信任客户端自报的 X-Forwarded-For；只有部署在可信反向代理后才开启。
+TRUST_PROXY = os.environ.get("ADMIN_TRUST_PROXY", "0").strip().lower() in ("1", "true", "yes", "on")
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     auth = get_auth()
     if auth.generated_password:
-        print("=" * 70, flush=True)
-        print(" [自动生成] Admin Web 管理员密码（未配置 ADMIN_PASSWORD 时随机生成）:", flush=True)
-        print(f"   账号: {auth.username}", flush=True)
-        print(f"   密码: {auth.generated_password}", flush=True)
-        print("=" * 70, flush=True)
+        show = os.environ.get("MCP_PRINT_SECRETS", "0").strip().lower() in ("1", "true", "yes", "on")
+        if show:
+            print("=" * 70, flush=True)
+            print(" [自动生成] Admin Web 管理员密码（未配置 ADMIN_PASSWORD 时随机生成）:", flush=True)
+            print(f"   账号: {auth.username}", flush=True)
+            print(f"   密码: {auth.generated_password}", flush=True)
+            print("=" * 70, flush=True)
+        else:
+            print("[admin] 已生成管理员口令并持久化，默认不写入容器日志；"
+                  "请从 ADMIN_PASSWORD_FILE 读取（或设置 MCP_PRINT_SECRETS=1）", flush=True)
     get_storage().add_event("admin_service", status="UP", source="admin",
                             detail="管理后台已启动")
     yield
@@ -57,6 +66,39 @@ async def _lifespan(_app: FastAPI):
 
 app = FastAPI(title="MCP Admin Dashboard", docs_url=None, redoc_url=None,
               openapi_url=None, lifespan=_lifespan)
+
+
+class CSRFGuard:
+    """管理端写操作的跨站防护（SameSite=Lax 的补充）。
+
+    使用纯 ASGI 而非 @app.middleware("http") 的 BaseHTTPMiddleware，
+    避免缓冲响应体、破坏 /api/live/stream 的 SSE 事件流。
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and scope.get("method") not in ("GET", "HEAD", "OPTIONS"):
+            headers = {
+                key.decode("latin-1").lower(): value.decode("latin-1")
+                for key, value in scope.get("headers", [])
+            }
+            origin = headers.get("origin", "")
+            host = headers.get("host", "")
+            blocked = bool(origin) and urllib.parse.urlsplit(origin).netloc != host
+            if not origin and headers.get("sec-fetch-site") in ("cross-site", "same-site"):
+                blocked = True
+            if blocked:
+                response = JSONResponse({"detail": "跨站请求被拒绝"}, status_code=403)
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(CSRFGuard)
+
+
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
@@ -72,6 +114,8 @@ CONFIG_WHITELIST = (
     "MCP_SEARCH_TIMEOUT", "MCP_SEARCH_MAX_RESULTS", "MCP_SEARCH_RETRIES",
     "MCP_SEARCH_CACHE_TTL", "MCP_SEARCH_ARXIV_MIN_INTERVAL",
     "MCP_SEARCH_WEB_PROVIDERS", "MCP_SEARCH_FETCH_ENABLED",
+    "MCP_OAUTH_REQUIRE_PKCE", "MCP_TRUST_PROXY", "ADMIN_TRUST_PROXY",
+    "MCP_GIT_EXTRA_SUBCOMMANDS",
     "AUDIT_STRICT", "AUDIT_RETENTION_DAYS", "AUDIT_MAX_DB_MB",
     "ADMIN_SESSION_TTL", "ADMIN_LOGIN_MAX_FAILURES", "ADMIN_LOGIN_LOCK_MINUTES",
 )
@@ -85,8 +129,11 @@ EDITABLE_SETTINGS = ("default_range", "page_size", "theme")
 
 # --------------------------------------------------------------------- auth
 def _ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-    return (forwarded or (request.client.host if request.client else "unknown"))[:64]
+    direct = request.client.host if request.client else "unknown"
+    if TRUST_PROXY:
+        forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        return (forwarded or direct)[:64]
+    return direct[:64]
 
 
 def _session(request: Request) -> dict[str, Any] | None:
@@ -200,12 +247,34 @@ def _range(request: Request) -> tuple[str, str, str]:
     return (now - timedelta(hours=hours)).isoformat(), now.isoformat(), label
 
 
+def _gateway_token() -> str:
+    """优先用环境变量；网关自动生成令牌时会同步到共享卷。"""
+    token = os.environ.get("MCP_TOKEN", "").strip()
+    if not token:
+        try:
+            token = Path("/data/audit/.mcp_token").read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+    return token
+
+
 def _gateway_health() -> dict[str, Any]:
-    try:
-        with urllib.request.urlopen(GATEWAY_URL + "/health", timeout=2) as resp:
-            return json.loads(resp.read().decode("utf-8", "replace"))
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "down", "error": repr(exc)[:200], "source": "mcp-gateway"}
+    """优先用 MCP_TOKEN 读取需鉴权的内部指标；公网 /health 只保留最小存活状态。"""
+    token = _gateway_token()
+    candidates = []
+    if token:
+        candidates.append((GATEWAY_URL + "/internal/metrics",
+                           {"Authorization": f"Bearer {token}"}))
+    candidates.append((GATEWAY_URL + "/health", {}))
+    last_error = ""
+    for url, headers in candidates:
+        try:
+            request = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(request, timeout=2) as resp:
+                return json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception as exc:  # noqa: BLE001
+            last_error = repr(exc)[:200]
+    return {"status": "down", "error": last_error, "source": "mcp-gateway"}
 
 
 def _filters(request: Request) -> dict[str, Any]:
@@ -283,9 +352,10 @@ def call_detail(request_id: str, session: dict = Depends(require_admin)):
         raise HTTPException(status_code=404, detail="记录不存在")
     result = row.get("result", "")
     if row.get("result_ref"):
-        full = storage.artifacts.read(row["result_ref"])
+        full = storage.artifacts.read(row["result_ref"],
+                                      expected_sha256=row.get("result_sha256", ""))
         if full is not None:
-            result = full
+            result = redact_text(full)
     related_tasks = storage.tasks(task_id=row.get("task_id", "")) if row.get("task_id") else []
     git = storage.git_for_request(request_id)
     experiments = storage.experiments_for_request(request_id, row.get("task_id", ""))
@@ -300,7 +370,9 @@ def call_detail(request_id: str, session: dict = Depends(require_admin)):
 @app.get("/api/live/recent")
 def live_recent(request: Request, session: dict = Depends(require_admin)):
     after = int(request.query_params.get("after", "0"))
-    events = get_storage().recent_events(after, 100)
+    storage = get_storage()
+    # 首屏展示最新事件；after>0 时仍按 id 升序追赶，供 SSE 增量使用
+    events = storage.latest_events(100) if after <= 0 else storage.recent_events(after, 100)
     return {"events": events, "last_id": events[-1]["id"] if events else after}
 
 

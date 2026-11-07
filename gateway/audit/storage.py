@@ -18,8 +18,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from gateway.audit.redaction import redact_text
+
+
+def _redact_row(row: dict[str, Any]) -> dict[str, Any]:
+    """读时二次脱敏：写入侧已脱敏，这里兜住历史明文、直写路径与采集层漏网。
+
+    所有读取出口（列表 / 详情 / SSE / 导出）都经由 _query，因此统一在此处理。
+    """
+    return {key: redact_text(value) if isinstance(value, str) else value
+            for key, value in row.items()}
+
 from .events import TERMINAL_STATUSES, ToolCallRecord, utcnow
-from .redaction import ArtifactStore
+from .redaction import ArtifactStore, redact_text
 
 DEFAULT_DB_PATH = os.environ.get("AUDIT_DB_PATH", "/data/audit/audit.db")
 MAX_FIELD_CHARS = int(os.environ.get("AUDIT_MAX_FIELD_CHARS", "32768"))
@@ -30,6 +41,8 @@ STRICT = os.environ.get("AUDIT_STRICT", "0").strip().lower() in ("1", "true", "y
 HIGH_RISK_TOOLS = frozenset({
     "run_command", "run_command_background", "write_file", "kill_process",
     "stop_task", "read_web_page",
+    "git_add", "git_commit", "git_push", "git_pull", "git_fetch",
+    "git_switch", "git_branch_create",
 })
 
 _SQLITE_SCHEMA = """
@@ -185,12 +198,16 @@ class AuditStorage:
             "backend": "postgresql" if self.pg else "sqlite-wal",
             "path": "" if self.pg else self.db_path,
             "buffered": len(self._buffer),
-            "last_error": self._last_error,
+            "last_error": redact_text(self._last_error),
             "strict": STRICT,
         }
 
     def available(self) -> bool:
-        return self._healthy or len(self._buffer) < MAX_BUFFER
+        """严格审计模式下，只有数据库健康且没有未落库的缓冲事件才算可用。
+
+        旧实现在首次写失败后仍返回 True（缓冲未满），导致 AUDIT_STRICT=1 形同虚设。
+        """
+        return self._healthy and not self._buffer
 
     def _execute(self, sql: str, params: Iterable[Any] = (), *, many: bool = False) -> bool:
         """执行写操作；失败时进入有界缓冲并返回 False。"""
@@ -205,17 +222,23 @@ class AuditStorage:
                     else:
                         conn.execute(sql, tuple(params))
                         conn.commit()
-                    # 缓冲恢复：尽力补写之前失败的事件
-                    while self._buffer:
-                        item = self._buffer[0]
-                        if self.pg:
-                            with conn.cursor() as cur:
-                                cur.execute(_to_pg(item["sql"]), tuple(item["params"]))
-                        else:
-                            conn.execute(item["sql"], tuple(item["params"]))
-                        self._buffer.popleft()
-                    if not self.pg:
-                        conn.commit()
+                    # 缓冲恢复：事务失败时把已弹出的事件原样放回，绝不丢审计记录
+                    replayed: list[dict[str, Any]] = []
+                    try:
+                        while self._buffer:
+                            item = self._buffer[0]
+                            if self.pg:
+                                with conn.cursor() as cur:
+                                    cur.execute(_to_pg(item["sql"]), tuple(item["params"]))
+                            else:
+                                conn.execute(item["sql"], tuple(item["params"]))
+                            self._buffer.popleft()
+                            replayed.append(item)
+                    except Exception:
+                        for item in reversed(replayed):
+                            self._buffer.appendleft(item)
+                        raise
+                    conn.commit()
                 finally:
                     conn.close()
             self._healthy = True
@@ -238,9 +261,10 @@ class AuditStorage:
                             if cur.description is None:
                                 return []
                             cols = [d[0] for d in cur.description]
-                            return [dict(zip(cols, row)) for row in cur.fetchall()]
+                            return [_redact_row(dict(zip(cols, row)))
+                                    for row in cur.fetchall()]
                     cur = conn.execute(sql, tuple(params))
-                    return [dict(row) for row in cur.fetchall()]
+                    return [_redact_row(dict(row)) for row in cur.fetchall()]
                 finally:
                     conn.close()
         except Exception as exc:  # noqa: BLE001
@@ -269,7 +293,8 @@ class AuditStorage:
     def add_event(self, kind: str, *, status: str = "", request_id: str = "",
                   trace_id: str = "", tool_name: str = "", actor_id: str = "",
                   client_id: str = "", source: str = "", detail: Any = "") -> bool:
-        text = detail if isinstance(detail, str) else json.dumps(detail, ensure_ascii=False)
+        raw = detail if isinstance(detail, str) else json.dumps(detail, ensure_ascii=False)
+        text = redact_text(raw, limit=MAX_FIELD_CHARS)
         return self._execute(
             "INSERT INTO audit_events (ts,kind,status,request_id,trace_id,tool_name,"
             "actor_id,client_id,source,detail) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -425,10 +450,18 @@ class AuditStorage:
         return self._query("SELECT * FROM audit_events WHERE request_id=? ORDER BY id", [request_id])
 
     def recent_events(self, after_id: int, limit: int = 100) -> list[dict[str, Any]]:
+        """SSE 增量追赶：返回 after_id 之后最早的若干条（升序）。"""
         return self._query(
             "SELECT * FROM audit_events WHERE id > ? ORDER BY id LIMIT ?",
             [after_id, min(limit, 500)],
         )
+
+    def latest_events(self, limit: int = 100) -> list[dict[str, Any]]:
+        """首屏展示：返回最新的若干条，仍按时间升序返回，由前端反转显示。"""
+        rows = self._query(
+            "SELECT * FROM audit_events ORDER BY id DESC LIMIT ?", [min(limit, 500)],
+        )
+        return list(reversed(rows))
 
     def max_event_id(self) -> int:
         rows = self._query("SELECT COALESCE(MAX(id),0) AS n FROM audit_events")

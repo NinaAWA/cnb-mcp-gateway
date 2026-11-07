@@ -53,7 +53,14 @@ def test_client_identity_comes_from_verified_token_only():
         assert trace.actor_id == trace.client_id
         assert "verified-token-abcdef" not in trace.client_id
         assert trace.declared_client == "codex-cli/1.0"
-        assert trace.remote_ip == "203.0.113.7"
+        # 默认不信任客户端自报的 XFF，来源 IP 取直连地址
+        assert trace.remote_ip == "10.0.0.5"
+        original_trust = mw.TRUST_PROXY
+        try:
+            mw.TRUST_PROXY = True
+            assert mw.bind_http_context(scope).remote_ip == "203.0.113.7"
+        finally:
+            mw.TRUST_PROXY = original_trust
         assert mw.bind_http_context({"type": "websocket", "headers": []}) is None
     finally:
         clear_trace()
@@ -169,3 +176,25 @@ def test_strict_mode_rejects_high_risk_when_storage_unavailable(monkeypatch):
         assert "审计存储不可用" in mw.result_text(result)
     finally:
         clear_trace()
+
+
+def test_read_path_redacts_legacy_plaintext(admin_client, login):
+    """绕过采集层直接写入的明文，不能从列表 / 详情 / 导出 / SSE 泄露。"""
+    from gateway.audit.events import ToolCallRecord, utcnow
+
+    client, storage, _ = admin_client
+    storage.insert_call(ToolCallRecord(
+        request_id="req_legacy", trace_id="trc_legacy",
+        timestamp_start=utcnow(), timestamp_end=utcnow(),
+        tool_name="run_command", status="SUCCESS", client_id="tok_test",
+        declared_client="legacy", source="mcp",
+        arguments='{"command":"echo MY_TOKEN=supersecretvalue"}',
+        result="postgresql://mcp:supersecretvalue@db:5432/audit",
+        duration_ms=1,
+    ))
+    login(client)
+    for path in ("/api/calls", "/api/calls/req_legacy", "/api/live/recent?after=0",
+                 "/api/export/stream?fmt=json", "/api/export/stream?fmt=csv"):
+        assert "supersecretvalue" not in client.get(path).text, path
+    rows, _ = storage.query_calls({})
+    assert "supersecretvalue" not in repr(rows)

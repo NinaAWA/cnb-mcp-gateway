@@ -3,7 +3,7 @@
 # 本地构建使用仓库根作为 context，包含 gateway/ 统一采集层。
 services:
   mcp-gateway:
-    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway:latest}
+    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway-plus:latest}
     build:
       context: .
       dockerfile: docker/Dockerfile
@@ -40,9 +40,24 @@ services:
       - AUDIT_STRICT=${AUDIT_STRICT:-0}
       - AUDIT_MAX_FIELD_CHARS=${AUDIT_MAX_FIELD_CHARS:-32768}
       - MCP_TASK_LOG_DIR=/data/audit/task-logs
+      # 新增安全策略：强制 PKCE、默认不信任 XFF、Git 子命令白名单扩展、密钥打印开关
+      - MCP_OAUTH_REQUIRE_PKCE=${MCP_OAUTH_REQUIRE_PKCE:-1}
+      - MCP_TRUST_PROXY=${MCP_TRUST_PROXY:-0}
+      - ADMIN_TRUST_PROXY=${ADMIN_TRUST_PROXY:-0}
+      - MCP_GIT_EXTRA_SUBCOMMANDS=${MCP_GIT_EXTRA_SUBCOMMANDS:-}
+      - MCP_PRINT_SECRETS=${MCP_PRINT_SECRETS:-0}
+      # 容器内 Git 身份 / 凭据（凭据文件建议以只读卷挂载，不要放进环境变量）
+      - GIT_USER_NAME=${GIT_USER_NAME:-}
+      - GIT_USER_EMAIL=${GIT_USER_EMAIL:-}
+      - GIT_CREDENTIALS_FILE=${GIT_CREDENTIALS_FILE:-}
     volumes:
       - ./workspace:/workspace
       - audit-data:/data/audit
+    # 不给 docker.sock、不启用 privileged；仅限制提权与进程数（防 fork bomb）。
+    # 保留 root 是为了让 agent 能装依赖/跑实验；生产可改用非 root + UID 映射挂载。
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 2048
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8765/health"]
       interval: 30s
@@ -51,7 +66,7 @@ services:
       start_period: 20s
 
   mcp-admin-web:
-    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway:latest}
+    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway-plus:latest}
     container_name: cnb-mcp-admin-web
     restart: unless-stopped
     depends_on:
@@ -76,6 +91,13 @@ services:
       - AUDIT_DB_DSN=${AUDIT_DB_DSN:-}
       - AUDIT_EXPORT_DIR=/data/audit/exports
       - MCP_TASK_LOG_DIR=/data/audit/task-logs
+      # 后台用 MCP_TOKEN 读取网关的受保护内部指标（不能用于登录后台）
+      - MCP_TOKEN=${MCP_TOKEN:-}
+      - ADMIN_TRUST_PROXY=${ADMIN_TRUST_PROXY:-0}
+      - MCP_PRINT_SECRETS=${MCP_PRINT_SECRETS:-0}
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
     # 默认只允许宿主机本机访问后台；CNB / 云平台端口预览需要设置 ADMIN_BIND_HOST=0.0.0.0，
     # 此时后台有独立登录鉴权，务必配合强口令、ADMIN_COOKIE_SECURE 与可选 MFA。
     ports:
@@ -90,7 +112,7 @@ services:
       start_period: 15s
 
   audit-storage:
-    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway:latest}
+    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway-plus:latest}
     container_name: cnb-audit-storage
     restart: unless-stopped
     environment:
@@ -104,6 +126,9 @@ services:
       - AUDIT_MAINTENANCE_INTERVAL=${AUDIT_MAINTENANCE_INTERVAL:-300}
     volumes:
       - audit-data:/data/audit
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
     healthcheck:
       test: ["CMD-SHELL", "test -f /data/audit/.maintenance.ok"]
       interval: 60s
@@ -114,7 +139,7 @@ services:
   # 可选 HTTPS 入口：docker compose --profile tunnel up -d
   # 同时在 .env 设置 MCP_TUNNEL_DISABLED=1，避免网关内置 quick tunnel 重复暴露。
   cloudflared:
-    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway:latest}
+    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway-plus:latest}
     profiles: ["tunnel"]
     container_name: cnb-mcp-cloudflared
     restart: unless-stopped
