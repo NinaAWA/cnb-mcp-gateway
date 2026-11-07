@@ -187,15 +187,17 @@
 - **规范提交**：功能分支 `upgrade/v3-full-admin-research` 上提交
   `592eafa1ed49720a39b03edd5be14ea6c1c49794`
   (`feat(v3): 升级为全权限科研服务器并完成 A–F 验收`)，74 文件 / +10,789 / -357；
-  本节回填另有一个纯文档提交。未改写 `main` 与历史，未强推。
+  另有本节回填与其措辞校正两个纯文档提交。未改写 `main` 与历史，未强推。
 - **功能分支 PR**：CNB [PR #1](https://cnb.cool/webgamer-2026/cnb-mcp-gateway/-/pulls/1)
   `main <- upgrade/v3-full-admin-research`，state=open，**未合并**；`cnb pulls get` 返回 200。
 - **`origin` 推送**：已执行，`* [new branch] HEAD -> upgrade/v3-full-admin-research`。
 - **`github` 推送**：已执行，同一分支推送到
   `https://github.com/NinaAWA/cnb-mcp-gateway.git`（纯 HTTPS remote URL，不含凭据）。
-- **凭据使用**：两枚明文 PAT 仅在单次 Python 进程内存中作为 `credential.helper` 输出，
-  未进入 argv / `.git/config` / `.git/.git-credentials` / remote URL / 任何仓库文件；
-  使用前视为已泄露，**请在使用后立即吊销并轮换**。
+- **凭据使用**：用户提供的两枚明文 PAT 中，仅第一枚实际用于推送（首轮即成功，第二枚未使用）。
+  它们只作为单次 Python 进程内的内存字符串 / 环境变量传给 `credential.helper`，
+  `git push` 的 argv 不含令牌；未写入 `.git/config` / `.git/.git-credentials` /
+  remote URL / 任何仓库文件。命令文本只在本次会话中出现，不落盘。
+  两枚 PAT 使用前均视为已泄露，**请立即全部吊销并轮换**。
 - **哈希复核**：推送前后 `.git/config` 与 `.git/.git-credentials` 的 SHA-256 与 7.2 基线
   **完全一致**（脚本内断言校验），两个 remote URL 仍为无凭据的纯 HTTPS 地址。
 
