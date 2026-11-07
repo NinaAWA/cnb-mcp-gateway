@@ -59,6 +59,9 @@ async def _lifespan(_app: FastAPI):
         else:
             print("[admin] 已生成管理员口令并持久化，默认不写入容器日志；"
                   "请从 ADMIN_PASSWORD_FILE 读取（或设置 MCP_PRINT_SECRETS=1）", flush=True)
+    elif os.environ.get("ADMIN_PASSWORD", "").strip() == "admin":
+        print("[admin] 正在使用镜像默认管理员口令 'admin'，仅限隔离环境；"
+              "请用 -e ADMIN_PASSWORD='<强口令>' 覆盖", flush=True)
     get_storage().add_event("admin_service", status="UP", source="admin",
                             detail="管理后台已启动")
     yield

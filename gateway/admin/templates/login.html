@@ -30,8 +30,9 @@
       <p class="error" id="login-error" role="alert">{{ error }}</p>
       <button type="submit" class="btn primary">登录</button>
     </form>
-    <p class="hint">首次启动若未设置 <code>ADMIN_PASSWORD</code>，随机口令会打印在容器日志中，
-      并保存在共享数据卷的受保护文件里（重启后不变）。后台与 MCP API 使用完全独立的访问控制，
+    <p class="hint">默认管理员口令为 <code>admin</code>（仅限隔离环境）；部署时可用
+      <code>ADMIN_PASSWORD</code> 设置更强口令。当前生效口令保存在共享数据卷的受保护文件
+      <code>/data/audit/.admin_password</code> 中。后台与 MCP API 使用完全独立的访问控制，
       未登录不能查看任何调用记录。</p>
     <button class="theme-toggle" type="button" onclick="toggleTheme()" aria-label="切换主题">◐</button>
   </main>

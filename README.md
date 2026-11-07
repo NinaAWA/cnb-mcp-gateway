@@ -58,6 +58,9 @@ audit log.
   can't be bypassed even with confirmation. Full audit log of every action.
 - **Sandbox knobs**: optional `MCP_ALLOWED_PREFIXES` allow-list, `MCP_DENY_PREFIXES`,
   `MCP_REQUIRE_CONFIRM`, working dir, audit log.
+- **Git LFS built in**: images ship `git-lfs` installed and initialized at system level,
+  so repositories with LFS `pre-push` hooks can be pushed without granting the agent
+  package-install permissions or weakening the command allow-list.
 - **Zero config ingress**: cloudflared quick tunnel gives you a public HTTPS URL
   automatically (URL rotates each restart; set `CF_TUNNEL_TOKEN` for a fixed URL).
 - **Self-contained Docker image**: server + tunnel in one container.
@@ -99,7 +102,7 @@ Or use the bundled helper (env-overridable):
 cp docker/.env.template .env
 # Pin MCP_TOKEN and ADMIN_PASSWORD in .env for production
 docker compose up -d --build
-docker exec cnb-mcp-admin-web cat /data/audit/.admin_password   # read the generated admin password
+docker exec cnb-mcp-admin-web cat /data/audit/.admin_password   # read the effective password (default: admin)
 ```
 
 The dashboard listens on `http://127.0.0.1:8788` only and uses a **separate admin account**
@@ -182,7 +185,7 @@ Example `claude_desktop_config.json`:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / generated | Separate admin account; the generated password is persisted in the `audit-data` volume. |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / `admin` | Separate admin account. The weak default is for isolated environments only — override with a strong `ADMIN_PASSWORD`; the effective password is persisted (mode 600) in the `audit-data` volume. |
 | `ADMIN_SESSION_SECRET` | (empty → sessions drop on restart) | HMAC key for session cookies. |
 | `ADMIN_SESSION_TTL` | `28800` | Session lifetime in seconds. |
 | `ADMIN_LOGIN_MAX_FAILURES` / `ADMIN_LOGIN_LOCK_MINUTES` | `5` / `15` | Failed-login lockout. |
@@ -299,8 +302,9 @@ least-privilege deploy key or PAT, keep independent backups, and avoid mounting
 - The public, unauthenticated `/health` returns only a minimal liveness status;
   metrics and tool counts moved to the Bearer-protected `/internal/metrics`, which the
   dashboard reads with `MCP_TOKEN`.
-- `MCP_TOKEN` and the generated admin password are **no longer printed to container
+- `MCP_TOKEN` and the effective admin password are **no longer printed to container
   logs** by default: read them from `/app/.env` and `/data/audit/.admin_password`.
+  The admin password defaults to `admin`; override it for any network-reachable deployment.
   OAuth requires S256 PKCE by default, validates `redirect_uri`, and expires tokens.
 
 ## Build from source

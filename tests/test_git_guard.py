@@ -114,6 +114,39 @@ class TestGitGuard(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertTrue(check_argv(argv).allowed, f"{argv} -> {check_argv(argv).reason}")
 
+    def test_lfs_subcommands(self):
+        allow = [
+            ["lfs", "pre-push", "origin", "https://cnb.cool/webgamer-2026/h1.git"],
+            ["lfs", "filter-process"],
+            ["lfs", "smudge"],
+            ["lfs", "clean"],
+            ["lfs", "pointer", "--file", "a.bin"],
+            ["lfs", "version"],
+            ["lfs", "env"],
+            ["lfs", "track", "*.psd"],
+            ["lfs", "ls-files"],
+            ["lfs", "status"],
+            ["lfs", "fsck"],
+            ["lfs", "push", "origin", "main"],
+            ["lfs", "fetch", "origin"],
+        ]
+        deny = [
+            ["lfs", "prune"],
+            ["lfs", "uninstall"],
+            ["lfs", "migrate", "import", "--everything"],
+            ["lfs", "pre-push", "--delete", "origin"],
+            ["lfs", "track", "--force"],
+            ["lfs"],
+        ]
+        for argv in allow:
+            with self.subTest(argv=argv):
+                decision = check_argv(argv)
+                self.assertTrue(decision.allowed, f"{argv} -> {decision.reason}")
+        for argv in deny:
+            with self.subTest(argv=argv):
+                self.assertFalse(check_argv(argv).allowed, argv)
+        self.assertTrue(check_command("git lfs version", cwd="/workspace").allowed)
+
     def test_repository_directory_is_protected(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "myrepo"

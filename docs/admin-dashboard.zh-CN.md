@@ -27,14 +27,15 @@ REST /run_command ─┼─> 统一采集层 ─> SQLite WAL (/data/audit/audit.
 
 ```bash
 cp docker/.env.template .env
-# 至少固定 MCP_TOKEN；生产环境建议同时设置 ADMIN_PASSWORD
+# 默认管理员口令为 admin；公网 / 生产环境务必改成强 ADMIN_PASSWORD
 docker compose up -d --build
-docker compose exec mcp-admin-web cat /data/audit/.admin_password   # 未设置 ADMIN_PASSWORD 时读取初始口令
+docker compose exec mcp-admin-web cat /data/audit/.admin_password   # 读取当前生效口令
 # 浏览器打开 http://127.0.0.1:8788
 ```
 
-首次启动若未设置 `ADMIN_PASSWORD`，入口脚本会生成随机口令、以 `600` 权限写入共享卷
-`/data/audit/.admin_password`；**重启后口令不变**，默认**不再打印到容器日志**（用上面的 `docker compose exec ... cat` 读取，
+未设置 `ADMIN_PASSWORD` 时使用镜像默认口令 `admin`（**仅限隔离环境**，公网可达时务必用强口令覆盖）。
+入口脚本会忽略旧卷里残留的随机口令文件，并把当前生效口令以 `600` 权限重新写入共享卷
+`/data/audit/.admin_password`；默认**不打印到容器日志**（用上面的 `docker compose exec ... cat` 读取，
 或在隔离环境设 `MCP_PRINT_SECRETS=1` 恢复打印）。`MCP_TOKEN` 同理默认只写入网关容器 `/app/.env`。
 Compose 模式下网关还会把令牌同步到共享卷 `/data/audit/.mcp_token`（权限 600），供后台读取需 Bearer 的
 `/internal/metrics`；该文件等同 `MCP_TOKEN`，请控制共享卷的访问权限。`.env` 含密钥，不要提交到仓库。
@@ -133,7 +134,7 @@ artifacts/                               大输出引用文件（权限 600）
 task-logs/                               后台任务日志
 exports/                                 导出文件（权限 600）
 archive/  backup/                        归档与备份
-.admin_password                          自动生成的管理员口令（权限 600）
+.admin_password                          当前生效的管理员口令（权限 600）
 .maintenance.ok                          维护心跳
 ```
 
@@ -148,7 +149,7 @@ docker compose exec audit-storage python -c \
 docker compose start mcp-gateway mcp-admin-web
 ```
 
-忘记管理员口令：
+忘记管理员口令（未配置 `ADMIN_PASSWORD` 时默认为 `admin`）：
 
 ```bash
 docker compose exec mcp-admin-web cat /data/audit/.admin_password

@@ -79,7 +79,7 @@ KNOWN_GIT_SUBCOMMANDS = frozenset({
     "count-objects", "credential", "describe", "diagnose", "diff", "diff-files",
     "diff-index", "diff-tree", "fetch", "fetch-pack", "filter-branch",
     "fmt-merge-msg", "for-each-ref", "format-patch", "fsck", "gc", "grep",
-    "hash-object", "help", "hook", "init", "log", "ls-files", "ls-remote",
+    "hash-object", "help", "hook", "init", "lfs", "log", "ls-files", "ls-remote",
     "ls-tree", "maintenance", "merge", "merge-base", "merge-file",
     "merge-index", "merge-one-file", "merge-tree", "mergetool", "mktag",
     "mktree", "multi-pack-index", "mv", "name-rev", "notes", "p4",
@@ -92,6 +92,14 @@ KNOWN_GIT_SUBCOMMANDS = frozenset({
     "update-index", "update-ref", "update-server-info", "var", "verify-commit",
     "verify-pack", "verify-tag", "version", "whatchanged", "worktree",
     "write-tree",
+})
+
+# 仓库 pre-push 钩子会调用 `git lfs pre-push`。只放行不会删除 LFS 对象、
+# 不重写历史的子操作；prune / uninstall / migrate 等一律拒绝，与 Git 删除硬防护一致。
+LFS_SAFE_SUBCOMMANDS = frozenset({
+    "clean", "env", "fetch", "filter-process", "fsck", "logs", "ls-files",
+    "pointer", "post-checkout", "post-commit", "post-merge", "pre-push",
+    "push", "smudge", "status", "track", "version",
 })
 
 _GLOBAL_NO_VALUE = frozenset({
@@ -176,6 +184,18 @@ def check_argv(argv: list[str]) -> Decision:
         return ALLOW
     if sub not in KNOWN_GIT_SUBCOMMANDS | _extra_subcommands():
         return _deny(f"未知 git 子命令 {sub!r}（可能是可展开成删除命令的 alias）")
+
+    if sub == "lfs":
+        # 取首个非选项参数作为 LFS 子操作。`git lfs pre-push origin <url>` 的远端
+        # URL 常以 .git 结尾，属于合法参数，不按危险 token 误杀。
+        lfs_sub = next((a.lower() for a in args if a and not a.startswith("-")), "")
+        if lfs_sub not in LFS_SAFE_SUBCOMMANDS:
+            return _deny(f"git lfs {lfs_sub or '(空子操作)'} 不在允许的安全子操作内")
+        lfs_flat = " ".join(args)
+        if _DELETE_FLAG_RE.search(lfs_flat) or re.search(
+                r"--(?:delete|force|prune|mirror|remove|uninstall)\b", lfs_flat, re.IGNORECASE):
+            return _deny("git lfs 的删除 / 强制类参数（与 Git 删除硬防护冲突）")
+        return ALLOW
 
     flat = " ".join(args)
 

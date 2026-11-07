@@ -10,27 +10,27 @@ case "$ROLE" in
     mkdir -p /data/audit
     PASS_FILE="${ADMIN_PASSWORD_FILE:-/data/audit/.admin_password}"
     ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
+    # 镜像默认口令 admin；显式传入空串也回落到默认值。旧部署的共享卷里可能残留
+    # 随机口令文件，升级后必须忽略而不是读取，否则固定口令不会生效。
+    # 仍以 600 权限写入最终生效口令，保证既有「cat $PASS_FILE」取口令方式可用。
     if [ -z "${ADMIN_PASSWORD:-}" ]; then
-      if [ -f "$PASS_FILE" ]; then
-        ADMIN_PASSWORD="$(cat "$PASS_FILE")"
-        echo "[entrypoint] 使用数据卷中保存的管理员口令: $PASS_FILE"
-      else
-        ADMIN_PASSWORD="$(python -c 'import secrets;print(secrets.token_urlsafe(24))')"
-        (umask 077; printf '%s\n' "$ADMIN_PASSWORD" > "$PASS_FILE")
-      fi
-      if [ "${MCP_PRINT_SECRETS:-0}" = "1" ]; then
-        echo "==================================================================="
-        echo " [自动生成] Admin Web 管理员口令（已保存到 $PASS_FILE，重启不变）"
-        echo "   账号: $ADMIN_USERNAME"
-        echo "   密码: $ADMIN_PASSWORD"
-        echo "==================================================================="
-      else
-        echo "[entrypoint] 管理员口令已生成并保存到 $PASS_FILE（默认不写入容器日志）"
-        echo "  读取方式: docker exec cnb-mcp-admin-web cat $PASS_FILE"
-        echo "  如需在日志中显示，可设置 MCP_PRINT_SECRETS=1（仅建议在隔离环境使用）"
-      fi
+      ADMIN_PASSWORD="admin"
+      echo "[entrypoint] 未配置 ADMIN_PASSWORD，使用镜像默认口令 'admin'（仅限隔离环境）"
+      echo "  建议启动时加 -e ADMIN_PASSWORD='<强口令>' 覆盖"
     fi
+    (umask 077; printf '%s\n' "$ADMIN_PASSWORD" > "$PASS_FILE")
     export ADMIN_PASSWORD ADMIN_USERNAME
+    if [ "${MCP_PRINT_SECRETS:-0}" = "1" ]; then
+      echo "==================================================================="
+      echo " Admin Web 管理员口令（已保存到 $PASS_FILE）"
+      echo "   账号: $ADMIN_USERNAME"
+      echo "   密码: $ADMIN_PASSWORD"
+      echo "==================================================================="
+    else
+      echo "[entrypoint] 管理员口令已保存到 $PASS_FILE（默认不写入容器日志）"
+      echo "  读取方式: docker exec <容器名> cat $PASS_FILE"
+      echo "  如需在日志中显示，可设置 MCP_PRINT_SECRETS=1（仅建议在隔离环境使用）"
+    fi
     echo "[entrypoint] 启动 Admin Web @ ${ADMIN_BIND:-0.0.0.0}:${ADMIN_PORT:-8788}"
     exec uvicorn gateway.admin.api:app \
       --host "${ADMIN_BIND:-0.0.0.0}" --port "${ADMIN_PORT:-8788}" --log-level info

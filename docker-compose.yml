@@ -77,8 +77,8 @@ services:
       - ADMIN_BIND=0.0.0.0
       - ADMIN_PORT=8788
       - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
-      # 留空时首次启动自动生成并持久化到 audit-data 卷，密码打印在容器日志。
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      # 留空回落到镜像默认 admin；公网 / 生产环境务必设置强口令。
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
       - ADMIN_SESSION_SECRET=${ADMIN_SESSION_SECRET:-}
       - ADMIN_SESSION_TTL=${ADMIN_SESSION_TTL:-28800}
       - ADMIN_LOGIN_MAX_FAILURES=${ADMIN_LOGIN_MAX_FAILURES:-5}

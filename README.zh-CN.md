@@ -36,6 +36,7 @@
   - `read_web_page` —— 可选抓取网页正文（默认关闭），带 SSRF 防护与不可信内容标注。
 - **安全模型**：默认开放（无白名单）+ 对破坏性命令的**确认门** + **毁灭级黑名单**（`rm -rf /`、`mkfs`、`shutdown` 等）即便确认也无法绕过 + **Git 删除硬保护**（删除分支/仓库、删除型 refspec、别名与混淆执行一律硬禁止）。每次操作都有完整审计日志。
 - **可调旋钮（Sandbox knobs）**：可选的 `MCP_ALLOWED_PREFIXES` 白名单、`MCP_DENY_PREFIXES`、`MCP_REQUIRE_CONFIRM`、工作目录、审计日志。
+- **内置 Git LFS**：制品已安装并系统级初始化 `git-lfs`，带 LFS `pre-push` 钩子的仓库可直接推送，无需向 agent 开放系统包安装权限或放宽命令白名单。
 - **零配置入口**：cloudflared 快速隧道自动给你一个公网 HTTPS 地址（每次重启地址会变；设置 `CF_TUNNEL_TOKEN` 可固定地址）。
 - **自包含镜像**：服务器 + 隧道在同一个容器里。
 - **MCP Admin Dashboard（多服务 Compose 部署，默认 3 容器 + 2 个可选 profile）**：独立管理员登录、实时调用监控、完整调用审计、
@@ -69,7 +70,7 @@ docker exec cnb-mcp-gateway cat /app/.env   # 读取 MCP_TOKEN
 cp docker/.env.template .env
 # 建议在 .env 中固定 MCP_TOKEN 与 ADMIN_PASSWORD
 docker compose up -d --build
-docker exec cnb-mcp-admin-web cat /data/audit/.admin_password   # 未设置 ADMIN_PASSWORD 时读取初始口令
+docker exec cnb-mcp-admin-web cat /data/audit/.admin_password   # 读取当前生效口令（默认 admin）
 ```
 
 后台默认只在宿主机 `http://127.0.0.1:8788` 可达，使用**独立管理员账号**登录（与 `MCP_TOKEN` 无关）；
@@ -155,7 +156,7 @@ Authorization: Bearer <MCP_TOKEN>
 
 | 变量 | 默认值 | 含义 |
 |---|---|---|
-| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / 随机生成 | 后台独立管理员账号；随机口令持久化在 `audit-data` 卷，重启不变。 |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / `admin` | 后台独立管理员账号；默认弱口令仅限隔离环境，建议用强 `ADMIN_PASSWORD` 覆盖。生效口令以 600 权限持久化在 `audit-data` 卷。 |
 | `ADMIN_SESSION_SECRET` | （空 = 重启后旧会话失效） | 会话 Cookie 的 HMAC 签名密钥。 |
 | `ADMIN_SESSION_TTL` | `28800` | 会话有效期（秒）。 |
 | `ADMIN_LOGIN_MAX_FAILURES` / `ADMIN_LOGIN_LOCK_MINUTES` | `5` / `15` | 失败次数上限与锁定窗口。 |
@@ -331,7 +332,7 @@ read_image(path="/workspace/results/loss_curve.png", max_dim=1024)
   后台写操作额外校验 Origin / Sec-Fetch-Site，登录锁定默认不信任可伪造的 `X-Forwarded-For`。
   详见 [部署与运维文档](./docs/admin-dashboard.zh-CN.md)。
 - 公网免鉴权的 `/health` 只返回最小存活状态；系统指标与工具数量改由需 Bearer 的 `/internal/metrics` 提供，后台用 `MCP_TOKEN` 读取。
-- `MCP_TOKEN` 与随机管理员口令**默认不再打印到容器日志**，分别从 `/app/.env` 与 `/data/audit/.admin_password` 读取；OAuth 默认强制 S256 PKCE、校验 `redirect_uri`、签发的 token 有过期并会回收。
+- `MCP_TOKEN` 与生效管理员口令**默认不再打印到容器日志**，分别从 `/app/.env` 与 `/data/audit/.admin_password` 读取；后台默认口令为 `admin`，任何网络可达的部署都应覆盖为强口令。OAuth 默认强制 S256 PKCE、校验 `redirect_uri`、签发的 token 有过期并会回收。
 - ⚠️ **密钥提醒**：如果你用的是共享/明文出现的 PAT 或令牌，建议用完后立即在对应平台撤销并轮换；agent 用的 Git 凭据务必最小权限，并在远端开启分支保护（见 [Git 删除保护](#git-删除保护硬约束)）。
 
 ## 从源码构建
