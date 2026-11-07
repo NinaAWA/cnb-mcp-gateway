@@ -54,6 +54,21 @@ case "$ROLE" in
     ;;
 esac
 
+# 其余角色都在上面 exec 退出，只有 gateway 会执行到这里。
+# 共享 audit-data 卷上的内部只读指标令牌：仅供后台请求 /health/details，
+# 绝不把 MCP_TOKEN（远程 shell 钥匙）交给后台，也不写入 .env 或日志。
+if [ "$ROLE" = "gateway" ]; then
+  METRICS_FILE="${GATEWAY_METRICS_TOKEN_FILE:-/data/audit/.metrics_token}"
+  mkdir -p "$(dirname "$METRICS_FILE")"
+  if [ -n "${GATEWAY_METRICS_TOKEN:-}" ]; then
+    (umask 077; printf '%s\n' "$GATEWAY_METRICS_TOKEN" > "$METRICS_FILE")
+  elif [ ! -s "$METRICS_FILE" ]; then
+    (umask 077; python -c 'import secrets;print(secrets.token_urlsafe(32))' > "$METRICS_FILE")
+    echo "[entrypoint] 已生成内部指标令牌: $METRICS_FILE（0600，仅用于 /health/details）"
+  fi
+  chmod 600 "$METRICS_FILE"
+fi
+
 PORT="${MCP_PORT:-8765}"
 BIND="${MCP_BIND:-127.0.0.1}"
 WORKDIR="${MCP_WORKDIR:-/workspace}"
@@ -90,7 +105,7 @@ mkdir -p "$WORKDIR"
 
 # 密钥：未提供则随机生成（容器重建会变化，请从 docker logs 记录）
 if [ -z "${MCP_TOKEN:-}" ]; then
-  MCP_TOKEN="$(python -c 'import secrets,string;print("".join(secrets.choice(string.ascii_letters+digits) for _ in range(48)))')"
+  MCP_TOKEN="$(python -c 'import secrets,string;print("".join(secrets.choice(string.ascii_letters+string.digits) for _ in range(48)))')"
   echo "==================================================================="
   echo " [自动生成] MCP_TOKEN（重开容器会变化，请妥善保存）:"
   echo "   $MCP_TOKEN"

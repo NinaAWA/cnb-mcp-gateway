@@ -13,6 +13,8 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
+from .redaction import redact_text
+
 _SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
 _TASK_RE = re.compile(r"task_id\s*[=:]\s*([A-Za-z0-9_-]{4,64})")
 _EXIT_RE = re.compile(r"(?:^|\n)exit[=:]\s*(-?\d+)")
@@ -146,6 +148,22 @@ def enrich(record: dict[str, Any], arguments: dict[str, Any],
     if "⚠️ 需确认" in text or args.get("confirm") is False:
         out["approval_id"] = f"apr_{record.get('request_id', '')[-10:]}"
 
+    # 派生字段可能来自原始命令：提交信息、远端地址、实验命令都含凭据风险。
+    for key in ("file_path", "git_repo", "task_id", "experiment_id", "approval_id"):
+        if isinstance(out.get(key), str):
+            out[key] = redact_text(out[key])
+    safe_events = []
+    for kind, values in out["sub_events"]:
+        clean: dict[str, Any] = {}
+        for key, value in values.items():
+            if not isinstance(value, str):
+                clean[key] = value
+            elif key == "push_remote" and "://" in value:
+                clean[key] = safe_repo_label(redact_text(value))
+            else:
+                clean[key] = redact_text(value)
+        safe_events.append((kind, clean))
+    out["sub_events"] = safe_events
     return out
 
 

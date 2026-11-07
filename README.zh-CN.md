@@ -117,6 +117,12 @@ Authorization: Bearer <MCP_TOKEN>
 - 注册地址 Registration URL：`https://<BASE_URL>/register`
 - 在同意页面：用户名 = 任意，**密码 = `MCP_TOKEN`**。
 
+本轮加固：`redirect_uri` 必须与 `/register` 注册值**精确匹配**（拒绝片段、通配符、内嵌凭据），
+GET / POST 都强制 PKCE `S256`，`/token` 会核对 `code_verifier`；签发的令牌按
+`MCP_OAUTH_TOKEN_TTL`（默认 30 天）过期并由中间件清理。老客户端可显式设置
+`OAUTH_ALLOW_ANY_REDIRECT=1` / `OAUTH_ALLOW_NO_PKCE=1` 降级兼容，默认均为 `0`，
+开启会削弱授权码流程，生产环境请勿启用。
+
 ## 配置（环境变量）
 
 | 变量 | 默认值 | 含义 |
@@ -154,8 +160,13 @@ Authorization: Bearer <MCP_TOKEN>
 | `ADMIN_COOKIE_SECURE` | `0` | 通过 HTTPS 访问后台时设为 `1`。 |
 | `ADMIN_HOST_PORT` / `ADMIN_BIND_HOST` | `8788` / `127.0.0.1` | 后台监听端口与绑定地址；CNB 等端口预览需设为 `0.0.0.0`，开放前请配置强口令与 MFA。 |
 | `AUDIT_DB_DSN` | （空 = SQLite WAL） | 可选 PostgreSQL DSN，配合 `postgres` profile。 |
-| `AUDIT_STRICT` | `0` | `1` = 审计存储不可用时拒绝高风险工具；默认降级放行，不中断实验。 |
-| `AUDIT_RETENTION_DAYS` / `AUDIT_MAX_DB_MB` | `90` / `512` | 归档保留天数与数据库配额。 |
+| `AUDIT_STRICT` | `0` | `1` = 只有确认 `RECEIVED` 行已持久化（数据库健康、缓冲为空、可回读）才放行高风险工具；默认降级缓冲，不中断实验。 |
+| `AUDIT_RETENTION_DAYS` / `AUDIT_MAX_DB_MB` | `90` / `512` | 保留天数与数据库配额；覆盖调用、事件、任务、Git、实验、审批、登录、导出与过期会话等所有历史表，`admin_settings` 不清理。 |
+| `AUDIT_ARCHIVE_BATCH` / `AUDIT_BUFFER_MAX` | `1000` / `1000` | 归档分批大小（100..5000）与写失败缓冲上限。 |
+| `MCP_SESSION_TTL` | `3600` | 客户端会话空闲 / 令牌有效期（秒），用于活跃客户端统计。 |
+| `OAUTH_ALLOW_ANY_REDIRECT` / `OAUTH_ALLOW_NO_PKCE` | `0` / `0` | 旧客户端兼容开关，默认关闭；开启有授权码被劫持风险。 |
+| `MCP_OAUTH_TOKEN_TTL` | `2592000` | OAuth 令牌有效期（秒）。 |
+| `GATEWAY_METRICS_TOKEN` | 自动生成 | `/health/details` 的内部只读令牌，落在共享卷 `/data/audit/.metrics_token`（600）；绝不能交给 agent。 |
 | `AUDIT_BACKUP_KEEP` / `AUDIT_MAINTENANCE_INTERVAL` | `7` / `300` | 备份保留数量与维护间隔（秒）。 |
 | `MCP_TUNNEL_DISABLED` | `0` | 启用独立 `cloudflared` 服务时设为 `1`。 |
 
@@ -247,6 +258,40 @@ read_image(path="/workspace/results/loss_curve.png", max_dim=1024)
   大输出只保存受保护引用；后台与 MCP API 的认证相互独立，未登录不能查询任何调用记录，
   也不能用 `MCP_TOKEN` 登录后台。详见 [部署与运维文档](./docs/admin-dashboard.zh-CN.md)。
 - ⚠️ **密钥提醒**：如果你用的是共享/明文出现的 PAT 或令牌，建议用完后立即在对应平台撤销并轮换。
+- **健康接口拆分**：公开 `/health` 只返回 `status` / `service` / `uptime_seconds` /
+  `audit.healthy`；工具数、审计详情与进程 / 容器指标移到需鉴权的 `/health/details`
+  （Bearer 或内部只读指标令牌）。Compose healthcheck 仍指向 `/health`。
+- **单一脱敏入口**：所有 SQL 写参数统一经过 `redact_params`；派生 Git / 实验字段、
+  旧式 `audit.log`、任务日志回读、归档文件与三种导出也都脱敏。归档按批写 JSONL（600）、
+  flush + fsync 并核验行数后才按主键精确删除；任一步失败保留全部数据并写
+  `audit_storage_warning`。
+- **严格审计是三态判定**：`available()` 只表示「还能缓冲」。`AUDIT_STRICT=1` 时高风险
+  工具额外要求 `confirm_persisted(request_id)`；终态写入失败会记录
+  `audit_strict_violation` 并体现在 `health()["strict_violations"]`。
+
+## 本轮修复的验证命令
+
+```bash
+# 静态与回归
+bash -n docker/entrypoint.sh
+docker compose config --quiet
+.venv/bin/python -m pytest tests -q          # 覆盖 6000 条归档、1200 条导出、OAuth、启动
+
+# 空 MCP_TOKEN 启动（入口会自动生成 48 位随机口令并打印到容器日志）
+unset MCP_TOKEN; docker compose up -d --build mcp-gateway
+
+# 健康接口隔离（网关在容器网络内，本机可用 docker compose exec 调用）
+docker compose exec mcp-gateway curl -fsS http://127.0.0.1:8765/health
+docker compose exec mcp-gateway curl -fsS http://127.0.0.1:8765/health/details   # 期望 401
+TOKEN=$(docker compose exec mcp-gateway cat /data/audit/.metrics_token)
+docker compose exec mcp-gateway curl -fsS -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:8765/health/details
+
+# 重启持久化：重建后台容器后历史记录仍在
+docker compose up -d --force-recreate mcp-admin-web
+docker compose exec mcp-admin-web python -c \
+  "from gateway.audit.storage import get_storage; print(get_storage().query_calls({})[1])"
+```
 
 ## 从源码构建
 

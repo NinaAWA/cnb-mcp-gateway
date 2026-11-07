@@ -143,6 +143,14 @@ Example `claude_desktop_config.json`:
 - Registration URL: `https://<BASE_URL>/register`
 - On the consent page: username = anything, **password = `MCP_TOKEN`**.
 
+OAuth hardening in this release: `redirect_uri` must **exactly** match a URI registered
+at `/register` (fragments, wildcards and embedded credentials are rejected), PKCE
+`S256` is mandatory and the `code_verifier` is verified at `/token`. Issued access
+tokens expire after `MCP_OAUTH_TOKEN_TTL` (default 30 days); expired entries are
+removed by the auth middleware. Legacy clients may opt out with
+`OAUTH_ALLOW_ANY_REDIRECT=1` / `OAUTH_ALLOW_NO_PKCE=1` — both default to `0` and
+enabling them weakens the authorization-code flow.
+
 ## Configuration (environment variables)
 
 | Variable | Default | Meaning |
@@ -180,8 +188,13 @@ Example `claude_desktop_config.json`:
 | `ADMIN_COOKIE_SECURE` | `0` | Set to `1` when the dashboard is served over HTTPS. |
 | `ADMIN_HOST_PORT` / `ADMIN_BIND_HOST` | `8788` / `127.0.0.1` | Dashboard port and bind address; use `0.0.0.0` for platform port-preview (set a strong password and MFA first). |
 | `AUDIT_DB_DSN` | (empty = SQLite WAL) | Optional PostgreSQL DSN for the `postgres` profile. |
-| `AUDIT_STRICT` | `0` | `1` rejects high-risk tools when audit storage is unavailable; default is graceful degradation. |
-| `AUDIT_RETENTION_DAYS` / `AUDIT_MAX_DB_MB` | `90` / `512` | Archive retention and DB quota. |
+| `AUDIT_STRICT` | `0` | `1` denies high-risk tools unless the `RECEIVED` row is confirmed persisted (healthy DB, empty buffer, read-back); default is graceful degradation with a bounded buffer. |
+| `AUDIT_RETENTION_DAYS` / `AUDIT_MAX_DB_MB` | `90` / `512` | Retention and DB quota. Every history table (calls, events, tasks, Git, experiments, approvals, logins, jobs, expired sessions) is archived in batches before exact-ID deletion; `admin_settings` is kept. |
+| `AUDIT_ARCHIVE_BATCH` / `AUDIT_BUFFER_MAX` | `1000` / `1000` | Archive batch size (100..5000) and write-failure buffer cap. |
+| `MCP_SESSION_TTL` | `3600` | Client-session idle/token TTL used for active-client statistics. |
+| `OAUTH_ALLOW_ANY_REDIRECT` / `OAUTH_ALLOW_NO_PKCE` | `0` / `0` | Legacy OAuth compatibility switches; keep off in production. |
+| `MCP_OAUTH_TOKEN_TTL` | `2592000` | Lifetime (seconds) of issued OAuth access tokens. |
+| `GATEWAY_METRICS_TOKEN` | auto-generated | Internal read-only token for `/health/details`, stored as `/data/audit/.metrics_token` (mode 0600). Never hand it to agents. |
 | `MCP_TUNNEL_DISABLED` | `0` | Set to `1` when using the standalone `cloudflared` service. |
 
 Full list: [`docker/.env.template`](./docker/.env.template) and the
@@ -242,6 +255,19 @@ Every result is labelled as untrusted external content in the tool output.
   are kept as protected references. Admin login is fully independent from the MCP API;
   unauthenticated users cannot read any call record. See the
   [deployment guide](./docs/admin-dashboard.zh-CN.md).
+- **Health endpoints are split.** Public `/health` returns only `status`, `service`,
+  `uptime_seconds` and `audit.healthy`. Tool count, detailed audit state and
+  process/container metrics require authenticated `/health/details` (Bearer or the
+  internal read-only metrics token). Compose healthchecks still use `/health`.
+- **One redaction boundary.** Every SQL write parameter passes through `redact_params`;
+  derived Git/experiment fields, the legacy `audit.log`, task-log readback, archives
+  and all exports are redacted too. Archive files are created 0600, flushed + fsynced
+  and line-count checked before only those exact primary keys are deleted — a failed
+  batch keeps all data and raises `audit_storage_warning`.
+- **Strict audit is a three-state decision.** `available()` only means "can buffer".
+  With `AUDIT_STRICT=1`, high-risk tools additionally require
+  `confirm_persisted(request_id)`; a failed terminal write is surfaced as an
+  `audit_strict_violation` event and in `health()["strict_violations"]`.
 
 ## Build from source
 
