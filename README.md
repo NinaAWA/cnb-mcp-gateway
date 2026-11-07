@@ -81,7 +81,7 @@ audit log.
 # 2) run it (default is fully open; tighten with -e MCP_ALLOWED_PREFIXES="git|python3|ls" if you like)
 docker run -d --name cnb-mcp-gateway --restart unless-stopped \
   -v "$PWD:/workspace" \
-  ghcr.io/ninaawa/cnb-mcp-gateway-plus:latest
+  ghcr.io/ninaawa/cnb-mcp-gateway:latest
 
 docker logs -f cnb-mcp-gateway              # prints BASE_URL, /mcp, openapi (no secrets by default)
 docker exec cnb-mcp-gateway cat /app/.env   # read MCP_TOKEN

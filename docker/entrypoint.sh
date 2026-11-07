@@ -96,7 +96,7 @@ mkdir -p "$WORKDIR"
 
 # 密钥：未提供则随机生成（容器重建会变化，请从 docker logs 记录）
 if [ -z "${MCP_TOKEN:-}" ]; then
-  MCP_TOKEN="$(python -c 'import secrets,string;print("".join(secrets.choice(string.ascii_letters+digits) for _ in range(48)))')"
+  MCP_TOKEN="$(python -c 'import secrets,string; alphabet=string.ascii_letters+string.digits; print("".join(secrets.choice(alphabet) for _ in range(48)))')"
   if [ "${MCP_PRINT_SECRETS:-0}" = "1" ]; then
     echo "==================================================================="
     echo " [自动生成] MCP_TOKEN（重开容器会变化，请妥善保存）:"
@@ -104,7 +104,7 @@ if [ -z "${MCP_TOKEN:-}" ]; then
     echo "==================================================================="
   else
     echo "[entrypoint] 已生成 MCP_TOKEN 并写入 /app/.env（默认不写入容器日志）"
-    echo "  读取方式: docker exec cnb-mcp-gateway cat /app/.env"
+    echo "  读取方式: docker exec <容器名> cat /app/.env（例如 cnb-mcp-gateway-plus）"
   fi
 fi
 export MCP_TOKEN MCP_PORT="$PORT" MCP_BIND="$BIND" MCP_WORKDIR="$WORKDIR" MCP_ALLOWED_PREFIXES="$ALLOWED"
@@ -191,14 +191,14 @@ else
       echo "   $MCP_TOKEN"
     else
       echo " 密钥 (MCP_TOKEN): 已写入 /app/.env，默认不在日志打印"
-      echo "   docker exec cnb-mcp-gateway cat /app/.env"
+      echo "   docker exec <容器名> cat /app/.env（例如 cnb-mcp-gateway-plus）"
     fi
     echo ""
     echo " 用法: ChatGPT 上传插件包(zip) 或 添加自定义 MCP 服务器 ${URL}/mcp"
     echo "       密钥在安装/连接时粘贴上面的 MCP_TOKEN"
     echo "==================================================================="
   else
-    echo "[entrypoint] 未能解析隧道 URL，请查看: docker logs cnb-mcp-gateway 或 docker exec cnb-mcp-gateway tail -f /tmp/cloudflared.log"
+    echo "[entrypoint] 未能解析隧道 URL，请查看: docker logs <容器名> 或 docker exec <容器名> tail -f /tmp/cloudflared.log"
   fi
 fi
 

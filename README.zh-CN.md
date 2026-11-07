@@ -51,7 +51,7 @@
 # 2) 启动（默认全开放；如需收紧可加 -e MCP_ALLOWED_PREFIXES="git|python3|ls"）
 docker run -d --name cnb-mcp-gateway --restart unless-stopped \
   -v "$PWD:/workspace" \
-  ghcr.io/ninaawa/cnb-mcp-gateway-plus:latest
+  ghcr.io/ninaawa/cnb-mcp-gateway:latest
 
 docker logs -f cnb-mcp-gateway              # 打印 BASE_URL、/mcp、openapi（默认不打印密钥）
 docker exec cnb-mcp-gateway cat /app/.env   # 读取 MCP_TOKEN

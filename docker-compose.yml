@@ -3,7 +3,7 @@
 # 本地构建使用仓库根作为 context，包含 gateway/ 统一采集层。
 services:
   mcp-gateway:
-    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway-plus:latest}
+    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway:latest}
     build:
       context: .
       dockerfile: docker/Dockerfile
@@ -66,7 +66,7 @@ services:
       start_period: 20s
 
   mcp-admin-web:
-    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway-plus:latest}
+    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway:latest}
     container_name: cnb-mcp-admin-web
     restart: unless-stopped
     depends_on:
@@ -112,7 +112,7 @@ services:
       start_period: 15s
 
   audit-storage:
-    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway-plus:latest}
+    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway:latest}
     container_name: cnb-audit-storage
     restart: unless-stopped
     environment:
@@ -139,7 +139,7 @@ services:
   # 可选 HTTPS 入口：docker compose --profile tunnel up -d
   # 同时在 .env 设置 MCP_TUNNEL_DISABLED=1，避免网关内置 quick tunnel 重复暴露。
   cloudflared:
-    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway-plus:latest}
+    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway:latest}
     profiles: ["tunnel"]
     container_name: cnb-mcp-cloudflared
     restart: unless-stopped
