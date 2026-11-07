@@ -10,6 +10,37 @@
    └─ cloudflared 快速隧道（随机 https 地址） ◄── 鉴权：Bearer 令牌 / OAuth2 PKCE
 ```
 
+## V3 升级（当前分支 `upgrade/v3-full-admin-research`）
+
+本分支把网关升级为面向**可信管理员**的全权限科研服务器：**49 个 `@mcp.tool()`**（基线 21 个全部保留），
+覆盖服务器管理、结构化 Git、科研实验、免费网页搜索、免费学术检索、合法开放获取 PDF 下载与阅读、
+本地文献库、分块 / Range 文件传输、Web 管理后台与完整操作审计。
+
+- 中文部署与升级：[docs/v3-upgrade.zh-CN.md](./docs/v3-upgrade.zh-CN.md) ·
+  基线清单：[docs/v3-inventory.md](./docs/v3-inventory.md) ·
+  验收报告：[docs/v3-acceptance-report.md](./docs/v3-acceptance-report.md)
+- **默认 `MCP_ACCESS_MODE=full_admin`**：不启用路径 / Shell 白名单。灾难级正则与
+  `confirm` 确认门是**辅助保护，不是安全边界**；真正边界是只把 `MCP_TOKEN` 交给可信管理员。
+- **双执行后端**：`container`（默认）或经 0600 Unix Socket + HMAC 授权的 `host`；
+  Compose `host` profile 不发布任何端口，真实宿主权限需部署时由用户显式授予，网关不自动提权。
+- **免费检索**：8 个零 Key 学术源 + 垂直社区源 + 可选通用搜索（`search` profile 自建 SearXNG）。
+  **垂直社区搜索不等于全网通用搜索**；免费 API 不是无限调用；SearXNG 软件免费不等于上游可达。
+- **合法 OA PDF**：仅供开放获取来源，严格校验（`%PDF-` 头 / Content-Type / 最终 URL / 大小 /
+  EOF / SHA-256 / 原子改名）与断点续传；状态明确区分「任务创建成功」与「文件最终校验成功」。
+  `pypdf` 是唯一新增纯 Python 依赖；**OCR 为可选能力，默认不安装、不调用**。
+- **后台新增两页**：搜索监控、论文库与下载；所有监控数据标注来自容器 / 宿主机 / 外部来源。
+
+```bash
+# 离线全量当前 143 passed（14 条 opt-in 集成测试默认取消选中）
+.venv/bin/python -m pytest -q
+# 独立真实网络集成 + 8 条真实 MCP 客户端工作流：13 passed / 1 skipped
+# （SearXNG 上游未配置）；浏览器视觉验收未执行
+.venv/bin/python -m pytest -q -m integration tests/integration/
+bash -n docker/entrypoint.sh && node --check gateway/admin/static/app.js && docker compose config -q
+```
+
+> 第「功能特性」及后续章节为基线说明（21 个工具）。若与本节冲突，以本节和 V3 文档为准。
+
 ## 为什么做这个
 
 你想让 AI agent 能**从任意位置在你的服务器上执行命令**，但又不想直接给一个开放 shell。这个网关把一组受控工具（带令牌门、确认门与危险黑名单安全网、完整审计日志）暴露出来，而不是裸 shell。
@@ -18,7 +49,7 @@
 
 - **通用 MCP**：支持所有会说 MCP 的客户端：
   - **Bearer 直连（最简单）**：向 `/mcp` 发送 `Authorization: Bearer <MCP_TOKEN>`，无需 OAuth 往返。适用于 Claude Desktop / Cursor / VS Code / 各类 SDK。
-  - **OAuth 2.1（PKCE + DCR）**：给只支持 OAuth 的客户端（如 ChatGPT 连接器）用。`redirect_uri` 接受任意合法的绝对 URI（`https://`、`http://`、自定义 scheme），不会把非 ChatGPT 的 agent 挡在门外。
+  - **OAuth 2.1（PKCE + DCR）**：给只支持 OAuth 的客户端（如 ChatGPT 连接器）用。`redirect_uri` 默认要求与 DCR 注册值**精确匹配**并强制 PKCE `S256`；`OAUTH_ALLOW_ANY_REDIRECT=1` / `OAUTH_ALLOW_NO_PKCE=1` 是仅供旧客户端的显式降级开关，默认 `0`。
 - **远程管理工具集（灵感来自 Remote Desktop Commander，但适配 Linux）**——真正像 RDC 一样跑实验、配环境、看数据与图片：
   - `run_command` —— 执行 shell 命令（默认**开放**；破坏性命令需要 `confirm=true`；毁灭级命令被安全网**硬禁止**）。
   - `run_command_background` + `get_task_status` / `get_task_output` / `tail_task` / `stop_task` —— 跑**长实验**（训练/推理），不被超时掐断。
@@ -29,7 +60,7 @@
   - `get_system_info` —— 内核、运行时间、CPU、内存、磁盘。
   - `get_environment_variables` —— 当前环境变量（密钥值已脱敏）。
 - **网页搜索 + 论文检索（零 API Key）**，方案调研见 [免费/开源数据源选型](./docs/search-sources-research.md)：
-  - `search_papers` —— 聚合 OpenAlex、arXiv、CrossRef、PubMed、Europe PMC（另可选 OpenReview / dblp / Semantic Scholar）；多源结果轮流交错，带 DOI、引用数、摘要与开放全文链接。
+  - `search_papers` —— 聚合 OpenAlex、arXiv、CrossRef、PubMed、Europe PMC（另可选 OpenReview / dblp / Semantic Scholar）；V3 起先跨源合并去重、再全局排序、最后截断，带 DOI、引用数（`None` = 不可用，`0` = 真实零引用）、摘要与开放全文链接，可选 `format="json"`。
   - `search_arxiv` / `get_paper` —— 按作者/分类查 arXiv；按 DOI / arXiv ID / PMID 查单篇论文。
   - `search_web` —— 可插拔 provider，默认 Hacker News + StackExchange（免密钥）；可选 GitHub、自建 SearXNG、Tavily。
   - `read_web_page` —— 可选抓取网页正文（默认关闭），带 SSRF 防护与不可信内容标注。
@@ -37,7 +68,7 @@
 - **可调旋钮（Sandbox knobs）**：可选的 `MCP_ALLOWED_PREFIXES` 白名单、`MCP_DENY_PREFIXES`、`MCP_REQUIRE_CONFIRM`、工作目录、审计日志。
 - **零配置入口**：cloudflared 快速隧道自动给你一个公网 HTTPS 地址（每次重启地址会变；设置 `CF_TUNNEL_TOKEN` 可固定地址）。
 - **自包含镜像**：服务器 + 隧道在同一个容器里。
-- **MCP Admin Dashboard（四服务 Compose 部署）**：独立管理员登录、实时调用监控、完整调用审计、
+- **MCP Admin Dashboard（Compose：3 个常驻服务 + 4 个可选 profile）**：独立管理员登录、实时调用监控、完整调用审计、
   Git/实验监控、容器状态、图表与日志导出；SQLite WAL 持久化，默认脱敏、大输出只存引用。
   详见 [中文部署与运维文档](./docs/admin-dashboard.zh-CN.md)。
 
@@ -61,7 +92,7 @@ docker logs -f cnb-mcp-gateway   # 会打印 BASE_URL、/mcp、openapi、MCP_TOK
 ./run.sh
 ```
 
-### 带审计后台的四服务部署（推荐用于服务器管理与完整调用审计）
+### 带审计后台的 Compose 部署（推荐用于服务器管理与完整调用审计）
 
 ```bash
 cp docker/.env.template .env
@@ -133,7 +164,7 @@ GET / POST 都强制 PKCE `S256`，`/token` 会核对 `code_verifier`；签发�
 | `MCP_REQUIRE_CONFIRM` | （空） | 追加到**需确认**列表（逗号或竖线分隔）；匹配到的命令需 `confirm=true` 才执行。 |
 | `CF_TUNNEL_TOKEN` | （空 → 快速隧道） | 命名 Cloudflare 隧道令牌 → **固定地址**。 |
 | `MCP_WORKDIR` | `/workspace` | 命令执行的工作目录（自动创建）。 |
-| `MCP_WORKDIR_MOUNT` | （未设置） | 宿主机挂载到容器内 `/workspace` 的路径。 |
+| `MCP_WORKDIR_MOUNT` | （未设置） | **仅 `run.sh` 单容器脚本读取**；Compose 部署使用 `docker-compose.yml` 中固定的 `./workspace` 绑定挂载，此变量不生效。 |
 | `MCP_SEARCH_TIMEOUT` | `10` | 单次外部请求超时（秒）。 |
 | `MCP_SEARCH_MAX_RESULTS` | `8` | 每个来源 / provider 的条数上限（最终输出最多 30 条）。 |
 | `MCP_SEARCH_MAX_BYTES` | `2000000` | 响应体体积上限（字节）。 |
@@ -209,6 +240,19 @@ GET / POST 都强制 PKCE `S256`，`/token` 会核对 `code_verifier`；签发�
 | `search_web` | 网页 / 技术社区检索 | 默认 HN + StackExchange；可选 GitHub / SearXNG / Tavily。 |
 | `read_web_page` | 抓取网页正文 | 默认关闭（`MCP_SEARCH_FETCH_ENABLED=1`）；仅 HTTPS + SSRF 防护。 |
 
+### V3 新增工具（28 个）
+
+| 分组 | 工具 | 要点 |
+|---|---|--- |
+| 网页 | `search_web_advanced` / `fetch_web_page` / `extract_web_content` / `search_website` | 站点 / 时间 / 语言筛选、去重、来源与抓取时间、逐源失败原因；垂直源不冒充全网搜索 |
+| 论文 | `find_paper_fulltext` / `download_paper` / `batch_download_papers` / `read_paper_pdf` / `search_paper_fulltext` / `list_downloaded_papers` / `get_paper_download_status` / `export_bibliography` | 合法 OA 发现、严格校验与续传、按页阅读、文献库与 BibTeX/RIS/CSV/JSON 导出；`created` ≠ `success` |
+| 权限 / 后端 | `request_approval` / `host_status` | 可选独立审批；容器 / 宿主来源与授权状态如实报告 |
+| Git | `git_inspect` / `git_clone` / `git_branch` / `git_stage` / `git_commit` / `git_sync` / `git_recover` / `git_worktree` | `shell=False`、按仓库锁、高风险默认 `dry_run`、凭据只走 `GIT_ASKPASS` |
+| 传输 / 任务 | `upload_file` / `download_file` / `signed_download_link` / `file_transfer_status` / `list_tasks` / `experiment_manifest` | 分块 / Range / 短期签名链接；任务重关联、进程组终止与复现元数据 |
+
+`run_command` 追加可选 `backend`（默认 `container`）与 `approval_id`；`search_papers` / `get_paper`
+追加可选 `format="json"`（默认仍为文本）。所有工具由一处 `AuditMiddleware` 统一审计与脱敏。
+
 ### 检索示例
 
 ```text
@@ -254,7 +298,7 @@ read_image(path="/workspace/results/loss_curve.png", max_dim=1024)
 - 检索工具只访问固定域名白名单，限制响应体积并按来源限速；`read_web_page` 默认关闭，开启后也会拦截非 HTTPS、IP 字面量与私网地址（含跳转目标）。
 - 外部数据源返回的标题、摘要与正文都是**不可信数据**，工具输出会明确标注，避免提示注入；不要把它们当作指令执行。
 - 被执行过的命令，以及检索活动（查询词、来源、耗时、结果条数）都会写入容器内的 `/app/audit.log`；密钥与响应体不会写入日志。
-- 四服务部署还会把完整调用记录写入共享卷的 SQLite WAL 审计库：参数、输出与错误统一脱敏，
+- Compose 部署还会把完整调用记录写入共享卷的 SQLite WAL 审计库：参数、输出与错误统一脱敏，
   大输出只保存受保护引用；后台与 MCP API 的认证相互独立，未登录不能查询任何调用记录，
   也不能用 `MCP_TOKEN` 登录后台。详见 [部署与运维文档](./docs/admin-dashboard.zh-CN.md)。
 - ⚠️ **密钥提醒**：如果你用的是共享/明文出现的 PAT 或令牌，建议用完后立即在对应平台撤销并轮换。
@@ -305,7 +349,7 @@ docker logs -f cnb-mcp-gateway
 ```
 
 > 构建上下文已改为仓库根目录，因为镜像现在还包含 `gateway/` 统一采集层与 Admin Web。
-> 四服务部署用 `docker compose up -d --build`；测试用 `.venv/bin/python -m pytest tests -q`。
+> Compose 部署用 `docker compose up -d --build`；测试用 `.venv/bin/python -m pytest tests -q`。
 
 ## 许可证
 

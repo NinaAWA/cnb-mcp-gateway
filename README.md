@@ -14,6 +14,45 @@ the public internet via a Cloudflare quick tunnel.
    └─ cloudflared quick tunnel (random https URL) ◄── auth: Bearer token / OAuth2 PKCE
 ```
 
+## V3 upgrade (branch `upgrade/v3-full-admin-research`)
+
+This branch upgrades the gateway into a full-permission research server for a
+**trusted administrator**: **49 `@mcp.tool()` entries** (all 21 baseline tools kept),
+covering server management, structured Git, long-running experiments, free web search,
+free academic search, lawful open-access PDF download/reading, a local paper library,
+chunked/Range file transfer, the admin dashboard, and complete operation auditing.
+
+- Docs: [Chinese upgrade & deployment guide](./docs/v3-upgrade.zh-CN.md) ·
+  [baseline inventory](./docs/v3-inventory.md) · [acceptance report](./docs/v3-acceptance-report.md)
+- **`MCP_ACCESS_MODE=full_admin` by default** — no path or shell allow-list. The danger
+  regex and `confirm` gate are **auxiliary guards, not a security boundary**; the real
+  boundary is giving `MCP_TOKEN` only to a trusted administrator.
+- **Two execution backends**: `container` (default) or `host` over a 0600 Unix Socket
+  with HMAC. The Compose `host` profile publishes **no ports**; real host permissions
+  must be granted explicitly at deploy time — the gateway never self-escalates.
+- **Free retrieval**: 8 zero-key academic sources + vertical community sources +
+  optional general search (`search` profile, self-hosted SearXNG). **Vertical community
+  search is not general web search**; free APIs are not unlimited; free SearXNG software
+  does not imply upstream reachability.
+- **Lawful OA PDFs only**: strict validation (`%PDF-` header, Content-Type, final URL,
+  size, EOF, SHA-256, atomic rename) and resumable download. Task states explicitly
+  distinguish "task created" from "file finally verified". `pypdf` is the only new
+  pure-Python dependency; **OCR is optional and disabled by default**.
+- **Dashboard**: new "Search Monitoring" and "Paper Library & Downloads" views; every
+  data block labels its origin (container / host / external source).
+
+```bash
+# Offline suite currently 143 passed (14 opt-in integration tests deselected).
+.venv/bin/python -m pytest -q
+# Opt-in real-network + 8 real MCP-client workflows: 13 passed, 1 skipped
+# (SearXNG upstream not configured). Browser visual review is NOT executed.
+.venv/bin/python -m pytest -q -m integration tests/integration/
+bash -n docker/entrypoint.sh && node --check gateway/admin/static/app.js && docker compose config -q
+```
+
+> Sections below describe the 21-tool baseline. Where they conflict with this section,
+> follow this section and the V3 docs.
+
 ## Why
 
 You want to let an AI agent run commands **on your server** from anywhere, but
@@ -27,8 +66,9 @@ audit log.
   - **Bearer direct** (simplest): send `Authorization: Bearer <MCP_TOKEN>` to
     `/mcp`. No OAuth round-trip needed. Claude Desktop / Cursor / VS Code / SDKs.
   - **OAuth 2.1 (PKCE + DCR)** for clients that only support OAuth (e.g. ChatGPT
-    connectors). `redirect_uri` accepts any valid absolute URI (`https://`,
-    `http://`, custom schemes) so non-ChatGPT agents are not blocked.
+    connectors). `redirect_uri` must exactly match the DCR-registered value and PKCE
+    `S256` is enforced by default; `OAUTH_ALLOW_ANY_REDIRECT=1` /
+    `OAUTH_ALLOW_NO_PKCE=1` are explicit legacy-compatibility downgrades (default `0`).
 - **Remote-control toolkit** (inspired by Remote Desktop Commander, adapted to Linux) —
   run experiments, set up environments, view data **and images**, exactly like RDC:
   - `run_command` — execute a shell command (default **open**; destructive commands
@@ -60,7 +100,7 @@ audit log.
 - **Zero config ingress**: cloudflared quick tunnel gives you a public HTTPS URL
   automatically (URL rotates each restart; set `CF_TUNNEL_TOKEN` for a fixed URL).
 - **Self-contained Docker image**: server + tunnel in one container.
-- **MCP Admin Dashboard (four-service Compose deployment)**: separate admin login,
+- **MCP Admin Dashboard (Compose: 3 always-on services + 4 optional profiles)**: separate admin login,
   live call monitoring, complete call audit, Git/experiment views, per-container metrics,
   charts and exports. SQLite WAL storage with redaction by default; large outputs are stored
   as protected references. See the [Chinese deployment guide](./docs/admin-dashboard.zh-CN.md).
@@ -85,7 +125,7 @@ Or use the bundled helper (env-overridable):
 ./run.sh
 ```
 
-### Four-service deployment with the audit dashboard (recommended for server management)
+### Compose deployment with the audit dashboard (recommended for server management)
 
 ```bash
 cp docker/.env.template .env
@@ -161,7 +201,7 @@ enabling them weakens the authorization-code flow.
 | `MCP_REQUIRE_CONFIRM` | (empty) | 追加到**需确认**列表（逗号或竖线分隔）；匹配到的命令需 `confirm=true` 才执行。 |
 | `CF_TUNNEL_TOKEN` | (empty → quick tunnel) | Named Cloudflare tunnel token → **fixed URL**. |
 | `MCP_WORKDIR` | `/workspace` | Working directory for executed commands (auto-created). |
-| `MCP_WORKDIR_MOUNT` | (unset) | Host path mounted into the container at `/workspace`. |
+| `MCP_WORKDIR_MOUNT` | (unset) | Only read by `run.sh` (single-container script). Compose deployments use the fixed `./workspace` bind mount in `docker-compose.yml`; this variable has no effect there. |
 | `MCP_SEARCH_TIMEOUT` | `10` | Per-request timeout in seconds. |
 | `MCP_SEARCH_MAX_RESULTS` | `8` | Max results per source / provider (final output ≤ 30). |
 | `MCP_SEARCH_MAX_BYTES` | `2000000` | Max response body size in bytes. |
@@ -218,6 +258,20 @@ Full list: [`docker/.env.template`](./docker/.env.template) and the
 | `search_web` | Web / tech-community search | Default HN + StackExchange; optional GitHub / SearXNG / Tavily. |
 | `read_web_page` | Extract page text | Off by default (`MCP_SEARCH_FETCH_ENABLED=1`); HTTPS + SSRF guards. |
 
+### V3 additions (28 tools)
+
+| Group | Tools | Notes |
+|---|---|---|
+| Web | `search_web_advanced`, `fetch_web_page`, `extract_web_content`, `search_website` | Site/time/language filters, dedup, per-source failure reasons; vertical sources are not general web search |
+| Papers | `find_paper_fulltext`, `download_paper`, `batch_download_papers`, `read_paper_pdf`, `search_paper_fulltext`, `list_downloaded_papers`, `get_paper_download_status`, `export_bibliography` | Lawful OA discovery, strict verification + resume, page-level reading, library and BibTeX/RIS/CSV/JSON export; `created` != `success` |
+| Access / backend | `request_approval`, `host_status` | Optional independent approval; honest container/host availability |
+| Git | `git_inspect`, `git_clone`, `git_branch`, `git_stage`, `git_commit`, `git_sync`, `git_recover`, `git_worktree` | `shell=False`, per-repo locks, `dry_run` default for high-risk ops, credentials only via `GIT_ASKPASS` |
+| Transfer / tasks | `upload_file`, `download_file`, `signed_download_link`, `file_transfer_status`, `list_tasks`, `experiment_manifest` | Chunked/Range/short-lived signed links; task reconciliation, process-group kill, reproducibility manifest |
+
+`run_command` gains optional `backend` (default `container`) and `approval_id`;
+`search_papers` / `get_paper` gain optional `format="json"` (text output remains the default).
+Every tool is covered by the single `AuditMiddleware` for auditing and redaction.
+
 ### Search examples
 
 ```text
@@ -250,7 +304,7 @@ Every result is labelled as untrusted external content in the tool output.
 - Executed commands and search activity (query, source, duration, result count)
   are written to `/app/audit.log` inside the container; keys and response bodies
   are never logged.
-- With the four-service deployment, full call records also go to a SQLite WAL audit DB
+- With the Compose deployment, full call records also go to a SQLite WAL audit DB
   on the shared volume: arguments, outputs and errors are redacted, and large outputs
   are kept as protected references. Admin login is fully independent from the MCP API;
   unauthenticated users cannot read any call record. See the
@@ -282,7 +336,7 @@ docker logs -f cnb-mcp-gateway
 
 > The build context is now the repository root because the image also contains the
 > `gateway/` audit layer and Admin Web. Use `docker compose up -d --build` for the
-> four-service deployment; run tests with `.venv/bin/python -m pytest tests -q`.
+> Compose deployment; run tests with `.venv/bin/python -m pytest tests -q`.
 
 ## License
 

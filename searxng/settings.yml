@@ -1,0 +1,54 @@
+# 自建 SearXNG 配置（仅供网关经容器内部网络调用）。
+# 软件免费 ≠ 上游引擎可达：部署后必须用 search_web / search_web_advanced
+# 实际探测；若上游返回 429 或不可达，网关会如实报告来源失败。
+use_default_settings: true
+
+general:
+  instance_name: "cnb-mcp-gateway-searxng"
+  debug: false
+  enable_metrics: false
+
+server:
+  bind_address: "0.0.0.0"
+  port: 8080
+  # 占位值：本实例只在容器内部网络可达、不发布端口、public_instance=false。
+  # 生产部署请设置 SEARXNG_SECRET；若镜像入口因下方 settings.yml 只读挂载
+  # 而无法覆盖，请挂载一份写入真实密钥的 searxng/settings.local.yml（不要提交）。
+  secret_key: "change-me-in-production"
+  # 引擎级限速：网关侧已有每来源 _throttle，这里再兜一层，避免上游 429。
+  limiter: true
+  public_instance: false
+  image_proxy: false
+  method: "GET"
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "auto"
+  formats:
+    - html
+    - json
+
+ui:
+  static_use_hash: false
+  theme_args:
+    simple_style: "dark"
+
+# 启用 JSON API（网关使用 /search?q=...&format=json）。
+engines:
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    disabled: false
+
+outgoing:
+  request_timeout: 8.0
+  max_request_timeout: 12.0
+  pool_connections: 20
+  pool_maxsize: 20
+  # 上游限流由 SearXNG 自身与网关双重退避处理；不要描述为无限调用。
+  enable_http2: true

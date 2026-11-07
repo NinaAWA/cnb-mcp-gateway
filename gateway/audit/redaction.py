@@ -26,6 +26,10 @@ SENSITIVE_KEY_PARTS = (
 SECRET_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE) for p in (
         r"gh[pousr]_[A-Za-z0-9]{20,}",
+        r"github_pat_[A-Za-z0-9_]{20,}",
+        r"glpat-[A-Za-z0-9_-]{20,}",
+        # 短期签名下载链接 / Git 凭据 URL 中的 token 参数
+        r"[?&](?:token|sig|signature|access_token|api_key)=[A-Za-z0-9._~+/=-]{8,}",
         r"tvly-[A-Za-z0-9_-]{10,}",
         r"sk-[A-Za-z0-9_-]{16,}",
         r"xox[baprs]-[A-Za-z0-9-]{10,}",
@@ -57,6 +61,29 @@ def redact_text(value: Any, *, limit: int = 0) -> str:
     if limit and len(text) > limit:
         return text[:limit] + f"…[已截断，原始长度 {len(text)}]"
     return text
+
+
+def redact_stream(chunks: Any, encoding: str = "utf-8") -> Any:
+    """逐行脱敏流式字节/文本块：用于后台任务 stdout/stderr 落盘前实时脱敏。
+
+    分块边界可能切断一行或切断一个密钥特征，因此按 ``\\n`` 组行后再调用
+    ``redact_text``；末尾不足一行的数据在流结束时再脱敏输出。
+    """
+    pending = ""
+    for chunk in chunks:
+        text = (chunk.decode(encoding, "replace") if isinstance(chunk, (bytes, bytearray))
+                else str(chunk))
+        pending += text
+        while "\n" in pending:
+            line, pending = pending.split("\n", 1)
+            yield redact_text(line) + "\n"
+    if pending:
+        yield redact_text(pending)
+
+
+def redact_line(value: Any) -> str:
+    """单行文本脱敏（任务日志、SSE 增量输出的统一入口）。"""
+    return redact_text(value)
 
 
 def redact_structure(value: Any, _depth: int = 0) -> Any:

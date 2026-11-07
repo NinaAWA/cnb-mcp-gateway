@@ -77,17 +77,39 @@ _AUDIT_ROOT = Path(__file__).resolve().parent.parent
 if (_AUDIT_ROOT / "gateway").is_dir() and str(_AUDIT_ROOT) not in sys.path:
     sys.path.insert(0, str(_AUDIT_ROOT))
 
+def _flag(name: str) -> bool:
+    """模块早期读取布尔环境变量（此时 _env_bool 尚未定义）。"""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+AUDIT_IMPORT_ERROR = ""
+AUDIT_REQUIRED = False
+AUDIT_ALLOW_UNAUDITED = False
 try:
     from gateway.audit.middleware import (
         AuditMiddleware, bind_http_context, record_event, task_lifecycle, trace_call,
     )
+    from gateway.audit.events import StrictAuditDenied
     from gateway.audit.storage import get_storage as _get_audit_storage
     AUDIT_ENABLED = True
-except Exception as _audit_import_error:  # noqa: BLE001 - 采集层不可用不能拖垮网关
+except Exception as _audit_import_error:  # noqa: BLE001 - 显式告警，不再静默 fail-open
     AUDIT_ENABLED = False
     AuditMiddleware = None
-    print(f"[audit] 采集层不可用，网关以无审计模式运行: {_audit_import_error!r}",
-          file=sys.stderr)
+    AUDIT_IMPORT_ERROR = repr(_audit_import_error)
+    banner = "=" * 78
+    print(banner, file=sys.stderr, flush=True)
+    print("[AUDIT ALERT] 审计采集层导入失败：本进程将无法记录任何调用审计。",
+          file=sys.stderr, flush=True)
+    print(f"[AUDIT ALERT] 原因: {AUDIT_IMPORT_ERROR}", file=sys.stderr, flush=True)
+    print("[AUDIT ALERT] 修复：检查 gateway/audit 依赖与权限；"
+          "如需强制审计请设置 AUDIT_REQUIRED=1（此时拒绝启动）。",
+          file=sys.stderr, flush=True)
+    print("[AUDIT ALERT] 仅在明确承担风险时设置 AUDIT_ALLOW_UNAUDITED=1 继续无审计运行。",
+          file=sys.stderr, flush=True)
+    print(banner, file=sys.stderr, flush=True)
+
+    class StrictAuditDenied(RuntimeError):
+        pass
 
     class _NullRecorder:
         def set(self, **_kw): pass
@@ -101,6 +123,19 @@ except Exception as _audit_import_error:  # noqa: BLE001 - 采集层不可用不
     @contextmanager
     def trace_call(*_a, **_kw):
         yield _NullRecorder()
+
+
+def _audit_startup_gate() -> None:
+    """AUDIT_REQUIRED=1 时导入失败即拒绝启动；AUDIT_ALLOW_UNAUDITED=1 时显式放行。"""
+    global AUDIT_REQUIRED, AUDIT_ALLOW_UNAUDITED
+    AUDIT_REQUIRED = _flag("AUDIT_REQUIRED")
+    AUDIT_ALLOW_UNAUDITED = _flag("AUDIT_ALLOW_UNAUDITED")
+    if not AUDIT_ENABLED and AUDIT_REQUIRED and not AUDIT_ALLOW_UNAUDITED:
+        raise SystemExit(
+            "FATAL: 审计采集层不可用且 AUDIT_REQUIRED=1，拒绝以无审计模式启动。"
+            f"原因: {AUDIT_IMPORT_ERROR}；如确需临时放行请显式设置 "
+            "AUDIT_ALLOW_UNAUDITED=1 并自行承担风险。"
+        )
 
 CONFIG_DIR = Path(__file__).parent
 
@@ -117,6 +152,7 @@ def load_env(p: Path):
 
 
 load_env(CONFIG_DIR / ".env")
+_audit_startup_gate()
 
 TOKEN = os.environ.get("MCP_TOKEN", "")
 PORT = int(os.environ.get("MCP_PORT", "8765"))
@@ -214,6 +250,44 @@ OAUTH_ALLOW_NO_PKCE = _env_bool("OAUTH_ALLOW_NO_PKCE", False)
 METRICS_TOKEN_FILE = Path(
     os.environ.get("GATEWAY_METRICS_TOKEN_FILE", "/data/audit/.metrics_token"))
 
+# 持久化写入穿透：进程内三个 dict 保持不变（兼容既有客户端与测试），
+# 磁盘上只保存 SHA-256 摘要；重启后按哈希惰性查活。
+try:
+    from gateway.oauth.store import get_oauth_store, oauth_persistence_enabled
+except Exception:  # noqa: BLE001 - 审计层不可用时 OAuth 退化为纯内存
+    get_oauth_store = None
+
+    def oauth_persistence_enabled() -> bool:
+        return False
+
+
+def _oauth():
+    if not get_oauth_store or not oauth_persistence_enabled():
+        return None
+    try:
+        return get_oauth_store()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _oauth_call(operation: str, *args, default=None):
+    store = _oauth()
+    if store is None:
+        return default
+    try:
+        return getattr(store, operation)(*args)
+    except Exception as exc:  # noqa: BLE001 - 持久化故障不得中断 OAuth 主流程
+        print(f"[oauth] WARN 持久化 {operation} 失败: {exc!r}", file=sys.stderr)
+        return default
+
+
+def _oauth_client_uris(client_id: str) -> tuple[str, ...]:
+    with _OAUTH_LOCK:
+        cached = tuple(CLIENTS.get(client_id, {}).get("redirect_uris", []))
+    if cached:
+        return cached
+    return tuple(_oauth_call("client_uris", client_id, default=[]) or [])
+
 
 def _metrics_token() -> str:
     """内部只读指标令牌：优先环境变量，其次网关在共享卷生成的 0600 文件。"""
@@ -233,12 +307,30 @@ def _token_is_authorized(presented: str) -> bool:
     if hmac.compare_digest(presented, TOKEN):
         return True
     now = time.time()
+    expired_here: list[str] = []
     with _OAUTH_LOCK:
         for key, expires in list(ISSUED_TOKENS.items()):
             if expires <= now:
                 ISSUED_TOKENS.pop(key, None)
+                expired_here.append(key)
         expires = ISSUED_TOKENS.get(presented)
-        return bool(expires and expires > now)
+        if expires and expires > now:
+            return True
+    # 进程内缓存是权威视图：缓存已判定过期/撤销时同步失效持久化记录，
+    # 避免「内存里过期、磁盘里仍有效」导致令牌复活。
+    for key in expired_here:
+        _oauth_call("revoke_token", key)
+    if presented in expired_here:
+        return False
+    # 重启后进程内字典为空：按 SHA-256 摘要查持久化层，命中则回填缓存。
+    valid, persisted_expiry = _oauth_call("token_valid", presented,
+                                          default=(False, 0.0))
+    if valid and persisted_expiry > now:
+        with _OAUTH_LOCK:
+            ISSUED_TOKENS[presented] = persisted_expiry
+        return True
+    _oauth_call("cleanup_expired")
+    return False
 
 
 def _normalize_redirect(uri) -> str:
@@ -264,8 +356,7 @@ def _resolve_redirect(client_id: str, redirect_uri) -> tuple[str, str]:
     if not normalized:
         return "", "redirect_uri 格式不合法（必须是无片段、无通配符的绝对 URI）"
     if not OAUTH_ALLOW_ANY_REDIRECT:
-        with _OAUTH_LOCK:
-            registered = tuple(CLIENTS.get(client_id, {}).get("redirect_uris", []))
+        registered = _oauth_client_uris(client_id)
         if not registered or normalized not in registered:
             return "", "redirect_uri 与已注册客户端的回调地址不匹配"
     return normalized, ""
@@ -359,6 +450,7 @@ async def register_endpoint(request):
     client_id = "cnb-" + secrets.token_urlsafe(16)
     with _OAUTH_LOCK:
         CLIENTS[client_id] = {"redirect_uris": uris}
+    _oauth_call("save_client", client_id, uris)
     audit(f"DCR client_id={client_id} uris={uris}")
     return JSONResponse(
         {
@@ -395,8 +487,7 @@ async def authorize_endpoint(request):
         client_id = str(qp.get("client_id", ""))
         requested = str(qp.get("redirect_uri", ""))
         if not requested:
-            with _OAUTH_LOCK:
-                registered = tuple(CLIENTS.get(client_id, {}).get("redirect_uris", []))
+            registered = _oauth_client_uris(client_id)
             if len(registered) == 1:
                 requested = registered[0]
         redirect_uri, error = _resolve_redirect(client_id, requested)
@@ -434,13 +525,15 @@ async def authorize_endpoint(request):
         return PlainTextResponse("必须使用 PKCE S256 校验码", 400)
     code = secrets.token_urlsafe(32)
     with _OAUTH_LOCK:
-        AUTH_CODES[code] = {
+        record = {
             "expires": time.time() + CODE_TTL,
             "redirect_uri": redirect_uri,
             "client_id": client_id,
             "challenge": challenge,
             "method": method,
         }
+        AUTH_CODES[code] = record
+    _oauth_call("save_code", code, record)
     audit(f"AUTHORIZE OK code_issued redirect={redirect_uri}")
     state = str(form.get("state", ""))
     sep = "&" if "?" in redirect_uri else "?"
@@ -462,6 +555,8 @@ async def token_endpoint(request):
                 AUTH_CODES.pop(key, None)
         # 校验通过后才消费授权码；客户端输错 verifier 不必重新走一遍授权。
         rec = AUTH_CODES.get(code)
+    # 重启后内存授权码丢失：按摘要从持久层水合（不还原明文授权码）。
+    rec = rec or _oauth_call("load_code", code)
     if not rec or rec["expires"] < now:
         return JSONResponse({"error": "invalid_grant"}, status_code=400)
     client_id = str(form.get("client_id", ""))
@@ -482,10 +577,42 @@ async def token_endpoint(request):
     with _OAUTH_LOCK:
         AUTH_CODES.pop(code, None)
         ISSUED_TOKENS[tok] = now + TOKEN_TTL
+    _oauth_call("consume_code", code)
+    _oauth_call("save_token", tok, now + TOKEN_TTL,
+                str(rec.get("client_id", "") or client_id))
     audit("TOKEN ISSUED")
     return JSONResponse(
         {"access_token": tok, "token_type": "Bearer", "expires_in": TOKEN_TTL}
     )
+
+
+async def revoke_endpoint(request):
+    """按 RFC 7009 语义撤销令牌：内存缓存与持久化哈希记录同时失效。"""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        try:
+            form = await request.form()
+            body = dict(form)
+        except Exception:  # noqa: BLE001
+            body = {}
+    token = str(body.get("token", "")).strip()
+    if not token:
+        return JSONResponse({"error": "invalid_request",
+                             "error_description": "缺少 token"}, status_code=400)
+    with _OAUTH_LOCK:
+        in_cache = ISSUED_TOKENS.pop(token, None) is not None
+    persisted = bool(_oauth_call("revoke_token", token, default=False))
+    if AUDIT_ENABLED:
+        record_event("oauth_revoke", status="OK" if (in_cache or persisted) else "NOOP",
+                     source="oauth", detail="客户端请求撤销访问令牌")
+    # RFC 7009：无论令牌是否存在都返回 200，避免令牌探测。
+    return JSONResponse({"ok": True})
+
+
+def oauth_hydrate() -> dict[str, int]:
+    """启动时报告已持久化的授权状态（令牌按哈希惰性查活，不灌回明文）。"""
+    return _oauth_call("hydrate", default={"clients": 0, "codes": 0, "tokens": 0})
 
 
 # ---------------------------------------------------------------------------
@@ -556,7 +683,14 @@ def _classify(cmd: str) -> str:
     return "normal"
 
 
-def _exec(command: str, cwd: str = WORKDIR, timeout: int = 60, confirm: bool = False) -> str:
+from gateway.access.policy import get_policy  # noqa: E402
+from gateway.exec.backends import backend_status, get_backend  # noqa: E402
+from gateway.gitops import tools as _gitops  # noqa: E402
+from gateway.tasks.manager import get_task_manager  # noqa: E402
+
+
+def _exec(command: str, cwd: str = WORKDIR, timeout: int = 60,
+          confirm: bool = False, approval_id: str = "") -> str:
     """实际执行 shell 命令（含分类权限控制、白名单与审计），MCP 工具与 REST 共用。
 
     权限三态：
@@ -574,6 +708,13 @@ def _exec(command: str, cwd: str = WORKDIR, timeout: int = 60, confirm: bool = F
         return ("⚠️ 这是破坏性指令，执行前需明确确认。请带上 confirm=true 重新调用本工具，"
                 "例如 run_command(command=..., confirm=true)。\n"
                 f"  待确认命令：{command}")
+    policy = get_policy()
+    if kind == "destructive" and policy.independent_confirm:
+        if not policy.consume_approval(command, approval_id):
+            audit(f"NEED_INDEPENDENT_APPROVAL cmd={command!r}")
+            return ("ERROR: 已启用 MCP_INDEPENDENT_CONFIRM，破坏性操作还需要一次"
+                    "独立审批。请先调用 request_approval(command=...) 取得审批 ID，"
+                    "再把 approval_id 传给本工具；审批只对该命令有效且仅能使用一次。")
     if ALLOWED_PREFIXES:
         if not any(command.strip().startswith(p) for p in ALLOWED_PREFIXES):
             audit(f"DENIED(prefix) cmd={command!r}")
@@ -603,7 +744,9 @@ def _exec(command: str, cwd: str = WORKDIR, timeout: int = 60, confirm: bool = F
 
 
 @mcp.tool()
-def run_command(command: str, cwd: str = WORKDIR, timeout: int = 60, confirm: bool = False) -> str:
+def run_command(command: str, cwd: str = WORKDIR, timeout: int = 60,
+                confirm: bool = False, backend: str = "container",
+                approval_id: str = "") -> str:
     """在服务器上执行一条 shell 命令。
 
     Args:
@@ -613,11 +756,225 @@ def run_command(command: str, cwd: str = WORKDIR, timeout: int = 60, confirm: bo
         confirm: 对破坏性指令（如 rm -rf、git reset --hard、docker rm -f 等）
                  必须设为 true 才放行；毁灭级指令（rm -rf /、mkfs、shutdown 等）
                  即便 confirm=true 也会被安全网硬禁止。
+        backend: container（默认，行为不变）或 host（需 host profile 授权）。
+        approval_id: 启用 MCP_INDEPENDENT_CONFIRM 时由 request_approval 发放。
 
     Returns:
         命令的退出码、stdout、stderr 拼接文本；或被拒绝/需确认提示。
+
+    Note:
+        默认 MCP_ACCESS_MODE=full_admin，不启用路径/shell 白名单；正则确认门
+        是辅助保护，不是安全边界。真实边界是只把 MCP_TOKEN 交给可信管理员。
     """
-    return _exec(command, cwd, timeout, confirm)
+    if backend and backend.strip().lower() not in ("", "container", "docker"):
+        try:
+            return get_backend(backend).run(command, cwd, timeout, confirm)
+        except (RuntimeError, ValueError) as exc:
+            return f"ERROR: {exc}"
+    return _exec(command, cwd, timeout, confirm, approval_id)
+
+
+@mcp.tool()
+def request_approval(command: str) -> str:
+    """为破坏性命令申请一次独立审批（仅 MCP_INDEPENDENT_CONFIRM=1 时需要）。"""
+    policy = get_policy()
+    if not policy.independent_confirm:
+        return ("独立审批默认关闭（MCP_INDEPENDENT_CONFIRM=0）；当前仅需 "
+                "confirm=true。辅助确认门不是安全边界。")
+    req, _trace = _trace_ids()
+    result = policy.request_approval(command, request_id=req)
+    return "\n".join([f"审批 ID: {result['approval_id']}",
+                      f"有效期: {result['expires_in']} 秒", result["note"]])
+
+
+@mcp.tool()
+def host_status() -> str:
+    """报告执行后端状态：容器默认可用，宿主机需显式授权且不静默降级。"""
+    info = backend_status()
+    info["access_mode"] = get_policy().mode
+    info["access_note"] = get_policy().note()
+    return json.dumps(info, ensure_ascii=False, indent=2, default=str)
+
+
+def _git_result(result: dict) -> str:
+    """结构化 Git 结果统一为紧凑文本；argv/凭据绝不出现在输出中。"""
+    lines = [f"操作: {result.get('op', '')}",
+             f"状态: {result.get('status', '')}",
+             f"仓库: {result.get('repo_label', '')}",
+             f"预览: {'是（未实际执行）' if result.get('dry_run') else '否'}"]
+    if result.get("branch"):
+        lines.append(f"分支: {result['branch']}")
+    if result.get("stdout"):
+        lines.append("--- 输出 ---")
+        lines.append(str(result["stdout"])[:12000])
+    if result.get("stderr"):
+        lines.append(f"--- 错误 ---\n{str(result['stderr'])[:4000]}")
+    if result.get("note"):
+        lines.append(result["note"])
+    if result.get("credential_policy"):
+        lines.append(f"凭据策略: {result['credential_policy']}")
+    return "\n".join(lines)
+
+
+def _git_request_id() -> str:
+    req, _trace = _trace_ids()
+    return req
+
+
+@mcp.tool()
+def git_inspect(repo: str) -> str:
+    """查看 Git 仓库分支、工作区改动、最近提交与远端（只读）。"""
+    return _git_result(_gitops.git_inspect(repo, _git_request_id()))
+
+
+@mcp.tool()
+def git_clone(url: str, dest: str, branch: str = "", depth: int = 0,
+             dry_run: bool = True) -> str:
+    """克隆仓库；默认只预览。凭据只走 GIT_ASKPASS，不接受 URL 内嵌口令。"""
+    return _git_result(_gitops.git_clone(url, dest, branch, depth, dry_run,
+                                         _git_request_id()))
+
+
+@mcp.tool()
+def git_branch(repo: str, name: str = "", action: str = "list",
+              dry_run: bool = False) -> str:
+    """分支 list/create/switch/delete（参数列表执行，按仓库加锁）。"""
+    return _git_result(_gitops.git_branch(repo, name, action, dry_run,
+                                          _git_request_id()))
+
+
+@mcp.tool()
+def git_stage(repo: str, paths: str = ".", dry_run: bool = False) -> str:
+    """暂存指定路径（空格分隔），不使用 shell。"""
+    return _git_result(_gitops.git_stage(repo, paths, dry_run,
+                                         _git_request_id()))
+
+
+@mcp.tool()
+def git_commit(repo: str, message: str, dry_run: bool = True) -> str:
+    """提交暂存区；默认 dry_run 预览，提交信息脱敏后入审计。"""
+    return _git_result(_gitops.git_commit(repo, message, dry_run,
+                                          _git_request_id()))
+
+
+@mcp.tool()
+def git_sync(repo: str, action: str = "fetch", remote: str = "origin",
+            branch: str = "", force: bool = False, dry_run: bool = True) -> str:
+    """fetch/pull/push；默认预览，force 需显式开启并记审计。"""
+    return _git_result(_gitops.git_sync(repo, action, remote, branch, force,
+                                        dry_run, _git_request_id()))
+
+
+@mcp.tool()
+def git_recover(repo: str, ref: str = "", dry_run: bool = True) -> str:
+    """列出 reflog 可恢复点；默认不改动工作区。"""
+    return _git_result(_gitops.git_recover(repo, ref, dry_run,
+                                           _git_request_id()))
+
+
+@mcp.tool()
+def git_worktree(repo: str, action: str = "list", path: str = "",
+                ref: str = "", dry_run: bool = False) -> str:
+    """worktree list/add/remove。"""
+    return _git_result(_gitops.git_worktree(repo, action, path, ref, dry_run,
+                                            _git_request_id()))
+
+
+# ---------------------------------------------------------------------------
+# 阶段 D：通用分块 / Range 文件传输（与论文下载共用 transfer/core.py）
+# ---------------------------------------------------------------------------
+
+from gateway.transfer import http_api as _transfer_http  # noqa: E402
+from gateway.transfer.core import (  # noqa: E402
+    GenericSourcePolicy, fetch_to_file,
+)
+
+_TRANSFER_ROOT = Path(os.environ.get("MCP_TRANSFER_DIR", "/workspace/transfers"))
+_TRANSFER_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+@mcp.tool()
+def upload_file(path: str, size_bytes: int = 0, sha256: str = "") -> str:
+    """创建分块上传任务并返回认证入口；不在 MCP 参数里塞大文件/Base64。
+
+    返回 created 只代表任务已创建，文件最终是否校验成功以
+    file_transfer_status 的 success 状态为准。
+    """
+    target = _transfer_http.safe_path(_TRANSFER_ROOT, path)
+    if target is None:
+        return "ERROR: 路径不在授权传输目录内"
+    req, _trace = _trace_ids()
+    _transfer_http._emit({
+        "request_id": req, "direction": "upload", "path": str(target),
+        "status": "created", "bytes": 0, "total_bytes": max(0, int(size_bytes or 0)),
+        "sha256": sha256,
+        "detail": "任务创建；文件内容尚未通过 HTTP 上传"})
+    return "\n".join([
+        "状态: created（任务已创建，尚未收到文件，不代表上传成功）",
+        f"路径: {target}",
+        "上传端点: POST /files/upload（需 Bearer 鉴权）",
+        "请求头: X-File-Path=<相对路径>, X-Upload-Offset=<断点偏移>, "
+        "X-File-Sha256=<可选期望摘要>",
+        "请求体: 流式分块二进制；服务端逐块 SHA-256、fsync、原子改名",
+        "说明: 支持 Range 断点续传，提供期望摘要时不一致会删除临时文件",
+    ])
+
+
+@mcp.tool()
+def download_file(url: str, path: str, expected_sha256: str = "") -> str:
+    """通用文件下载（流式分块 + 可选 SHA-256 + 原子改名），不做 PDF 专用校验。"""
+    target = _transfer_http.safe_path(_TRANSFER_ROOT, path)
+    if target is None:
+        return "ERROR: 路径不在授权传输目录内"
+    req, _trace = _trace_ids()
+    client = SafeHttpClient(
+        allowed_hosts=frozenset(), default_interval=0.2,
+        timeout=SEARCH_TIMEOUT, max_bytes=0, retries=SEARCH_RETRIES,
+        cache_ttl=0, user_agent=_SEARCH_UA, pin_dns=_env_bool(
+            "MCP_SEARCH_PIN_DNS", True))
+    result = fetch_to_file(client, url, target,
+                           policy=GenericSourcePolicy(),
+                           expected_sha256=expected_sha256,
+                           verify_pdf=False,
+                           allow_private=_env_bool("MCP_TRANSFER_ALLOW_PRIVATE", False))
+    _transfer_http._emit({
+        "request_id": req, "direction": "download", "path": str(target),
+        "status": result.status, "bytes": result.bytes,
+        "total_bytes": result.bytes, "sha256": result.sha256,
+        "detail": f"final_url={result.final_url}; {result.reason}"})
+    return "\n".join([
+        f"状态: {result.status}", f"路径: {result.path or '(未生成)'}",
+        f"大小: {result.bytes}", f"SHA-256: {result.sha256}",
+        f"最终地址: {result.final_url}",
+        f"原因: {result.reason or '(无)'}",
+        "说明: created 仅表示任务创建；success/duplicate 才表示最终校验通过",
+    ])
+
+
+@mcp.tool()
+def signed_download_link(path: str, ttl: int = 600) -> str:
+    """为已落盘文件生成短期 HMAC 签名下载链接（默认 10 分钟）。"""
+    target = _transfer_http.safe_path(_TRANSFER_ROOT, path)
+    if target is None:
+        return "ERROR: 路径不在授权传输目录内"
+    if not target.is_file():
+        return "ERROR: 文件不存在，不生成指向不存在文件的成功链接"
+    # 签名对象必须与 /files/download 的 path 查询参数完全一致，否则校验必失败。
+    expiry, signature = _transfer_http.sign_path(path, ttl)
+    return "\n".join([
+        f"路径: {target}",
+        f"有效期至(epoch): {expiry}",
+        f"签名: {signature}",
+        "下载端点: GET /files/download?path=...&exp=...&sig=...",
+        "说明: 签名绑定绝对路径与过期时间；也可直接使用 Bearer 鉴权",
+    ])
+
+
+@mcp.tool()
+def file_transfer_status(limit: int = 50) -> str:
+    """文件传输全过程状态（区分 created 与最终 success）。"""
+    return json.dumps(_transfer_http.transfer_status(limit),
+                      ensure_ascii=False, indent=2, default=str)
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +985,46 @@ _TASKS: dict = {}
 _TASK_LOCK = threading.Lock()
 _TASK_DIR = Path(os.environ.get("MCP_TASK_LOG_DIR", "/tmp/mcp_tasks"))
 _TASK_DIR.mkdir(parents=True, exist_ok=True)
+
+try:
+    from gateway.audit.redaction import redact_stream as _redact_stream
+except Exception:  # noqa: BLE001 - 脱敏层不可用时仍保留原始日志流，但会显式告警
+    def _redact_stream(chunks):
+        yield from chunks
+
+    print("[AUDIT ALERT] 任务日志脱敏模块不可用，日志将无法实时脱敏",
+          file=sys.stderr, flush=True)
+
+
+def _spawn_redacting_logger(log_path: Path, read_fd: int) -> threading.Thread:
+    """任务 stdout/stderr 逐行脱敏后再落盘（0600），避免凭据写入日志文件。"""
+    logf = open(log_path, "wb")
+    try:
+        os.chmod(log_path, 0o600)
+    except OSError:
+        pass
+
+    def pump():
+        try:
+            with os.fdopen(read_fd, "rb", closefd=True) as src:
+                for piece in _redact_stream(iter(lambda: src.read(4096), b"")):
+                    data = (piece if isinstance(piece, bytes)
+                            else str(piece).encode("utf-8", "replace"))
+                    logf.write(data)
+                logf.flush()
+                os.fsync(logf.fileno())
+        except Exception as exc:  # noqa: BLE001 - 日志线程不得拖垮任务
+            print(f"[AUDIT ALERT] 任务日志写入失败: {exc!r}", file=sys.stderr)
+        finally:
+            try:
+                logf.close()
+            except OSError:
+                pass
+
+    worker = threading.Thread(target=pump, daemon=True,
+                              name=f"task-log-{log_path.stem}")
+    worker.start()
+    return worker
 
 
 def _task_event(task_id: str, status: str, rec: dict | None = None, **extra) -> None:
@@ -654,7 +1051,7 @@ def _task_watchdog(task_id: str, timeout: int):
     with _TASK_LOCK:
         rec = _TASKS.get(task_id)
         if rec and rec["proc"].poll() is None:
-            rec["proc"].terminate()
+            get_task_manager().terminate(task_id)
             rec["status"] = "killed-timeout"
             audit(f"TASK_TIMEOUT task_id={task_id}")
         else:
@@ -680,6 +1077,16 @@ def _task_reaper():
             continue
         for task_id, rec, rc, status in finished:
             _task_event(task_id, status, rec, detail=f"exit_code={rc}")
+            get_task_manager().update_status(task_id, status,
+                                             f"exit_code={rc}")
+
+
+if AUDIT_ENABLED:
+    try:
+        _reconciled = get_task_manager().reconcile()
+        print(f"[tasks] 启动重关联: {_reconciled}", flush=True)
+    except Exception as _reconcile_error:  # noqa: BLE001
+        print(f"[tasks] WARN 启动重关联失败: {_reconcile_error!r}", file=sys.stderr)
 
 
 if AUDIT_ENABLED:
@@ -713,14 +1120,20 @@ def run_command_background(command: str, cwd: str = WORKDIR, confirm: bool = Fal
     try:
         task_id = secrets.token_hex(8)
         log_path = _TASK_DIR / f"{task_id}.log"
-        logf = open(log_path, "wb")
+        read_fd, write_fd = os.pipe()
+        manager = get_task_manager()
         try:
-            os.chmod(log_path, 0o600)
-        except OSError:
-            pass
-        proc = subprocess.Popen(
-            command, shell=True, cwd=cwd, stdout=logf, stderr=subprocess.STDOUT,
-        )
+            proc = subprocess.Popen(
+                command, shell=True, cwd=cwd, stdout=write_fd,
+                stderr=subprocess.STDOUT, start_new_session=True,
+                env=manager.child_env(task_id),
+            )
+        except Exception:
+            os.close(read_fd)
+            raise
+        finally:
+            os.close(write_fd)
+        _spawn_redacting_logger(log_path, read_fd)
         _trace = None
         if AUDIT_ENABLED:
             try:
@@ -736,6 +1149,9 @@ def run_command_background(command: str, cwd: str = WORKDIR, confirm: bool = Fal
         }
         with _TASK_LOCK:
             _TASKS[task_id] = rec
+        manager.register(task_id, command=command, cwd=cwd,
+                         log_path=str(log_path), proc=proc,
+                         request_id=rec.get("request_id", ""))
         if timeout and timeout > 0:
             threading.Thread(target=_task_watchdog, args=(task_id, timeout), daemon=True).start()
         audit(f"BG START task_id={task_id} cmd={command!r}")
@@ -772,7 +1188,20 @@ def get_task_status(task_id: str) -> str:
     with _TASK_LOCK:
         rec = _TASKS.get(task_id)
         if not rec:
-            return f"ERROR: 找不到任务 {task_id}（可能已过期或容器重启过）。"
+            persisted = get_task_manager().get(task_id)
+            if not persisted:
+                for row in get_task_manager().list(500):
+                    if str(row.get("task_id")) == task_id:
+                        persisted = row
+                        break
+            if not persisted:
+                return f"ERROR: 找不到任务 {task_id}（可能已过期或容器重启过）。"
+            return (f"task_id={task_id}\nstatus={persisted.get('status')}\n"
+                    f"exit_code=(重启后不可恢复)\npid={persisted.get('pid')}\n"
+                    f"cmd={persisted.get('command')}\n"
+                    f"log={persisted.get('log_path')}\n"
+                    "说明: 进程对象在容器重建后无法重关联，此处仅返回持久化元数据；"
+                    "用 experiment_manifest 导出复现信息。")
         proc = rec["proc"]
         rc = proc.poll()
         newly_finished = False
@@ -786,6 +1215,7 @@ def get_task_status(task_id: str) -> str:
                 newly_finished = True
     if newly_finished:
         _task_event(task_id, status, rec, detail=f"exit_code={rc}")
+        get_task_manager().update_status(task_id, status, f"exit_code={rc}")
     audit(f"TASK_STATUS task_id={task_id} status={status}")
     return (f"task_id={task_id}\nstatus={status}\n"
             f"exit_code={rc}\ncmd={rec['cmd']}\nlog={rec['log']}")
@@ -828,16 +1258,42 @@ def stop_task(task_id: str) -> str:
             return f"ERROR: 找不到任务 {task_id}。"
         proc = rec["proc"]
         if proc.poll() is None:
-            proc.terminate()
+            outcome = get_task_manager().terminate(task_id)
+            if not outcome["ok"]:
+                proc.terminate()
             rec["status"] = "killed"
-            audit(f"TASK STOP task_id={task_id}")
+            audit(f"TASK STOP task_id={task_id} group={outcome}")
             stopped = True
         else:
             stopped = False
     if stopped:
-        _task_event(task_id, "killed", rec, detail="管理员/agent 主动终止")
-        return f"OK: 已发送 TERM 信号终止任务 {task_id}。"
+        _task_event(task_id, "killed", rec, detail="管理员/agent 主动终止进程组")
+        return f"OK: 已终止任务 {task_id} 的整个进程组（SIGTERM/SIGKILL）。"
     return f"任务 {task_id} 已结束（exit={proc.poll()}），无需停止。"
+
+
+@mcp.tool()
+def list_tasks(max_results: int = 30) -> str:
+    """列出持久化任务状态（含重启后标记为 interrupted 的任务）。"""
+    rows = get_task_manager().list(max(1, min(int(max_results or 30), 200)))
+    lines = [f"共 {len(rows)} 个任务（数据来源：审计库 task_state）"]
+    for row in rows:
+        lines.append(
+            f"- {row.get('task_id')} | {row.get('status')} | pid={row.get('pid')} "
+            f"pgid={row.get('pgid')} | git={row.get('git_commit') or '-'} | "
+            f"cmd={str(row.get('command') or '')[:100]}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def experiment_manifest(task_id: str, format: str = "text") -> str:
+    """导出实验复现元数据（命令、Git commit、输出路径、环境键名指纹）。"""
+    manifest = get_task_manager().manifest(task_id)
+    if format == "json":
+        return json.dumps(manifest, ensure_ascii=False, indent=2, default=str)
+    if not manifest["ok"]:
+        return f"ERROR: {manifest['reason']}"
+    return "\n".join(f"{k}: {v}" for k, v in manifest.items() if k != "ok")
 
 
 # ---------------------------------------------------------------------------
@@ -1129,11 +1585,14 @@ def read_image(path: str, max_dim: int = 1024):
 # 外部检索统一网络层（仅标准库：白名单 / SSRF 防护 / 限速 / 缓存 / 重试退避）
 # ---------------------------------------------------------------------------
 
-class SearchError(Exception):
-    """检索请求失败时抛出的可读错误；工具层统一转成 "ERROR: ..." 文本。"""
+# 统一安全客户端：8 个学术源、5 个网页 provider、新增网页工具、PDF 下载共用。
+# server.py 保留同名兼容函数，避免改动所有调用点。
+from gateway.net.client import (  # noqa: E402
+    SafeHttpClient, SafeHttpError as SearchError, configured_host,
+    resolve_public_ips,
+)
 
-
-_SEARCH_UA = "cnb-mcp-gateway/1.0 (+https://github.com/NinaAWA/cnb-mcp-gateway)"
+_SEARCH_UA = "cnb-mcp-gateway/3.0 (+https://github.com/NinaAWA/cnb-mcp-gateway)"
 
 # 由工具拼接出的所有外部 URL，主机必须在此白名单内（自建 SearXNG 除外）。
 _SEARCH_ALLOWED_HOSTS = frozenset({
@@ -1142,205 +1601,70 @@ _SEARCH_ALLOWED_HOSTS = frozenset({
     "dblp.org", "api.unpaywall.org", "api.semanticscholar.org",
     "hn.algolia.com", "api.stackexchange.com", "api.github.com",
     "api.tavily.com",
+    "arxiv.org", "www.ncbi.nlm.nih.gov", "pmc.ncbi.nlm.nih.gov",
 })
 
-# 各来源最小请求间隔（秒）；其余来源默认 0.15 秒，礼貌且避免触发限流。
+# 各来源最小请求间隔（秒）；其余来源默认 0.15 秒。
 _SEARCH_MIN_INTERVAL = {
     "export.arxiv.org": SEARCH_ARXIV_MIN_INTERVAL,
     "eutils.ncbi.nlm.nih.gov": 0.4,
 }
 
-_SEARCH_LOCK = threading.Lock()
-_SEARCH_HOST_LOCKS: dict[str, threading.Lock] = {}
-_SEARCH_LAST_CALL: dict[str, float] = {}
-_SEARCH_CACHE: dict[str, tuple[float, bytes]] = {}
+# 私网放行收窄为「运维显式配置的自建 SearXNG 主机」，而不是任意 allow_private。
+_SEARXNG_HOST = configured_host(SEARCH_SEARXNG_URL)
+_SEARCH_PRIVATE_HOSTS = frozenset({_SEARXNG_HOST} - {""})
 
-
-def _host_lock(host: str) -> threading.Lock:
-    with _SEARCH_LOCK:
-        return _SEARCH_HOST_LOCKS.setdefault(host, threading.Lock())
-
-
-def _throttle(host: str) -> None:
-    interval = _SEARCH_MIN_INTERVAL.get(host, 0.15)
-    with _host_lock(host):
-        wait = _SEARCH_LAST_CALL.get(host, 0.0) + interval - time.monotonic()
-        if wait > 0:
-            time.sleep(wait)
-        _SEARCH_LAST_CALL[host] = time.monotonic()
-
-
-# 只拦截真正可用于内网 / 本机 / 云元数据服务的地址段。
-# 不拦 198.18.0.0/15：部分机房用这段地址做透明出网代理，合法域名会被
-# 解析到该段；若一并拦截，页面抓取在本环境将完全不可用。
-_BLOCKED_NETS = tuple(
-    ipaddress.ip_network(cidr) for cidr in (
-        "0.0.0.0/8", "10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16",
-        "172.16.0.0/12", "192.168.0.0/16", "::1/128", "::/128",
-        "fc00::/7", "fe80::/10",
-    )
+_HTTP_CLIENT = SafeHttpClient(
+    allowed_hosts=_SEARCH_ALLOWED_HOSTS,
+    min_intervals=_SEARCH_MIN_INTERVAL,
+    timeout=SEARCH_TIMEOUT, max_bytes=SEARCH_MAX_BYTES,
+    retries=SEARCH_RETRIES, cache_ttl=SEARCH_CACHE_TTL,
+    user_agent=_SEARCH_UA, private_hosts=_SEARCH_PRIVATE_HOSTS,
+    pin_dns=_env_bool("MCP_SEARCH_PIN_DNS", True),
 )
 
 
+def _throttle(host: str) -> None:
+    _HTTP_CLIENT.throttle(host)
+
+
 def _assert_public(host: str) -> None:
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except socket.gaierror as e:
-        raise SearchError(f"域名解析失败: {host} ({e})")
-    for info in infos:
-        try:
-            ip = ipaddress.ip_address(info[4][0])
-        except ValueError:
-            continue
-        if any(ip in net for net in _BLOCKED_NETS):
-            raise SearchError(f"拒绝访问非公网地址: {host} -> {ip}")
+    resolve_public_ips(host)
 
 
 def _validate_url(url: str, *, allow_any_host: bool = False,
                   allow_private: bool = False) -> str:
-    parts = urllib.parse.urlsplit(url)
-    if parts.scheme not in ("http", "https"):
-        raise SearchError("仅允许 http/https 协议")
-    if parts.username or parts.password:
-        raise SearchError("URL 不允许携带用户名或密码")
-    host = (parts.hostname or "").lower()
-    if not host:
-        raise SearchError("URL 缺少主机名")
-    if not allow_any_host and host not in _SEARCH_ALLOWED_HOSTS:
-        raise SearchError(f"来源不在允许列表: {host}")
-    if parts.port and parts.port not in (80, 443):
-        raise SearchError("不允许访问非标准端口")
-    # 固定白名单来源由代码拼接 URL，主机名不可被外部输入控制（跳转目标也受同一
-    # 白名单约束），因此豁免私网检查：部分机房 DNS 会把允许的域名映射到 198.18.x.x
-    # 之类的代理地址。仅当 allow_any_host=True（如页面抓取）时才做私网拦截。
-    if not allow_private and allow_any_host:
-        try:
-            ipaddress.ip_address(host)
-        except ValueError:
-            pass
-        else:
-            raise SearchError("不允许直接使用 IP 地址作为目标主机")
-        _assert_public(host)
-    return host
-
-
-class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """跟随跳转前重新校验目标，防止通过 302 绕过白名单 / 私网拦截。"""
-
-    def __init__(self, allow_any_host: bool, allow_private: bool):
-        super().__init__()
-        self.allow_any_host = allow_any_host
-        self.allow_private = allow_private
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        _validate_url(newurl, allow_any_host=self.allow_any_host,
-                      allow_private=self.allow_private)
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+    return _HTTP_CLIENT.validate_url(url, allow_any_host=allow_any_host,
+                                     allow_private=allow_private)
 
 
 def _cache_get(key: str):
-    if SEARCH_CACHE_TTL <= 0:
-        return None
-    with _SEARCH_LOCK:
-        item = _SEARCH_CACHE.get(key)
-        if item and time.time() - item[0] < SEARCH_CACHE_TTL:
-            return item[1]
-        _SEARCH_CACHE.pop(key, None)
-    return None
+    return _HTTP_CLIENT._cache_get(key)
 
 
 def _cache_put(key: str, raw: bytes) -> None:
-    if SEARCH_CACHE_TTL <= 0:
-        return
-    with _SEARCH_LOCK:
-        if len(_SEARCH_CACHE) >= 256:
-            oldest = min(_SEARCH_CACHE, key=lambda k: _SEARCH_CACHE[k][0])
-            _SEARCH_CACHE.pop(oldest, None)
-        _SEARCH_CACHE[key] = (time.time(), raw)
+    _HTTP_CLIENT._cache_put(key, raw)
 
 
 def _http_request(url: str, *, method: str = "GET", data=None, headers=None,
                   timeout: float = 0, max_bytes: int = 0,
                   allow_any_host: bool = False, allow_private: bool = False,
-                  retries: int = -1, use_cache: bool = True) -> bytes:
-    host = _validate_url(url, allow_any_host=allow_any_host,
-                         allow_private=allow_private)
-    timeout = timeout or SEARCH_TIMEOUT
-    max_bytes = max_bytes or SEARCH_MAX_BYTES
-    retries = SEARCH_RETRIES if retries < 0 else retries
-    hdrs = {"User-Agent": _SEARCH_UA, "Accept-Encoding": "identity"}
-    if headers:
-        hdrs.update(headers)
-    body = None
-    if data is not None:
-        body = data if isinstance(data, bytes) else json.dumps(data).encode("utf-8")
-        hdrs.setdefault("Content-Type", "application/json")
-    cacheable = use_cache and method == "GET" and body is None
-    cache_key = f"{method}:{url}"
-    if cacheable:
-        cached = _cache_get(cache_key)
-        if cached is not None:
-            return cached
-    opener = urllib.request.build_opener(
-        urllib.request.HTTPSHandler(context=ssl.create_default_context()),
-        _SafeRedirectHandler(allow_any_host, allow_private),
+                  retries: int = -1, use_cache: bool = True,
+                  expect_text: bool = True) -> bytes:
+    return _HTTP_CLIENT.request(
+        url, method=method, data=data, headers=headers, timeout=timeout,
+        max_bytes=max_bytes, allow_any_host=allow_any_host,
+        allow_private=allow_private, retries=retries, use_cache=use_cache,
+        expect_text=expect_text,
     )
-    last_err = "未知错误"
-    for attempt in range(retries + 1):
-        _throttle(host)
-        try:
-            req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
-            with opener.open(req, timeout=timeout) as resp:
-                if getattr(resp, "status", 200) == 202:
-                    raise SearchError("上游返回 202（排队或反自动化校验）")
-                raw = resp.read(max_bytes + 1)
-            if len(raw) > max_bytes:
-                raise SearchError(f"响应超过体积上限 {max_bytes} 字节")
-            if cacheable:
-                _cache_put(cache_key, raw)
-            return raw
-        except SearchError:
-            raise
-        except urllib.error.HTTPError as e:
-            last_err = f"HTTP {e.code}"
-            retryable = e.code in (429, 500, 502, 503, 504)
-            try:
-                e.close()
-            except OSError:
-                pass
-            if not retryable or attempt >= retries:
-                raise SearchError(f"{last_err}（{urllib.parse.urlsplit(url).netloc}）")
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            last_err = str(e)[:180]
-            if attempt >= retries:
-                raise SearchError(f"请求失败: {last_err}")
-        if attempt < retries:
-            time.sleep(min(2 ** attempt, 4))
-    raise SearchError(f"请求失败: {last_err}")
 
 
 def _json_get(url: str, **kw):
-    hdrs = {"Accept": "application/json"}
-    if kw.get("headers"):
-        hdrs.update(kw.pop("headers"))
-    kw["headers"] = hdrs
-    raw = _http_request(url, **kw)
-    try:
-        return json.loads(raw.decode("utf-8", "replace"))
-    except (ValueError, UnicodeDecodeError) as e:
-        raise SearchError(f"JSON 解析失败: {e}")
+    return _HTTP_CLIENT.json_get(url, **kw)
 
 
 def _xml_get(url: str, **kw):
-    hdrs = {"Accept": "application/atom+xml, application/xml, text/xml"}
-    if kw.get("headers"):
-        hdrs.update(kw.pop("headers"))
-    kw["headers"] = hdrs
-    raw = _http_request(url, **kw)
-    try:
-        return ET.fromstring(raw)
-    except ET.ParseError as e:
-        raise SearchError(f"XML 解析失败: {e}")
+    return _HTTP_CLIENT.xml_get(url, **kw)
 
 
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -1424,24 +1748,80 @@ def _fmt_results(items: list[dict], query: str, sources: list[str],
 
 
 def _audit_search(kind: str, query: str, sources: list[str], took: float,
-                  ok: bool, detail: str = "") -> None:
+                  ok: bool, detail: str = "",
+                  per_source: dict[str, dict] | None = None) -> None:
+    """旧式日志 + 结构化 search_events（关键词哈希脱敏，逐源耗时/条数/失败原因）。"""
     audit(f"SEARCH kind={kind} sources={','.join(sources)} query={query!r} "
           f"took={took:.2f}s status={'OK' if ok else 'FAIL'} {detail}".rstrip())
+    try:
+        from gateway.audit.events import current_trace
+        from gateway.audit.middleware import record_search_event
+        from gateway.audit.redaction import fingerprint
+
+        trace = current_trace()
+        base = {
+            "tool_name": f"search_{kind}", "request_id": trace.request_id if trace else "",
+            "trace_id": trace.trace_id if trace else "",
+            "client_id": trace.client_id if trace else "",
+            "source": "external", "query_hash": fingerprint(query),
+            "keyword": query[:200],
+        }
+        for label, info in (per_source or {}).items():
+            record_search_event({
+                **base, "provider": label,
+                "status": info.get("status", "SUCCESS"),
+                "duration_ms": int(info.get("duration_ms", 0)),
+                "result_count": int(info.get("result_count", 0)),
+                "cached": int(bool(info.get("cached"))),
+                "rate_limited": int(bool(info.get("rate_limited"))),
+                "error": info.get("error", ""),
+            })
+        record_search_event({
+            **base, "provider": "", "status": "SUCCESS" if ok else "FAILED",
+            "duration_ms": int(took * 1000), "result_count": len(sources),
+            "detail": detail[:500],
+        })
+    except Exception:  # noqa: BLE001 - 审计不可用时检索本身不受影响
+        pass
 
 
 # ---------------------------------------------------------------------------
 # 论文检索：一源一解析函数 + 聚合调度（全部零密钥）
 # ---------------------------------------------------------------------------
 
-def _src_openalex(query: str, limit: int, year: int) -> list[dict]:
+from gateway.research.metadata import (  # noqa: E402
+    merge_items, normalize_date, rank_items, structured_output,
+    publication_year as _paper_year,
+)
+
+
+def _year_in_range(value, year_from: int, year_to: int) -> bool:
+    """from_year / to_year 统一为「闭区间年份」，缺失日期不因过滤而误删。"""
+    parsed = _paper_year(value)
+    if parsed is None:
+        return True
+    if year_from and parsed < year_from:
+        return False
+    if year_to and parsed > year_to:
+        return False
+    return True
+
+
+def _src_openalex(query: str, limit: int, year: int,
+                  year_to: int = 0) -> list[dict]:
     params = {
         "search": query,
         "per-page": str(min(limit, 100)),
         "select": "id,doi,title,publication_year,cited_by_count,authorships,"
                   "primary_location,abstract_inverted_index,type",
     }
+    date_filters = []
     if year:
-        params["filter"] = f"from_publication_date:{year}-01-01"
+        date_filters.append(f"from_publication_date:{year}-01-01")
+    if year_to:
+        date_filters.append(f"to_publication_date:{year_to}-12-31")
+    if date_filters:
+        params["filter"] = ",".join(date_filters)
     if SEARCH_MAILTO:
         params["mailto"] = SEARCH_MAILTO
     data = _json_get("https://api.openalex.org/works?" + urllib.parse.urlencode(params))
@@ -1465,7 +1845,7 @@ def _src_openalex(query: str, limit: int, year: int) -> list[dict]:
             "source": "OpenAlex",
             "date": str(work.get("publication_year") or ""),
             "authors": authors,
-            "citations": work.get("cited_by_count") or 0,
+            "citations": work.get("cited_by_count"),
             "doi": (work.get("doi") or "").replace("https://doi.org/", ""),
             "venue": venue,
         })
@@ -1473,7 +1853,7 @@ def _src_openalex(query: str, limit: int, year: int) -> list[dict]:
 
 
 def _src_arxiv(query: str, limit: int, year: int, author: str = "",
-               category: str = "") -> list[dict]:
+               category: str = "", year_to: int = 0) -> list[dict]:
     term = query.strip()
     if " " in term and not term.startswith('"'):
         term = f'"{term}"'
@@ -1500,7 +1880,8 @@ def _src_arxiv(query: str, limit: int, year: int, author: str = "",
         if not title or title.lower().startswith("error"):
             continue
         published = (entry.findtext(f"{ns}published") or "")[:10]
-        if year and (not published or int(published[:4]) < year):
+        if (year or year_to) and published and not _year_in_range(
+                published, year, year_to):
             continue
         authors = ", ".join(
             _clean_text(a.findtext(f"{ns}name"))
@@ -1520,15 +1901,21 @@ def _src_arxiv(query: str, limit: int, year: int, author: str = "",
     return out[:limit]
 
 
-def _src_crossref(query: str, limit: int, year: int) -> list[dict]:
+def _src_crossref(query: str, limit: int, year: int,
+                  year_to: int = 0) -> list[dict]:
     params = {
         "query.bibliographic": query,
         "rows": str(min(limit, 100)),
         "select": "DOI,title,author,published,URL,container-title,abstract,"
                   "is-referenced-by-count,type",
     }
+    date_filters = []
     if year:
-        params["filter"] = f"from-pub-date:{year}-01-01"
+        date_filters.append(f"from-pub-date:{year}-01-01")
+    if year_to:
+        date_filters.append(f"until-pub-date:{year_to}-12-31")
+    if date_filters:
+        params["filter"] = ",".join(date_filters)
     if SEARCH_MAILTO:
         params["mailto"] = SEARCH_MAILTO
     data = _json_get("https://api.crossref.org/works?" + urllib.parse.urlencode(params))
@@ -1548,15 +1935,22 @@ def _src_crossref(query: str, limit: int, year: int) -> list[dict]:
             "source": "CrossRef",
             "date": date,
             "authors": authors,
-            "citations": item.get("is-referenced-by-count") or 0,
+            "citations": item.get("is-referenced-by-count"),
             "doi": item.get("DOI") or "",
             "venue": _clean_text(item.get("container-title")),
         })
     return out
 
 
-def _src_europepmc(query: str, limit: int, year: int) -> list[dict]:
-    q = query + (f" AND FIRST_PDATE:[{year}-01-01 TO {year}-12-31]" if year else "")
+def _src_europepmc(query: str, limit: int, year: int,
+                   year_to: int = 0) -> list[dict]:
+    # 统一语义：from_year = 该年及之后，to_year = 该年及之前。
+    if year or year_to:
+        lower = f"{year}-01-01" if year else "*"
+        upper = f"{year_to}-12-31" if year_to else "*"
+        q = f"{query} AND FIRST_PDATE:[{lower} TO {upper}]"
+    else:
+        q = query
     params = {"query": q, "format": "json", "pageSize": str(min(limit, 100)),
               "resultType": "core"}
     data = _json_get("https://www.ebi.ac.uk/europepmc/webservices/rest/search?"
@@ -1574,7 +1968,7 @@ def _src_europepmc(query: str, limit: int, year: int) -> list[dict]:
             "source": "Europe PMC",
             "date": str(item.get("pubYear") or ""),
             "authors": _clean_text(item.get("authorString")),
-            "citations": item.get("citedByCount") or 0,
+            "citations": item.get("citedByCount"),
             "doi": doi,
             "venue": _clean_text(item.get("journalTitle")),
             "extra": "OA=yes" if item.get("isOpenAccess") == "Y" else "",
@@ -1582,8 +1976,14 @@ def _src_europepmc(query: str, limit: int, year: int) -> list[dict]:
     return out
 
 
-def _src_pubmed(query: str, limit: int, year: int) -> list[dict]:
-    term = query + (f" AND {year}[pdat]" if year else "")
+def _src_pubmed(query: str, limit: int, year: int,
+                year_to: int = 0) -> list[dict]:
+    if year or year_to:
+        lower = str(year) if year else "1900"
+        upper = str(year_to) if year_to else "3000"
+        term = f"{query} AND {lower}:{upper}[pdat]"
+    else:
+        term = query
     p1 = {"db": "pubmed", "term": term, "retmax": str(min(limit, 100)),
           "retmode": "json"}
     if SEARCH_MAILTO:
@@ -1619,7 +2019,8 @@ def _src_pubmed(query: str, limit: int, year: int) -> list[dict]:
     return out
 
 
-def _src_openreview(query: str, limit: int, year: int) -> list[dict]:
+def _src_openreview(query: str, limit: int, year: int,
+                    year_to: int = 0) -> list[dict]:
     params = {"query": query, "limit": str(min(limit, 50))}
     data = _json_get("https://api.openreview.net/notes/search?"
                      + urllib.parse.urlencode(params))
@@ -1632,7 +2033,7 @@ def _src_openreview(query: str, limit: int, year: int) -> list[dict]:
                 (note.get("cdate") or 0) / 1000, datetime.timezone.utc).date().isoformat()
         except (TypeError, ValueError, OSError, OverflowError):
             date = ""
-        if year and date and not date.startswith(str(year)):
+        if not _year_in_range(date, year, year_to):
             continue
         out.append({
             "title": title,
@@ -1645,7 +2046,8 @@ def _src_openreview(query: str, limit: int, year: int) -> list[dict]:
     return out
 
 
-def _src_dblp(query: str, limit: int, year: int) -> list[dict]:
+def _src_dblp(query: str, limit: int, year: int,
+              year_to: int = 0) -> list[dict]:
     # 注意：dblp 对部分出口 IP 返回 202 + 反自动化 HTML 页，默认不启用。
     params = {"q": query, "format": "json", "h": str(min(limit, 50))}
     data = _json_get("https://dblp.org/search/publ/api?" + urllib.parse.urlencode(params))
@@ -1658,7 +2060,7 @@ def _src_dblp(query: str, limit: int, year: int) -> list[dict]:
             raw_authors = [raw_authors.get("text", "")]
         if isinstance(raw_authors, str):
             raw_authors = [raw_authors]
-        if year and str(info.get("year") or "") != str(year):
+        if not _year_in_range(info.get("year"), year, year_to):
             continue
         out.append({
             "title": _clean_text(info.get("title")),
@@ -1672,16 +2074,22 @@ def _src_dblp(query: str, limit: int, year: int) -> list[dict]:
     return out
 
 
-def _src_semanticscholar(query: str, limit: int, year: int) -> list[dict]:
+def _src_semanticscholar(query: str, limit: int, year: int,
+                         year_to: int = 0) -> list[dict]:
     params = {"query": query, "limit": str(min(limit, 50)),
               "fields": "title,authors,year,abstract,citationCount,url,externalIds"}
-    if year:
-        params["year"] = str(year)
+    if year or year_to:
+        params["year"] = (f"{year}-{year_to}" if year and year_to and year != year_to
+                          else str(year or year_to))
+        if year_to and not year:
+            params["year"] = f"-{year_to}"
     data = _json_get("https://api.semanticscholar.org/graph/v1/paper/search?"
                      + urllib.parse.urlencode(params))
     out = []
     for paper in data.get("data") or []:
         ids = paper.get("externalIds") or {}
+        if not _year_in_range(paper.get("year"), year, year_to):
+            continue
         out.append({
             "title": _clean_text(paper.get("title")),
             "url": paper.get("url") or ("https://doi.org/" + ids["DOI"] if ids.get("DOI") else ""),
@@ -1689,7 +2097,7 @@ def _src_semanticscholar(query: str, limit: int, year: int) -> list[dict]:
             "source": "Semantic Scholar",
             "date": str(paper.get("year") or ""),
             "authors": ", ".join(a.get("name", "") for a in (paper.get("authors") or [])[:3]),
-            "citations": paper.get("citationCount") or 0,
+            "citations": paper.get("citationCount"),
             "doi": ids.get("DOI") or "",
         })
     return out
@@ -1728,56 +2136,78 @@ def _interleave(groups: list[list[dict]]) -> list[dict]:
 
 
 def _run_paper_sources(names: list[str], query: str, limit: int, year: int,
-                       sort: str = "relevance") -> str:
+                       sort: str = "relevance", year_to: int = 0,
+                       fmt: str = "text") -> str:
     started = time.monotonic()
     jobs: list[tuple[str, str, object]] = []
     errors: list[str] = []
+    per_source: dict[str, dict] = {}
     for name in names:
         key = name.strip().lower()
         if key not in _PAPER_SOURCES:
             errors.append(f"{name}: 未知来源（可选 {', '.join(sorted(_PAPER_SOURCES))}）")
+            per_source[name] = {"status": "FAILED", "error": "未知来源"}
             continue
         label, func = _PAPER_SOURCES[key]
         jobs.append((key, label, func))
     used: list[str] = []
-    collected: dict[str, list[dict]] = {}
+    all_items: list[dict] = []
     if jobs:
         # 多源并行：总耗时约等于最慢的那个来源，而不是各来源耗时之和。
         pool = ThreadPoolExecutor(max_workers=min(4, len(jobs)))
         deadline = SEARCH_TIMEOUT * (SEARCH_RETRIES + 1) + 5
         try:
-            futures = [(key, label, pool.submit(func, query, limit, year))
+            futures = [(key, label, pool.submit(func, query, limit, year,
+                                                year_to=year_to),
+                        time.monotonic())
                        for key, label, func in jobs]
-            for key, label, future in futures:
+            for key, label, future, submitted_at in futures:
+                stat: dict = {"status": "SUCCESS", "result_count": 0,
+                              "duration_ms": 0}
                 try:
                     got = future.result(timeout=deadline)[:limit]
                     used.append(label)
-                    if got:
-                        collected[key] = got
+                    stat["result_count"] = len(got)
+                    all_items.extend(got)
                 except SearchError as e:
                     errors.append(f"{label}: {e}")
+                    stat.update(status="FAILED", error=str(e)[:300],
+                                rate_limited="429" in str(e))
                 except Exception as e:  # noqa: BLE001 - 单源失败不影响其余来源
                     errors.append(f"{label}: 意外错误 {str(e)[:160]}")
+                    stat.update(status="FAILED", error=str(e)[:300])
+                stat["duration_ms"] = int((time.monotonic() - submitted_at) * 1000)
+                per_source[label] = stat
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
-    groups = [collected[key] for key, _, _ in jobs if collected.get(key)]
-    items = _interleave(groups)[:max(limit, min(limit * max(1, len(used)), 30))]
-    if sort == "date":
-        items.sort(key=lambda x: str(x.get("date") or ""), reverse=True)
+
+    # 关键顺序：先跨源合并去重 → 再全局排序 → 最后截断。
+    merged = merge_items(all_items)
+    ranked = rank_items(merged, sort, query)
+    cap = max(limit, min(limit * max(1, len(used)), 30))
+    items = ranked[:cap]
     took = time.monotonic() - started
-    text = _fmt_results(items, query, used, took)
-    if errors:
-        text += "\n\n部分来源失败（其余结果照常返回）:\n" + "\n".join(
-            f"  - {line}" for line in errors)
+    scope = ("检索范围仅限所选学术数据源，不代表全网可达；"
+             "citation 为空表示来源未提供该指标，不是零引用。")
+    if fmt == "json":
+        text = structured_output(items, query=query, sources=used, took=took,
+                                 errors=errors, scope_note=scope)
+    else:
+        text = _fmt_results(items, query, used, took) + "\n" + scope
+        if errors:
+            text += "\n\n部分来源失败（其余结果照常返回）:\n" + "\n".join(
+                f"  - {line}" for line in errors)
     _audit_search("papers", query, used, took, bool(items),
-                  f"results={len(items)} errors={len(errors)}")
+                  f"results={len(items)} merged={len(merged)} errors={len(errors)}",
+                  per_source=per_source)
     return text
 
 
 @mcp.tool()
 def search_papers(query: str, sources: str = _PAPER_DEFAULT_SOURCES,
                   max_results: int = 8, from_year: int = 0,
-                  sort: str = "relevance") -> str:
+                  sort: str = "relevance", to_year: int = 0,
+                  format: str = "text") -> str:
     """跨多个开放学术数据源检索论文（默认零密钥：OpenAlex / arXiv / CrossRef / PubMed / Europe PMC）。
 
     Args:
@@ -1787,12 +2217,15 @@ def search_papers(query: str, sources: str = _PAPER_DEFAULT_SOURCES,
                  可能因反自动化 / 限流而失败）。
         max_results: 每个来源的最大条数，默认 8；各来源结果轮流交错展示，
                      最终最多 30 条。
-        from_year: 只保留该年份及之后的文献，0 表示不限。
-        sort: relevance（按来源顺序）或 date（按日期倒序）。
+        from_year: 只保留该年份及之后的文献，0 表示不限（所有来源语义一致）。
+        to_year: 只保留该年份及之前的文献，0 表示不限；不得小于 from_year。
+        sort: relevance（跨源合并后全局打分）或 date（按归一化日期倒序）。
+        format: text（默认，兼容旧客户端）或 json（结构化元数据）。
 
     Returns:
-        归一化的紧凑结果文本（标题、链接、日期、作者、引用数、DOI、摘要）；
-        单个来源失败不影响其它来源，失败原因会附在末尾。
+        归一化的结果（标题、链接、日期、作者、引用数、DOI、摘要）；
+        单个来源失败不影响其它来源，失败原因会附在末尾；
+        引用数缺失在 JSON 中为 null，真实零引用为 0。
     """
     started = time.monotonic()
     try:
@@ -1802,10 +2235,16 @@ def search_papers(query: str, sources: str = _PAPER_DEFAULT_SOURCES,
             raise SearchError("sources 不能为空")
         if len(names) > 8:
             raise SearchError("一次最多聚合 8 个来源")
-        year = max(0, min(int(from_year or 0), datetime.datetime.now().year))
+        current = datetime.datetime.now().year
+        year = max(0, min(int(from_year or 0), current))
+        upper = max(0, min(int(to_year or 0), current))
+        if year and upper and upper < year:
+            raise SearchError("to_year 不能小于 from_year")
         if sort not in ("relevance", "date"):
             raise SearchError("sort 只能是 relevance 或 date")
-        return _run_paper_sources(names, query, limit, year, sort)
+        if format not in ("text", "json"):
+            raise SearchError("format 只能是 text 或 json")
+        return _run_paper_sources(names, query, limit, year, sort, upper, format)
     except SearchError as e:
         _audit_search("papers", str(query)[:80], [], time.monotonic() - started, False, str(e))
         return f"ERROR: {e}"
@@ -1816,7 +2255,8 @@ def search_papers(query: str, sources: str = _PAPER_DEFAULT_SOURCES,
 
 @mcp.tool()
 def search_arxiv(query: str, author: str = "", category: str = "",
-                 max_results: int = 8, from_year: int = 0) -> str:
+                 max_results: int = 8, from_year: int = 0,
+                 to_year: int = 0, format: str = "text") -> str:
     """用 arXiv 官方 API 检索预印本，支持字段限定（作者、分类、年份）与 PDF 链接。
 
     Args:
@@ -1832,10 +2272,24 @@ def search_arxiv(query: str, author: str = "", category: str = "",
     started = time.monotonic()
     try:
         query, limit = _check_query(query, max_results)
-        year = max(0, min(int(from_year or 0), datetime.datetime.now().year))
-        items = _src_arxiv(query, limit, year, author, category)
+        current = datetime.datetime.now().year
+        year = max(0, min(int(from_year or 0), current))
+        upper = max(0, min(int(to_year or 0), current))
+        if year and upper and upper < year:
+            raise SearchError("to_year 不能小于 from_year")
+        if format not in ("text", "json"):
+            raise SearchError("format 只能是 text 或 json")
+        items = _src_arxiv(query, limit, year, author, category, year_to=upper)
         took = time.monotonic() - started
-        _audit_search("arxiv", query, ["arXiv"], took, bool(items), f"results={len(items)}")
+        _audit_search("arxiv", query, ["arXiv"], took, bool(items),
+                      f"results={len(items)}",
+                      per_source={"arXiv": {"status": "SUCCESS",
+                                            "duration_ms": int(took * 1000),
+                                            "result_count": len(items)}})
+        if format == "json":
+            return structured_output(items[:limit], query=query,
+                                     sources=["arXiv"], took=took,
+                                     scope_note="仅 arXiv 官方 API，非全网通用搜索")
         return _fmt_results(items, query, ["arXiv"], took, limit)
     except SearchError as e:
         _audit_search("arxiv", str(query)[:80], ["arXiv"], time.monotonic() - started, False, str(e))
@@ -1919,8 +2373,45 @@ def _paper_by_pmid(pmid: str) -> str:
     ])
 
 
+_PAPER_FIELD_MAP = {
+    "标识符": "identifier", "标题": "title", "作者": "authors",
+    "发表": "publication", "类型": "type", "引用数": "citation_count",
+    "链接": "landing_url", "摘要": "abstract", "开放全文": "oa_location",
+    "提交": "submitted", "摘要页": "landing_url", "PDF": "pdf_url",
+    "DOI": "doi",
+}
+
+
+def _paper_record_from_text(text: str, *, identifier: str,
+                            source: str) -> dict:
+    """把单篇详情的标签行转成结构化字段，不虚构任何未返回的元数据。"""
+    record: dict = {
+        "identifier": identifier, "source": source,
+        "retrieved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "scope_note": "仅查询所选标识符对应的公开数据源，不代表全网检索",
+    }
+    for line in text.splitlines():
+        if ": " not in line:
+            continue
+        label, value = line.split(": ", 1)
+        key = _PAPER_FIELD_MAP.get(label.strip())
+        if key:
+            record[key] = value.strip()
+    if record.get("citation_count", "").isdigit():
+        record["citation_count"] = int(record["citation_count"])
+    return json.dumps({
+        "query": identifier,
+        "sources": [source],
+        "source_failures": [],
+        "result_count": 1 if record.get("title") else 0,
+        "results": [record],
+        "citations_semantics": "citation_count=null 表示来源未提供；0 表示真实零引用",
+    }, ensure_ascii=False, indent=2)
+
+
 @mcp.tool()
-def get_paper(doi: str = "", arxiv_id: str = "", pmid: str = "") -> str:
+def get_paper(doi: str = "", arxiv_id: str = "", pmid: str = "",
+              format: str = "text") -> str:
     """按单个标识符查论文详情与合法开放全文链接（DOI / arXiv ID / PubMed ID 三选一）。
 
     Args:
@@ -1930,13 +2421,16 @@ def get_paper(doi: str = "", arxiv_id: str = "", pmid: str = "") -> str:
         pmid: PubMed ID，如 "30000000"（走 NCBI E-utilities）。
 
     Returns:
-        单篇论文的元数据文本；未传任何标识符返回错误提示。
+        单篇论文的元数据文本（默认）或 JSON（format="json"）；
+        未传任何标识符返回错误提示。
     """
     started = time.monotonic()
     identifier = (doi or arxiv_id or pmid or "").strip()
     try:
         if sum(bool(x.strip()) for x in (doi, arxiv_id, pmid)) != 1:
             raise SearchError("请且只传 doi / arxiv_id / pmid 中的一个")
+        if format not in ("text", "json"):
+            raise SearchError("format 只能是 text 或 json")
         identifier = identifier[:200]
         if doi.strip():
             text = _paper_by_doi(doi.strip())
@@ -1948,7 +2442,13 @@ def get_paper(doi: str = "", arxiv_id: str = "", pmid: str = "") -> str:
             text = _paper_by_pmid(pmid.strip())
             source = "PubMed"
         took = time.monotonic() - started
-        _audit_search("paper", identifier, [source], took, not text.startswith("ERROR:"), "")
+        failed = text.startswith("ERROR:")
+        _audit_search("paper", identifier, [source], took, not failed, "",
+                      per_source={source: {"status": "FAILED" if failed else "SUCCESS",
+                                           "duration_ms": int(took * 1000),
+                                           "error": text[:200] if failed else ""}})
+        if format == "json" and not failed:
+            return _paper_record_from_text(text, identifier=identifier, source=source)
         return text + "\n\n" + _UNTRUSTED_NOTE
     except SearchError as e:
         _audit_search("paper", identifier, [], time.monotonic() - started, False, str(e))
@@ -2089,41 +2589,58 @@ _WEB_PROVIDERS = {
 }
 
 
-def _run_web_providers(names: list[str], query: str, limit: int,
-                       site: str) -> str:
+def _collect_web_results(names: list[str], query: str, limit: int,
+                         site: str) -> tuple[list[dict], list[str], list[str],
+                                             dict[str, dict], float]:
+    """并行抓取各 provider，返回 (全部条目, 成功来源, 错误, 逐源统计, 耗时)。"""
     started = time.monotonic()
     jobs: list[tuple[str, str, object]] = []
     errors: list[str] = []
+    per_source: dict[str, dict] = {}
     for name in names:
         key = name.strip().lower()
         if key not in _WEB_PROVIDERS:
             errors.append(f"{name}: 未知 provider（可选 {', '.join(sorted(_WEB_PROVIDERS))}）")
+            per_source[name] = {"status": "FAILED", "error": "未知 provider"}
             continue
         label, func = _WEB_PROVIDERS[key]
         jobs.append((key, label, func))
     used: list[str] = []
-    collected: dict[str, list[dict]] = {}
+    items: list[dict] = []
     if jobs:
         pool = ThreadPoolExecutor(max_workers=min(4, len(jobs)))
         deadline = SEARCH_TIMEOUT * (SEARCH_RETRIES + 1) + 5
         try:
-            futures = [(key, label, pool.submit(func, query, limit, site))
-                       for key, label, func in jobs]
-            for key, label, future in futures:
+            futures = [(label, pool.submit(func, query, limit, site), time.monotonic())
+                       for _, label, func in jobs]
+            for label, future, submitted_at in futures:
+                stat: dict = {"status": "SUCCESS", "result_count": 0}
                 try:
                     got = future.result(timeout=deadline)[:limit]
                     used.append(label)
-                    if got:
-                        collected[key] = got
+                    stat["result_count"] = len(got)
+                    items.extend(got)
                 except SearchError as e:
                     errors.append(f"{label}: {e}")
+                    stat.update(status="FAILED", error=str(e)[:300],
+                                rate_limited="429" in str(e))
                 except Exception as e:  # noqa: BLE001 - 单源失败不影响其余来源
                     errors.append(f"{label}: 意外错误 {str(e)[:160]}")
+                    stat.update(status="FAILED", error=str(e)[:300])
+                stat["duration_ms"] = int((time.monotonic() - submitted_at) * 1000)
+                per_source[label] = stat
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
-    groups = [collected[key] for key, _, _ in jobs if collected.get(key)]
-    items = _interleave(groups)[:max(limit, min(limit * max(1, len(used)), 30))]
-    took = time.monotonic() - started
+    return items, used, errors, per_source, time.monotonic() - started
+
+
+def _run_web_providers(names: list[str], query: str, limit: int,
+                       site: str) -> str:
+    items, used, errors, per_source, took = _collect_web_results(
+        names, query, limit, site)
+    # 与论文检索一致：先去重合并，再全局排序，最后截断。
+    ranked = rank_items(merge_items(items), "relevance", query)
+    items = ranked[:max(limit, min(limit * max(1, len(used)), 30))]
     text = _fmt_results(items, query, used, took)
     if not any(n.strip().lower() in ("searxng", "tavily") for n in names):
         text += "\n\n" + _WEB_SCOPE_NOTE
@@ -2131,7 +2648,8 @@ def _run_web_providers(names: list[str], query: str, limit: int,
         text += "\n\n部分来源失败（其余结果照常返回）:\n" + "\n".join(
             f"  - {line}" for line in errors)
     _audit_search("web", query, used, took, bool(items),
-                  f"results={len(items)} errors={len(errors)}")
+                  f"results={len(items)} errors={len(errors)}",
+                  per_source=per_source)
     return text
 
 
@@ -2224,6 +2742,500 @@ def read_web_page(url: str, max_chars: int = 8000) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 阶段 B 论文全链路：合法 OA 发现 / 下载 / 阅读 / 文献库 / 批量
+# ---------------------------------------------------------------------------
+
+from gateway.research.batch import batch_download as _batch_download  # noqa: E402
+from gateway.research.download import (  # noqa: E402
+    PAPER_DIR as _PAPER_DIR, download_paper as _download_one,
+)
+from gateway.research.fulltext import discover_oa as _discover_oa  # noqa: E402
+from gateway.research.library import (  # noqa: E402
+    download_status as _download_status, export_bibliography as _export_bib,
+    list_papers as _list_papers,
+)
+from gateway.research.pdf import read_pdf as _read_pdf  # noqa: E402
+from gateway.research.pdf import search_pdf_fulltext  # noqa: E402
+from gateway.transfer.core import OA_ALLOWED_HOSTS as _OA_HOSTS  # noqa: E402
+
+_PAPER_CLIENT = SafeHttpClient(
+    allowed_hosts=_OA_HOSTS, default_interval=0.3, timeout=SEARCH_TIMEOUT,
+    max_bytes=SEARCH_MAX_BYTES, retries=SEARCH_RETRIES,
+    cache_ttl=0.0, user_agent=_SEARCH_UA,
+    pin_dns=False, private_hosts=frozenset({_SEARXNG_HOST} - {""}),
+)
+
+
+def _trace_ids() -> tuple[str, str]:
+    try:
+        from gateway.audit.events import current_trace
+        trace = current_trace()
+        if trace:
+            return trace.request_id, trace.trace_id
+    except Exception:  # noqa: BLE001
+        pass
+    return "", ""
+
+
+def _paper_from_identifier(identifier: str) -> dict:
+    """把 DOI / arXiv ID / PMID / PMCID 归一成发现器需要的字段。"""
+    value = (identifier or "").strip()
+    lower = value.lower()
+    if lower.startswith("10.") or "doi.org/" in lower:
+        doi = value.split("doi.org/", 1)[-1] if "doi.org/" in lower else value
+        return {"doi": doi, "title": doi, "landing_url": f"https://doi.org/{doi}"}
+    if lower.startswith("pmc") and lower[3:].isdigit():
+        return {"pmcid": value, "title": value}
+    if re.fullmatch(r"\d{4}\.\d{4,5}(v\d+)?", value) or re.fullmatch(
+            r"[a-z-]+(\.[A-Z]{2})?/\d{7}(v\d+)?", value):
+        return {"arxiv_id": value, "title": value,
+                "landing_url": f"https://arxiv.org/abs/{value}"}
+    if value.isdigit():
+        return {"pmid": value, "title": value}
+    return {"title": value}
+
+
+def _paper_allow_private() -> bool:
+    """离线/自建测试时才显式开启私网来源，生产默认仅合法 OA 公网主机。"""
+    return _env_bool("MCP_PAPER_ALLOW_PRIVATE", False)
+
+
+def _paper_extra_hosts() -> frozenset[str]:
+    raw = os.environ.get("MCP_PAPER_EXTRA_HOSTS", "")
+    return frozenset(h.strip().lower() for h in raw.split(",") if h.strip())
+
+
+def _paper_extras() -> tuple[frozenset[str], bool]:
+    return _paper_extra_hosts(), _paper_allow_private()
+
+
+@mcp.tool()
+def find_paper_fulltext(identifier: str = "", title: str = "", doi: str = "",
+                        arxiv_id: str = "", pmcid: str = "") -> str:
+    """发现合法开放获取 PDF 位置，明确报告 6 种状态，不返回盗版/付费墙链接。
+
+    状态：FOUND / NO_OA / SUBSCRIPTION_REQUIRED / SOURCE_UNAVAILABLE
+    / INVALID_HOST / 以及随逐源原因返回的 ERROR。
+    """
+    paper = {**_paper_from_identifier(identifier or doi or arxiv_id or pmcid or title),
+             **({"doi": doi} if doi else {}),
+             **({"arxiv_id": arxiv_id} if arxiv_id else {}),
+             **({"pmcid": pmcid} if pmcid else {}),
+             **({"title": title} if title else {})}
+    if not any(paper.get(k) for k in ("doi", "arxiv_id", "pmcid", "pmid", "title")):
+        return "ERROR: 请提供 identifier / doi / arxiv_id / pmcid / title 之一"
+    extra_hosts, allow_private = _paper_extras()
+    result = _discover_oa(paper, client=_PAPER_CLIENT, mailto=SEARCH_MAILTO,
+                          extra_hosts=extra_hosts, allow_private=allow_private)
+    lines = [f"状态: {result['status']}", result["note"]]
+    for candidate in result["candidates"]:
+        lines.append(f"候选: {candidate['source']} | {candidate['url']}")
+    for reason in result["reasons"]:
+        lines.append(f"原因: {reason}")
+    req, trace = _trace_ids()
+    audit(f"PAPER_OA id={result['paper_id']} status={result['status']} "
+          f"candidates={len(result['candidates'])} request={req} trace={trace}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def download_paper(identifier: str = "", title: str = "", doi: str = "",
+                   arxiv_id: str = "", project: str = "") -> str:
+    """下载单篇合法 OA PDF，严格校验后才报告最终成功。
+
+    返回 status=success/duplicate 才代表文件已落盘并通过校验；created 仅表示
+    任务创建。失败会给出具体原因（HTML 假 PDF、%%EOF 缺失、来源不可用等）。
+    """
+    paper = {**_paper_from_identifier(identifier or doi or arxiv_id or title),
+             **({"doi": doi} if doi else {}),
+             **({"arxiv_id": arxiv_id} if arxiv_id else {}),
+             **({"title": title} if title else {}),
+             "project": project}
+    req, trace = _trace_ids()
+    extra_hosts, allow_private = _paper_extras()
+    result = _download_one(
+        paper, client=_PAPER_CLIENT, mailto=SEARCH_MAILTO,
+        paper_dir=_PAPER_DIR, request_id=req, trace_id=trace, project=project,
+        extra_hosts=extra_hosts, allow_private=allow_private)
+    lines = [f"状态: {result['status']}", f"关联请求: {req or '(无)'}",
+             f"路径: {result.get('path') or '(未生成)'}"]
+    if result.get("bytes"):
+        lines.append(f"大小: {result['bytes']} 字节")
+    if result.get("sha256"):
+        lines.append(f"SHA-256: {result['sha256']}")
+    if result.get("final_url"):
+        lines.append(f"最终地址: {result['final_url']}")
+    if result.get("reason"):
+        lines.append(f"原因: {result['reason']}")
+    for reason in (result.get("discovery") or {}).get("reasons", []):
+        lines.append(f"来源说明: {reason}")
+    lines.append("说明: created 仅表示任务创建；success/duplicate 才表示文件最终校验通过。")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def batch_download_papers(identifiers: str = "", project: str = "",
+                          max_workers: int = 0) -> str:
+    """批量下载（去重 + 有界并发 + 部分成功逐篇报告）。
+
+    identifiers 支持逗号分隔或 JSON 字符串数组，元素为 DOI / arXiv ID / PMCID。
+    """
+    raw = (identifiers or "").strip()
+    if raw.startswith("["):
+        try:
+            values = [str(v) for v in json.loads(raw)]
+        except ValueError as exc:
+            return f"ERROR: identifiers 不是合法 JSON 数组: {exc}"
+    else:
+        values = [v.strip() for v in raw.split(",") if v.strip()]
+    if not values:
+        return "ERROR: identifiers 为空"
+    if len(values) > 50:
+        return "ERROR: 单批最多 50 篇，请分批调用"
+    papers = [_paper_from_identifier(v) for v in values]
+    req, trace = _trace_ids()
+    extra_hosts, allow_private = _paper_extras()
+    result = _batch_download(
+        papers, client=_PAPER_CLIENT, mailto=SEARCH_MAILTO,
+        paper_dir=_PAPER_DIR, request_id=req, trace_id=trace, project=project,
+        max_workers=max_workers, extra_hosts=extra_hosts,
+        allow_private=allow_private)
+    lines = [f"状态: {result['status']}", f"总数: {result['total']} / "
+             f"去重后: {result['unique']} / 成功: {result['succeeded']} / "
+             f"失败: {result['failed']}", f"并发: {result['workers']}",
+             result["note"]]
+    for row in result["results"]:
+        lines.append(f"- {row['paper_id']}: {row['status']} "
+                     f"{row.get('path') or ''} {row.get('reason') or ''}".rstrip())
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def read_paper_pdf(path: str = "", page: int = 0, keyword: str = "",
+                   list_sections: bool = False, max_chars: int = 8000,
+                   format: str = "text") -> str:
+    """按页读取本地 PDF：页码引用、章节/关键词检索、扫描版 OCR 提示。"""
+    if not path:
+        return "ERROR: 请提供本地 PDF 路径"
+    if format not in ("text", "json"):
+        return "ERROR: format 只能是 text 或 json"
+    allowed = _PAPER_DIR.resolve()
+    try:
+        resolved = Path(path).resolve()
+        if allowed not in resolved.parents and resolved != allowed:
+            return f"ERROR: 路径不在论文目录内: {allowed}"
+    except OSError as exc:
+        return f"ERROR: 路径无法解析: {exc}"
+    result = _read_pdf(resolved, page=page, keyword=keyword,
+                       max_chars=max(200, min(int(max_chars or 8000), 200000)),
+                       list_sections=list_sections)
+    if format == "json":
+        return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+    lines = [f"状态: {result['status']}", f"页数: {result['page_count']}",
+             f"提取字符: {result.get('characters_extracted', 0)}",
+             f"路径: {path}"]
+    if result.get("reason"):
+        lines.append(f"提示: {result['reason']}")
+    for section in result.get("sections", []):
+        lines.append(f"章节: 第 {section['page']} 页 | {section['heading']}")
+    for match in result.get("matches", []):
+        lines.append(f"命中: 第 {match['page']} 页 | {match['excerpt'][:200]}")
+    lines.extend(result.get("pages", []))
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def search_paper_fulltext(path: str = "", keyword: str = "",
+                          max_results: int = 20) -> str:
+    """在本地 PDF 全文中检索关键词，返回页码与上下文片段。"""
+    if not path or not keyword:
+        return "ERROR: 请提供 path 与 keyword"
+    allowed = _PAPER_DIR.resolve()
+    resolved = Path(path).resolve()
+    if allowed not in resolved.parents:
+        return f"ERROR: 路径不在论文目录内: {allowed}"
+    result = search_pdf_fulltext(resolved, keyword, max_results)
+    return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+
+
+@mcp.tool()
+def list_downloaded_papers(keyword: str = "", project: str = "", tag: str = "",
+                           reading_status: str = "", from_year: int = 0,
+                           to_year: int = 0, max_results: int = 50,
+                           format: str = "text") -> str:
+    """列出本地文献库（项目/标签/阅读状态/年份/关键词筛选）。"""
+    rows = _list_papers({"keyword": keyword, "project": project, "tag": tag,
+                         "reading_status": reading_status,
+                         "from_year": from_year, "to_year": to_year},
+                        limit=max(1, min(int(max_results or 50), 200)))
+    if format == "json":
+        return json.dumps({"count": len(rows), "items": rows},
+                          ensure_ascii=False, indent=2, default=str)
+    lines = [f"共 {len(rows)} 篇（仅已通过校验的本地文件）"]
+    for row in rows:
+        lines.append(
+            f"- {row['title']} | {row.get('publication_year') or '年份未知'} | "
+            f"DOI={row.get('doi') or '-'} | 状态={row.get('reading_status')} | "
+            f"校验={'通过' if row.get('sha256_verified') else '未知'} | "
+            f"{row.get('file_path') or ''}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_paper_download_status(request_id: str = "", limit: int = 50) -> str:
+    """查询下载任务全过程状态，明确区分任务创建成功与文件最终校验成功。"""
+    result = _download_status(request_id, limit)
+    return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+
+
+@mcp.tool()
+def export_bibliography(format: str = "bibtex", keyword: str = "",
+                        project: str = "", tag: str = "") -> str:
+    """导出文献库为 BibTeX / RIS / CSV / JSON。"""
+    try:
+        return _export_bib(format, {"keyword": keyword, "project": project,
+                                    "tag": tag})
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# 阶段 B 新增网页工具：高级检索 / 页面抓取 / 正文提取 / 站点限定搜索
+# ---------------------------------------------------------------------------
+
+from gateway.web.tools import (  # noqa: E402
+    extract_content, filter_results, merge_and_rank,
+)
+
+_GENERAL_PROVIDERS = ("searxng", "tavily")
+
+
+def _general_search_available() -> bool:
+    return bool(SEARCH_SEARXNG_URL or SEARCH_TAVILY_KEY)
+
+
+def _fetch_page(url: str, max_chars: int, chunk_size: int = 0) -> dict:
+    """页面抓取共用入口：沿用同一 SafeHttpClient 与 SSRF / Content-Type 校验。"""
+    if not SEARCH_FETCH_ENABLED:
+        raise SearchError("页面抓取默认关闭；设置 MCP_SEARCH_FETCH_ENABLED=1 开启")
+    url = (url or "").strip()
+    if not url or len(url) > 2000:
+        raise SearchError("URL 为空或过长（上限 2000 字符）")
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https":
+        raise SearchError("仅允许 https 页面")
+    host = (parts.hostname or "").lower()
+    if SEARCH_FETCH_ALLOW_HOSTS and host not in SEARCH_FETCH_ALLOW_HOSTS:
+        raise SearchError(f"主机不在 MCP_SEARCH_FETCH_ALLOW_HOSTS 中: {host}")
+    cap = max(200, min(int(max_chars or SEARCH_FETCH_MAX_CHARS),
+                       SEARCH_FETCH_MAX_CHARS))
+    raw = _http_request(url, allow_any_host=True,
+                        headers={"Accept": "text/html, text/plain, */*"},
+                        max_bytes=SEARCH_MAX_BYTES)
+    if raw[:2] in (b"PK", b"\x89P", b"\xff\xd8", b"GI"):
+        raise SearchError("目标不是文本网页（疑似二进制内容）")
+    content = extract_content(raw.decode("utf-8", "replace"), max_chars=cap,
+                              chunk_size=max(0, min(int(chunk_size or 0), 20000)))
+    content.update({"url": url, "source": host, "final_url": _HTTP_CLIENT.last_url,
+                    "content_type": _HTTP_CLIENT.last_content_type,
+                    "untrusted": True})
+    return content
+
+
+@mcp.tool()
+def search_web_advanced(query: str, providers: str = "", max_results: int = 8,
+                        site: str = "", from_year: int = 0, to_year: int = 0,
+                        language: str = "", sort: str = "relevance",
+                        format: str = "text") -> str:
+    """增强网页检索：站点/年份/语言筛选、跨源去重、全局排序、JSON 输出。
+
+    默认 provider 是技术社区垂直检索，不是全网通用搜索；如需全网结果必须配置
+    自建 SearXNG 或 Tavily 免费额度。
+
+    Args:
+        query: 检索关键词。
+        providers: 逗号分隔；留空用 MCP_SEARCH_WEB_PROVIDERS。
+        max_results: 每个 provider 条数，最终最多 30 条。
+        site: 结果 URL 需包含的站点（对垂直社区结果执行客户端过滤）。
+        from_year / to_year: 结果日期闭区间，0 表示不限。
+        language: zh / en，按标题与摘要文字粗筛；留空不限。
+        sort: relevance（默认）或 date。
+        format: text 或 json。
+    """
+    started = time.monotonic()
+    try:
+        query, limit = _check_query(query, max_results)
+        names = ([p.strip() for p in providers.split(",") if p.strip()]
+                 if providers.strip() else list(SEARCH_WEB_PROVIDERS))
+        if not names or len(names) > 5:
+            raise SearchError("providers 需在 1..5 个之间")
+        if sort not in ("relevance", "date") or format not in ("text", "json"):
+            raise SearchError("sort 只能是 relevance/date，format 只能是 text/json")
+        current = datetime.datetime.now().year
+        lower = max(0, min(int(from_year or 0), current))
+        upper = max(0, min(int(to_year or 0), current))
+        if lower and upper and upper < lower:
+            raise SearchError("to_year 不能小于 from_year")
+        items, used, errors, per_source, took = _collect_web_results(
+            names, query, limit, site or "stackoverflow")
+        filtered, notes = filter_results(items, query=query, from_year=lower,
+                                         to_year=upper, language=language,
+                                         site=site)
+        ranked = merge_and_rank(filtered, sort, query,
+                                max(limit, min(limit * max(1, len(used)), 30)))
+        scope = (_WEB_SCOPE_NOTE if not any(
+            n.strip().lower() in _GENERAL_PROVIDERS for n in names)
+            else "已启用通用搜索 provider；上游引擎可达性仍取决于运行时网络。")
+        if format == "json":
+            text = structured_output(ranked, query=query, sources=used, took=took,
+                                     errors=errors + notes, scope_note=scope)
+        else:
+            text = _fmt_results(ranked, query, used, took) + "\n\n" + scope
+            if notes:
+                text += "\n筛选说明: " + "; ".join(notes)
+            if errors:
+                text += "\n\n部分来源失败:\n" + "\n".join(f"  - {e}" for e in errors)
+        _audit_search("web_advanced", query, used, took, bool(ranked),
+                      f"results={len(ranked)} errors={len(errors)}",
+                      per_source=per_source)
+        return text
+    except SearchError as e:
+        _audit_search("web_advanced", str(query)[:80], [],
+                      time.monotonic() - started, False, str(e))
+        return f"ERROR: {e}"
+    except Exception as e:  # noqa: BLE001
+        _audit_search("web_advanced", str(query)[:80], [],
+                      time.monotonic() - started, False, repr(e))
+        return f"ERROR: {e}"
+
+
+@mcp.tool()
+def fetch_web_page(url: str, max_chars: int = 8000) -> str:
+    """抓取公开 HTTPS 网页并返回带来源、抓取时间与不可信标注的纯文本。
+
+    Args:
+        url: 目标 https 网页。
+        max_chars: 正文字符上限。
+    """
+    started = time.monotonic()
+    try:
+        content = _fetch_page(url, max_chars)
+        took = time.monotonic() - started
+        _audit_search("fetch", url[:120], [content["source"]], took,
+                      bool(content["text"]), f"chars={len(content['text'])}")
+        return "\n".join([
+            f"URL: {url}",
+            f"最终地址: {content['final_url'] or url}",
+            f"标题: {content['title'] or '(无)'}",
+            f"来源: {content['source']} | 抓取时间(UTC): {content['retrieved_at']}"
+            f" | 耗时: {took:.2f}s",
+            _UNTRUSTED_NOTE,
+            "----- 以下为外部页面正文 -----",
+            content["text"] or "(未提取到正文)",
+        ])
+    except SearchError as e:
+        _audit_search("fetch", str(url)[:120], [], time.monotonic() - started,
+                      False, str(e))
+        return f"ERROR: {e}"
+    except Exception as e:  # noqa: BLE001
+        _audit_search("fetch", str(url)[:120], [], time.monotonic() - started,
+                      False, repr(e))
+        return f"ERROR: {e}"
+
+
+@mcp.tool()
+def extract_web_content(url: str, max_chars: int = 8000,
+                        chunk_size: int = 0, format: str = "text") -> str:
+    """结构化提取网页标题、作者、发布时间、描述与正文，可选按字符分段。
+
+    Args:
+        url: 目标 https 网页。
+        max_chars: 正文上限。
+        chunk_size: >0 时按该长度分段返回，便于长网页逐段处理。
+        format: text 或 json。
+    """
+    started = time.monotonic()
+    try:
+        if format not in ("text", "json"):
+            raise SearchError("format 只能是 text 或 json")
+        content = _fetch_page(url, max_chars, chunk_size)
+        took = time.monotonic() - started
+        _audit_search("extract", url[:120], [content["source"]], took,
+                      bool(content["text"]),
+                      f"chars={len(content['text'])} chunks={len(content['chunks'])}")
+        if format == "json":
+            return json.dumps({**content, "untrusted_note": _UNTRUSTED_NOTE,
+                               "took_seconds": round(took, 3)},
+                              ensure_ascii=False, indent=2)
+        lines = [f"URL: {url}", f"标题: {content['title'] or '(无)'}",
+                 f"作者: {content['author'] or '(未提供)'}",
+                 f"发布时间: {content['published'] or '(未提供)'}",
+                 f"描述: {content['description'] or '(未提供)'}",
+                 f"来源: {content['source']} | 抓取时间(UTC): "
+                 f"{content['retrieved_at']} | 分段数: {len(content['chunks'])}",
+                 _UNTRUSTED_NOTE]
+        blocks = content["chunks"] or ([content["text"]] if content["text"] else [])
+        for idx, block in enumerate(blocks, 1):
+            lines.append(f"----- 第 {idx}/{len(blocks)} 段 -----")
+            lines.append(block)
+        return "\n".join(lines) if blocks else "\n".join(lines + ["(未提取到正文)"])
+    except SearchError as e:
+        _audit_search("extract", str(url)[:120], [], time.monotonic() - started,
+                      False, str(e))
+        return f"ERROR: {e}"
+    except Exception as e:  # noqa: BLE001
+        _audit_search("extract", str(url)[:120], [], time.monotonic() - started,
+                      False, repr(e))
+        return f"ERROR: {e}"
+
+
+@mcp.tool()
+def search_website(site: str, query: str, max_results: int = 8) -> str:
+    """站点限定的通用网页搜索；未配置通用搜索 provider 时明确报告不可用。
+
+    不会用 Hacker News / StackExchange 的结果冒充「站内全网搜索」。
+    """
+    started = time.monotonic()
+    try:
+        site = (site or "").strip().lower()
+        if not site or not re.fullmatch(r"[a-z0-9.-]{1,253}", site):
+            raise SearchError("site 必须是合法域名（如 example.com）")
+        query, limit = _check_query(query, max_results)
+        if not _general_search_available():
+            raise SearchError(
+                "SOURCE_UNAVAILABLE: 站点限定搜索需要通用搜索 provider，"
+                "请配置 MCP_SEARCH_SEARXNG_URL（自建 SearXNG，软件免费但上游"
+                "引擎可达性需运行时确认）或 MCP_SEARCH_TAVILY_KEY（免费额度）；"
+                "垂直社区检索不能替代站内搜索")
+        providers = []
+        if SEARCH_SEARXNG_URL:
+            providers.append("searxng")
+        if SEARCH_TAVILY_KEY:
+            providers.append("tavily")
+        scoped = f"site:{site} {query}"
+        items, used, errors, per_source, took = _collect_web_results(
+            providers, scoped, limit, site)
+        ranked = merge_and_rank(items, "relevance", scoped, limit)
+        _audit_search("website", scoped, used, took, bool(ranked),
+                      f"results={len(ranked)} errors={len(errors)}",
+                      per_source=per_source)
+        text = _fmt_results(ranked, scoped, used, took)
+        text += ("\n\n覆盖范围: 仅已配置通用 provider 返回的结果；"
+                 "上游引擎是否可达、免费额度是否耗尽以本次结果为准。")
+        if errors:
+            text += "\n来源失败: " + "; ".join(errors)
+        return text
+    except SearchError as e:
+        _audit_search("website", str(query)[:80], [], time.monotonic() - started,
+                      False, str(e))
+        return f"ERROR: {e}"
+    except Exception as e:  # noqa: BLE001
+        _audit_search("website", str(query)[:80], [], time.monotonic() - started,
+                      False, repr(e))
+        return f"ERROR: {e}"
+
+
+# ---------------------------------------------------------------------------
 # ChatGPT 插件 / GPT Actions：REST 端点 + 官方 ai-plugin.json / openapi.yaml
 # ---------------------------------------------------------------------------
 
@@ -2306,16 +3318,34 @@ async def run_command_rest(request):
     command = str(body.get("command", ""))
     cwd = str(body.get("cwd", WORKDIR))
     confirm = _strict_confirm(body.get("confirm", False))
+    backend = str(body.get("backend", "container") or "container")
+    approval_id = str(body.get("approval_id", "") or "")
     try:
         timeout = int(body.get("timeout", 60))
     except Exception:  # noqa: BLE001
         timeout = 60
     # REST 绕过 MCP tools/call，使用同一采集层补齐，保证不漏审计
-    with trace_call("run_command",
-                    {"command": command, "cwd": cwd, "confirm": confirm, "timeout": timeout},
-                    source="rest") as rec:
-        output = _exec(command, cwd, timeout, confirm)
-        rec.ok(output)
+    try:
+        with trace_call("run_command",
+                        {"command": command, "cwd": cwd, "confirm": confirm,
+                         "timeout": timeout, "backend": backend},
+                        source="rest") as rec:
+            if backend.strip().lower() not in ("", "container", "docker"):
+                try:
+                    output = get_backend(backend).run(command, cwd, timeout, confirm)
+                except (RuntimeError, ValueError) as exc:
+                    output = f"ERROR: {exc}"
+            else:
+                output = _exec(command, cwd, timeout, confirm, approval_id)
+            rec.ok(output)
+    except StrictAuditDenied as exc:
+        # 入口已被严格审计门记为 DENIED；返回可操作错误，绝不静默执行。
+        return JSONResponse(
+            {"output": f"ERROR: {exc}", "status": "DENIED",
+             "hint": "检查审计数据库与磁盘 spool，恢复后重试；"
+                     "AUDIT_STRICT=0 可临时降级但会失去严格审计保证"},
+            status_code=503,
+        )
     return JSONResponse({"output": output})
 
 
@@ -2330,6 +3360,7 @@ async def health_endpoint(request):
             healthy = bool(_get_audit_storage().health().get("healthy"))
         except Exception:  # noqa: BLE001
             healthy = False
+    # 公开存活检查必须保持最小化：审计降级详情只出现在需鉴权的 /health/details。
     return JSONResponse({
         "status": "ok",
         "service": "mcp-gateway",
@@ -2356,7 +3387,10 @@ async def health_details_endpoint(request):
         except Exception as exc:  # noqa: BLE001
             payload["audit"] = {"healthy": False, "last_error": repr(exc)}
     else:
-        payload["audit"] = {"healthy": False, "last_error": "审计采集层不可用"}
+        payload["audit"] = {"healthy": False, "enabled": False,
+                            "last_error": AUDIT_IMPORT_ERROR or "审计采集层不可用",
+                            "required": AUDIT_REQUIRED,
+                            "allow_unaudited": AUDIT_ALLOW_UNAUDITED}
     try:
         from gateway.monitoring.system import collect
         payload["metrics"] = collect("mcp-gateway")
@@ -2418,7 +3452,17 @@ class BearerAuthMiddleware:
                 if path == "/health/details" and scope.get("method") == "GET" and presented:
                     internal = _metrics_token()
                     metrics_ok = bool(internal) and hmac.compare_digest(presented, internal)
-                ok = metrics_ok or _token_is_authorized(presented)
+                # 短期 HMAC 签名下载链接：只在签名有效时豁免 Bearer，
+                # 绝不因路径白名单放行无效/缺失的 Bearer 凭据。
+                signed_ok = False
+                if path == "/files/download" and scope.get("method") == "GET" \
+                        and not presented:
+                    query = urllib.parse.parse_qs(
+                        scope.get("query_string", b"").decode("utf-8", "replace"))
+                    signed_ok = _transfer_http.verify_path(
+                        query.get("path", [""])[0], query.get("exp", [""])[0],
+                        query.get("sig", [""])[0])
+                ok = metrics_ok or signed_ok or _token_is_authorized(presented)
                 if not ok:
                     await send(
                         {
@@ -2448,6 +3492,8 @@ app = mcp.http_app(
 app.router.routes.append(Route("/authorize", authorize_endpoint, methods=["GET", "POST"]))
 app.router.routes.append(Route("/token", token_endpoint, methods=["POST"]))
 app.router.routes.append(Route("/register", register_endpoint, methods=["POST"]))
+# 撤销端点需要 Bearer 鉴权，刻意不加入 OAUTH_PATHS。
+app.router.routes.append(Route("/revoke", revoke_endpoint, methods=["POST"]))
 app.router.routes.append(
     Route("/.well-known/oauth-authorization-server", metadata_endpoint, methods=["GET"])
 )
@@ -2470,10 +3516,53 @@ app.router.routes.append(Route("/logo.png", logo_png, methods=["GET"]))
 app.router.routes.append(Route("/health", health_endpoint, methods=["GET"]))
 app.router.routes.append(Route("/health/details", health_details_endpoint, methods=["GET"]))
 
+
+async def _audited_http_transfer(request, tool_name: str, args: dict,
+                                 handler):
+    """非 MCP 的 HTTP 传输端点也进入 tool_calls（与 REST 同一采集层）。"""
+    try:
+        with trace_call(tool_name, args, source="http") as rec:
+            response = await handler(request, _TRANSFER_ROOT)
+            # 只记录状态/字节数等摘要，绝不把文件内容写入审计库。
+            rec.ok(f"status={response.status_code} "
+                   f"content_length={response.headers.get('content-length', '')}",
+                   status="FAILED" if response.status_code >= 400 else "SUCCESS")
+            return response
+    except StrictAuditDenied as exc:
+        return JSONResponse(
+            {"error": f"严格审计门拒绝: {exc}", "status": "DENIED"},
+            status_code=503)
+
+
+async def _files_upload_route(request):
+    """分块上传入口；BearerAuthMiddleware 已覆盖该路径。"""
+    return await _audited_http_transfer(
+        request, "files.upload",
+        {"path": request.headers.get("x-file-path", ""),
+         "offset": request.headers.get("x-upload-offset", "0")},
+        _transfer_http.upload_endpoint)
+
+
+async def _files_download_route(request):
+    """Range 下载入口；支持 Bearer 或短期 HMAC 签名。"""
+    return await _audited_http_transfer(
+        request, "files.download",
+        {"path": request.query_params.get("path", ""),
+         "range": request.headers.get("range", "")},
+        _transfer_http.download_endpoint)
+
+
+app.router.routes.append(Route("/files/upload", _files_upload_route, methods=["POST"]))
+app.router.routes.append(Route("/files/download", _files_download_route, methods=["GET"]))
+
 if AUDIT_ENABLED:
     try:
         record_event("service_start", status="UP", source="system",
                      detail=f"bind={BIND} port={PORT} tools=registered")
+        hydrated = oauth_hydrate()
+        print(f"[oauth] 已持久化授权状态: clients={hydrated['clients']} "
+              f"codes={hydrated['codes']} tokens={hydrated['tokens']} "
+              "(令牌以 SHA-256 摘要存储，按哈希惰性查活)", flush=True)
     except Exception:  # noqa: BLE001
         pass
 

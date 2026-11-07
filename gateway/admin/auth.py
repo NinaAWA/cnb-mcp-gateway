@@ -22,6 +22,44 @@ from gateway.audit.storage import get_storage
 
 PBKDF2_ROUNDS = 200_000
 COOKIE_NAME = "mcp_admin_session"
+CSRF_COOKIE_NAME = "mcp_admin_csrf"
+CSRF_HEADER = "x-csrf-token"
+CSRF_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
+# 登录本身没有已认证会话（login CSRF 风险由 SameSite + Origin 校验覆盖），
+# healthz 由容器 healthcheck 调用；两者豁免双提交 token。
+CSRF_EXEMPT_PATHS = frozenset({"/api/login", "/healthz"})
+
+
+def new_csrf_token() -> str:
+    return secrets.token_hex(32)
+
+
+def csrf_cookie(secure: bool = False) -> str:
+    return (f"{CSRF_COOKIE_NAME}={{token}}; Path=/; SameSite=Lax; Max-Age=28800"
+            + ("; Secure" if secure else ""))
+
+
+def csrf_valid(headers: dict[str, str]) -> tuple[bool, str]:
+    """双提交 Cookie + Origin 校验；headers 的键均为小写。"""
+    from http.cookies import SimpleCookie
+    from urllib.parse import urlsplit
+
+    jar = SimpleCookie()
+    try:
+        jar.load(headers.get("cookie", ""))
+    except Exception:  # noqa: BLE001
+        return False, "CSRF Cookie 无法解析"
+    morsel = jar.get(CSRF_COOKIE_NAME)
+    cookie = morsel.value if morsel else ""
+    presented = headers.get(CSRF_HEADER, "")
+    if not cookie or not presented or not hmac.compare_digest(cookie, presented):
+        return False, "CSRF 校验失败：缺少或不匹配 X-CSRF-Token"
+    origin = headers.get("origin", "")
+    if origin:
+        host = headers.get("host", "")
+        if not host or urlsplit(origin).netloc.lower() != host.lower():
+            return False, "CSRF 校验失败：Origin 与 Host 不一致"
+    return True, ""
 
 
 def _now() -> datetime:
@@ -78,6 +116,8 @@ class AdminAuth:
         self.totp_secret = os.environ.get("ADMIN_TOTP_SECRET", "").strip()
         self.max_failures = max(1, int(os.environ.get("ADMIN_LOGIN_MAX_FAILURES", "5")))
         self.lock_minutes = max(1, int(os.environ.get("ADMIN_LOGIN_LOCK_MINUTES", "15")))
+        # 并发会话上限：超出时撤销最旧的活跃会话，避免无限会话累积。
+        self.max_sessions = max(1, int(os.environ.get("ADMIN_MAX_SESSIONS", "8")))
         self._lock = threading.Lock()
         self._cleanup_sessions()
 
@@ -141,6 +181,21 @@ class AdminAuth:
                 self._log("failure", username, remote_ip, "动态验证码错误")
                 return False, "动态验证码错误", ""
 
+            active = self.storage._query(
+                "SELECT session_id FROM admin_sessions WHERE revoked=0 "
+                "AND expires_at > ? ORDER BY created_at ASC LIMIT 1000",
+                [_iso(_now())],
+            )
+            overflow = max(0, len(active) - self.max_sessions + 1)
+            for row in active[:overflow]:
+                self.storage._execute(
+                    "UPDATE admin_sessions SET revoked=1 WHERE session_id=?",
+                    [row["session_id"]],
+                )
+                self.storage.add_event(
+                    "admin_auth", status="REVOKE", source="admin",
+                    detail="超出 ADMIN_MAX_SESSIONS，自动撤销最旧会话",
+                )
             session_id = secrets.token_urlsafe(24)
             created = _now()
             expires = created + timedelta(seconds=self.ttl_seconds)

@@ -31,6 +31,34 @@ for _name in ("ADMIN_TOTP_SECRET", "AUDIT_DB_DSN", "GATEWAY_METRICS_TOKEN",
               "OAUTH_ALLOW_ANY_REDIRECT", "OAUTH_ALLOW_NO_PKCE",
               "MCP_OAUTH_TOKEN_TTL", "AUDIT_ARCHIVE_BATCH"):
     os.environ.pop(_name, None)
+# 网关模块级测试共用一个固定 DB；清理遗留磁盘 spool，避免跨轮次回放旧事件。
+for _stale in Path("/tmp/mcp-audit-tests/spool").glob("*.jsonl"):
+    _stale.unlink(missing_ok=True)
+os.environ.setdefault("AUDIT_REQUIRED", "0")
+os.environ.setdefault("AUDIT_ALLOW_UNAUDITED", "1")
+os.environ.setdefault("ADMIN_MAX_SESSIONS", "8")
+
+
+class CsrfTestClientMixin:
+    """自动携带双提交 CSRF token：保持既有 POST/DELETE 用例无需逐个改签名。"""
+
+    def request(self, method, url, **kwargs):
+        if str(method).upper() in ("POST", "PUT", "PATCH", "DELETE"):
+            token = self.cookies.get("mcp_admin_csrf")
+            if token:
+                headers = dict(kwargs.pop("headers", None) or {})
+                headers.setdefault("X-CSRF-Token", token)
+                kwargs["headers"] = headers
+        return super().request(method, url, **kwargs)
+
+
+def csrf_test_client(app):
+    from fastapi.testclient import TestClient
+
+    class _Client(CsrfTestClientMixin, TestClient):
+        pass
+
+    return _Client(app)
 
 
 @pytest.fixture
@@ -41,6 +69,9 @@ def isolated_storage(tmp_path, monkeypatch):
     monkeypatch.setenv("AUDIT_DB_PATH", str(db))
     storage_mod._STORAGE = None
     store = storage_mod.AuditStorage(db_path=str(db))
+    # 让 get_storage() 单例也指向隔离库：新模块的 library/download 事件入口
+    # 通过 get_storage() 取存储，必须与夹具一致。
+    storage_mod._STORAGE = store
     yield store
     storage_mod._STORAGE = None
 
@@ -51,7 +82,6 @@ def admin_client(tmp_path, monkeypatch):
     from gateway.admin import api as api_mod
     from gateway.admin import auth as auth_mod
     from gateway.audit import storage as storage_mod
-    from fastapi.testclient import TestClient
 
     db = tmp_path / "audit.db"
     monkeypatch.setenv("AUDIT_DB_PATH", str(db))
@@ -64,7 +94,7 @@ def admin_client(tmp_path, monkeypatch):
     logs.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(api_mod, "EXPORT_DIR", tmp_path / "exports")
     monkeypatch.setattr(api_mod, "TASK_LOG_DIR", logs)
-    with TestClient(api_mod.app) as client:
+    with csrf_test_client(api_mod.app) as client:
         yield client, storage_mod.get_storage(), logs
     storage_mod._STORAGE = None
     auth_mod._AUTH = None
@@ -166,3 +196,30 @@ def gateway_client(gateway_module, tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_module, "OAUTH_ALLOW_NO_PKCE", False)
     with TestClient(gateway_module.app) as client:
         yield gateway_module, client, "test-internal-metrics-token"
+
+
+@pytest.fixture(autouse=True)
+def _reset_v3_singletons():
+    """V3 模块在 import 期或首次调用时缓存 env / 存储单例，逐用例复位避免串状态。
+
+    只复位「已导入的」模块：不强制 import 生产模块，也不触碰测试自行构造的
+    AuditStorage / TaskManager 实例。server.py 的 _TASKS 由 gateway_module
+    夹具按 module 复用，这里仅清理其中的任务条目。
+    """
+    import sys
+
+    caches = (
+        ("gateway.access.policy", "_POLICY", None),
+        ("gateway.oauth.store", "_STORE", None),
+        ("gateway.tasks.manager", "_MANAGER", None),
+        ("gateway.exec.backends", "_BACKENDS", {}),
+        ("gateway.gitops.tools", "_REPO_LOCKS", {}),
+    )
+    for mod_name, attr, fresh in caches:
+        module = sys.modules.get(mod_name)
+        if module is not None and hasattr(module, attr):
+            setattr(module, attr, dict(fresh) if isinstance(fresh, dict) else fresh)
+    server = sys.modules.get("mcp_gateway_server_under_test")
+    if server is not None and isinstance(getattr(server, "_TASKS", None), dict):
+        server._TASKS.clear()
+    yield

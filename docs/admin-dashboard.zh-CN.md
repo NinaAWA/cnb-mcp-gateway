@@ -1,7 +1,9 @@
 # MCP Admin Dashboard 部署与运维（中文）
 
-> 适用分支：`feature/admin-dashboard`。目标是在不削弱原有 Shell / 文件 / Git / 实验能力的前提下，
-> 完整记录、查询、审计与监控 AI Agent 对服务器发起的每一次操作。
+> 适用分支：`upgrade/v3-full-admin-research`（基线 GitHub `main` = `3cf1ab57`）。
+> 目标是在不削弱原有 Shell / 文件 / Git / 实验能力的前提下，完整记录、查询、审计与监控
+> AI Agent 对服务器发起的每一次操作。第 1–10 节为后台既有能力说明，第 11 节为 V3 扩展；
+> 若两处描述冲突，以第 11 节与 [v3-upgrade.zh-CN.md](./v3-upgrade.zh-CN.md) 为准。
 
 ## 1. 架构与数据流
 
@@ -265,3 +267,138 @@ python -m venv .venv
 - 回归：新增 `tests/test_oauth.py`、`tests/test_startup.py`，并扩充 3 个既有测试文件；
   `.venv/bin/python -m pytest tests -q` → 44 passed（原有 21 个全部保留）。
 - 部署验收与双远端同步见本节上方清单与 README 的「本轮修复的验证命令」。
+
+> 说明：第 10 节是**历史实测记录**（旧分支 `fix/audit-integrity-6c71287`、21 个工具、21 passed），
+> 不代表 V3 当前状态。V3 当前为 49 个工具、全量离线 `143 passed`，见第 11 节与验收报告。
+
+---
+
+## 11. V3 扩展（搜索监控 / 论文库 / 来源标识 / 严格审计与归档恢复）
+
+### 11.1 页面
+
+导航由 9 项扩为 11 项，新增「搜索监控」「论文库与下载」；仪表盘总览、完整调用记录、
+科研实验监控、服务器与执行后端四页同步扩展。沿用深色 GitHub 变量体系、渐变强调边、
+状态色徽标、玻璃质感卡片与克制的淡入 / hover 微动效；支持 `prefers-reduced-motion`，
+1280px / 900px 逐级折叠为堆叠卡片，表格横向滚动。
+
+**搜索监控**
+- 筛选：时间范围、搜索类型、客户端、脱敏关键词、数据源、状态；条件变化即刷新。
+- 来源矩阵：每个来源的请求数、成功/失败、平均耗时、返回条数、API 限流与缓存命中；
+  失败行标红并展开原因。数据来自单条聚合查询（`/api/search/events`），避免 N+1。
+- 标题区明确「垂直学术源 / 社区源与可选通用搜索的覆盖范围」；垂直社区搜索**不是全网通用搜索**。
+- 页脚：上游连通性固定显示「**未检测**」（后台不自动发外部请求、不虚构可达性）、限额提示与采样说明。
+
+**论文库与下载**
+- 筛选：关键词、DOI/arXiv ID、OA 状态、年份、项目、标签、阅读状态；BibTeX/RIS/CSV/JSON 导出。
+- 论文卡片：标题、作者、年份、期刊、DOI/arXiv ID、来源、OA 状态、SHA-256 校验结果、PDF 预览入口。
+- 下载任务面板：进度条 + `created → downloading → verifying → success` 分段流程条、失败原因、
+  文件大小、保存路径、关联 MCP 请求 ID。
+- **口径（必须遵守）**：`created` 仅表示「任务创建成功」，`success` / `duplicate` 才表示
+  「文件最终校验成功」（`%PDF-` 头、Content-Type、最终 URL、大小、EOF、SHA-256、fsync + 原子改名）。
+  页面不得把仅返回标题或 PDF 链接当作实际下载成功。
+- 页脚：索引持久化说明、默认保存目录、OCR 未启用说明与最近同步时间。
+
+**完整调用记录**：新增 `source` 筛选（mcp / rest / admin / http / task / host-agent / …）与
+「结果摘要」列（脱敏后的结果预览 + `result_ref` 引用），详情抽屉可查看调用时间线与关联事件。
+
+**服务器与执行后端**：新增「容器 / 宿主」来源切换与 `scope_note`。Host Agent 未连接 / 未授权时
+明确显示原因，不展示任何宿主指标，也不把容器指标误报为宿主指标；GPU 未配置采集器时如实
+返回 `unavailable`，不虚构数据。
+
+### 11.2 数据来源标注
+
+所有数据块都用 `source-chip` 标注来源：
+
+| 徽标 | 含义 |
+| --- | --- |
+| 容器 | 网关容器 / 后台容器自身的指标与审计库数据 |
+| 宿主机 | 仅在用户显式挂载授权目录并启用 Host Agent 后可用 |
+| 外部来源 | 免费学术 / 网页 API 的调用结果，不是本机指标 |
+| 离线 | 未检测 / 未连接 / 不可用，附具体原因 |
+
+`/api/host/status` 返回 `SOURCE_LABELS`、默认后端、容器与 Host Agent 可用性、Unix Socket 路径
+与「真实宿主权限需部署时由用户授予」的显式说明。
+
+### 11.3 新增 API
+
+全部走 `require_admin`（签名下载端点除外，见下）并在返回前经 `_safe_rows()` / `redact_structure()` 脱敏。
+
+| 端点 | 用途 |
+| --- | --- |
+| `GET /api/search/events` | 逐源矩阵 + 最近事件；`by_provider` 为单条聚合查询 |
+| `GET /api/papers` | 文献库筛选 + `total/verified/bytes/verified_rate` 统计 |
+| `GET /api/papers/downloads` | 下载任务全过程与按状态计数 |
+| `GET /api/papers/export?fmt=bibtex\|ris\|csv\|json` | 文献导出（非法格式 400） |
+| `GET /api/papers/link` / `GET /api/papers/file` | 已校验 PDF 的短期 HMAC 签名链接与 Range 下载 |
+| `GET /api/transfers` / `/api/transfers/link` / `/api/transfers/file` | 传输监控、签名链接与 Range 下载 |
+| `GET /api/host/status` | 执行后端与来源标识 |
+| `GET /api/v3/overview` | 仪表盘单条聚合总览（搜索 / 论文 / 下载 / 传输 / 工具来源 / 最近失败下载） |
+| `GET /api/archives*` | 归档列表、校验、查询与幂等恢复（阶段 A） |
+
+**签名下载鉴权**：`/api/papers/file` 与 `/api/transfers/file` 刻意不挂 `require_admin`
+（否则纯签名链接会在进入函数前被 401），改为「有效后台会话**或**有效短期 HMAC 签名，二选一」；
+二者皆无时返回 401。后台未配置 `MCP_TRANSFER_SECRET` 时 `/api/transfers/link` 直接拒绝签发，
+避免用弱默认密钥。签名绑定路径 / 论文 ID 与过期时间（600 秒）。
+
+### 11.4 严格审计与归档恢复的口径更新
+
+第 4 节的「严格审计三态」仍然成立，V3 补充：
+
+- **统一严格门**：MCP 中间件、REST `/run_command`、任务与后台操作、非工具 HTTP 传输端点共用
+  `strict_gate(tool_name, request_id, source)`；`HIGH_RISK_TOOLS` 已扩展至 Git / 论文 / 传输 /
+  宿主工具及 `files.*`。严格模式下失败返回可操作错误（REST / HTTP 为 503）并记 `DENIED`。
+- **导入失败不再静默 fail-open**：`AUDIT_REQUIRED=1` 时醒目 `[AUDIT ALERT]` + 拒绝启动，
+  仅在 `AUDIT_ALLOW_UNAUDITED=1`（运维明确承担风险）时放行；`/health/details` 报告降级原因。
+  默认 `AUDIT_REQUIRED=0` 保持既有行为。
+- **磁盘持久化缓冲**：写库失败路径改为 `spool/` 下 0600 JSONL + fsync + 有界轮转
+  （`AUDIT_SPOOL_MAX_MB=64` / `AUDIT_SPOOL_MAX_FILES=4`），启动时回放；
+  `confirm_persisted()` 追加「spool 为空」条件。
+- **归档校验与恢复**：`_write_archive` 增加流式 SHA-256 + `.manifest.json` 清单
+  （表名 / 批次 / 行数 / 摘要 / 时间），删除前二次读回比对行数与摘要；
+  提供 `list_archives` / `verify_archive` / `query_archive` / `restore_archive`
+  （按 `request_id` 幂等 `INSERT OR IGNORE`）；维护任务消费校验失败原因并告警。
+  **失败保留原记录、绝不按时间整批删**的语义不变。
+- **不纳入 `ARCHIVE_TABLES` 的例外**：`oauth_*`、`paper_library`、`spool_applied`
+  属于「当前有效状态 / 幂等标记」，按时间删除会误删仍有效的授权或导致重放，与
+  `admin_settings` 一样跳过；其余新增历史表全部纳入保留策略。
+
+### 11.5 逐阶段验收清单（V3）
+
+命令统一用 `.venv/bin/python -m pytest -q`（全局 `python` 无 pytest）。
+
+- [x] **A**：`tests/test_phase_a_integrity.py`、`tests/test_audit_security.py`；
+  全量 `57 passed`。
+- [x] **B-检索**：`tests/test_search_web.py`、`test_paper_search.py`；全量 `89 passed`。
+- [x] **B-论文**：`tests/test_pdf_download.py`、`test_pdf_read.py`、`test_library.py`；
+  MarkItDown 与 `read_paper_pdf` 在本地模拟 2 页 PDF 上交叉比对通过（见验收报告第 2 节）。
+- [x] **C**：`tests/test_access_mode.py`、`test_host_agent.py`、`test_gitops.py`、`test_startup.py`；
+  专项 20 passed、全量 `103 passed`。真实宿主权限**未验收**。
+- [x] **D**：`tests/test_tasks_v3.py`、`test_transfer.py`；全量 `122 passed`。
+- [x] **E**：`tests/test_dashboard_v3.py`；专项 19 passed、全量 `141 passed`（阶段结束时的快照）。
+  浏览器视觉验收**未执行**。
+- [x] **文档与配置**：新增 `test_docs_and_config_stay_in_sync_with_v3_code`，
+  全量 `142 passed`（后续新增文献库回归用例为 `143 passed`）；4 个 Compose profile 的 `config -q` 全部通过。
+- [x] **F（验收部分）**：镜像重建、3 个常驻服务健康、独立真实网络集成
+  （`-m integration`，13 passed / 1 skipped）、8 条真实 MCP 客户端工作流全部通过。
+  浏览器视觉验收、真实宿主权限与双远端推送**未执行**，见 [v3-acceptance-report.md](./v3-acceptance-report.md)。
+
+配置校验已通过：`bash -n docker/entrypoint.sh`、`node --check gateway/admin/static/app.js`、
+`docker compose config -q`，以及 `--profile search` / `--profile host` /
+`--profile tunnel` / `--profile postgres` 四个 profile 的 `config -q`。
+注意：四个 profile 的**配置语法**通过不等于全部 profile 服务都已实际启动。阶段 F 已真实启动
+`search` 与 `host` 两个 profile（SearXNG JSON API HTTP 200 但 5 个上游引擎全部超时；Host Agent
+socket 0600、HMAC 认证正常），`tunnel` / `postgres` 仍未启动。后台「上游连通性」固定显示
+「未检测」，不自动发外部请求、不虚构可达性。
+
+### 11.6 故障排查补充
+
+| 现象 | 检查 |
+| --- | --- |
+| 搜索监控显示「上游连通性：未检测」 | 预期行为，后台不自动探测；用独立集成测试记录真实可达性 |
+| 论文卡片无「PDF 预览」按钮 | 该条目 `file_path` 为空或文件未通过校验；先看下载任务面板的失败原因 |
+| 下载任务停在 `created` | 只代表任务已创建，不代表文件已下载；检查 `error_message` 与 OA 状态 |
+| 签名下载 401 | 签名过期（600 秒）或缺失，且未登录；重新生成链接或保持后台会话 |
+| `/api/transfers/link` 返回 `ok=false` | `MCP_TRANSFER_SECRET` 未配置或文件不在授权传输目录内 |
+| 服务器页宿主来源为空 | Host Agent 未连接 / 未授权；查 `/api/host/status` 的 `reason`，不要误填容器指标 |
+| 审计状态「降级」但数据不丢 | 检查 `spool/` 与 `health()`；恢复后自动回放，严格模式会拒绝高风险工具 |

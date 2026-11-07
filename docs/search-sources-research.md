@@ -2,7 +2,9 @@
 
 > 调研日期：2026-11-07
 > 适用项目：CNB MCP Gateway（`/workspace`，FastMCP 4.1.6 单容器 HTTP + Bearer/OAuth 网关）
-> 本文是新增检索工具的唯一选型依据；宿主机与容器内出网均已实测。
+> 本文第 1–8 节是**基线选型调研**（工具总数 21 时撰写）；第 9 节记录 V3 阶段 B 的落地更新。
+> 文中所有「实测」只代表 2026-11-07 当时的出口环境，不代表所有 CNB / 云环境，
+> 也不代表服务永久可达或额度充足；若两处描述冲突，以第 9 节为准。
 
 ## 1. 结论速览
 
@@ -155,3 +157,90 @@
 - [ ] 私网地址、超大响应、超时、429/5xx 均有可读错误与审计记录。
 - [ ] 环境变量经 `docker/.env.template` → `docker-compose.yml` → `entrypoint.sh` → `server.py` 全链路透传，且敏感值在 `get_environment_variables` 中被脱敏。
 - [ ] `docker build` 成功；本地 `.venv` 下 `import server`、`pip check` 通过；中英文 README 与工具表一致。
+
+---
+
+## 9. V3 阶段 B 落地更新（2026-11-07）
+
+### 9.1 覆盖范围与服务条款的如实说明（重要）
+
+- **垂直社区搜索 ≠ 全网通用搜索**。HN Algolia、StackExchange、GitHub 仓库检索只覆盖各自社区，
+  不得在工具说明、页面或文档中冒充「全网搜索」。`search_web` 的默认结果就是这些垂直源的合并。
+- **通用搜索是可选能力**：需显式启用 `searxng` / `duckduckgo` / `wikipedia` 等 provider 或
+  配置 Tavily 免费额度 Key；未配置时工具明确报告「来源不可用」，不静默跳过、不伪造结果。
+- **免费 ≠ 无限**：每个免费 API 都有自己的速率限制、日额度与维护窗口（见第 2 节表格）。
+  `429` / `5xx` 走指数退避并尊重 `Retry-After`；`MCP_SEARCH_MAILTO` 只用于进入礼貌池，
+  不解除额度限制。不得把免费服务描述为「无限调用」或「全网可达」。
+- **SearXNG 软件免费 ≠ 上游可达**：自建 SearXNG 是 AGPL-3.0 开源软件、部署零授权费，
+  但其聚合的上游引擎（Google / DDG / Brave 等）在第 4 节的本环境实测中多数不可达。
+  Compose `search` profile 只解决「自建实例」问题，上游连通性必须在部署环境重新实测。
+  后台「搜索监控」页固定显示「上游连通性：未检测」，不自动发外部请求、不虚构可达性。
+- **Unpaywall 必须真实邮箱**：`MCP_SEARCH_MAILTO` 缺失时 OA 发现链路明确返回
+  `SOURCE_UNAVAILABLE`，不用占位邮箱伪造请求，也不静默跳过该来源。
+- **禁止盗版镜像与付费墙绕过**：合法 OA 发现只走 arXiv 官方 PDF、PMC / Europe PMC、
+  OpenAlex OA 位置、Unpaywall、合法机构 / 出版社 OA，并有主机白名单；
+  `metadata_only` / `subscription_required` 如实报告，不把仅返回标题或 PDF 链接当作实际下载。
+
+### 9.2 出网可达性的补充说明
+
+第 4 节的宿主机 / 容器 curl 实测为**基线调研记录**。V3 开工前另做了一次只读探测：
+OpenAlex、arXiv、Crossref、PubMed、Europe PMC、HN Algolia、StackExchange、GitHub API
+在当前出口均返回 HTTP 200。**仅代表本环境出口可达**；探测不构成「所有部署环境可达」的结论。
+阶段 F 已独立运行 `-m integration`：9 个学术 / 网页 / OA PDF 端点全部 HTTP 200。
+另真实启动 `search` profile：SearXNG 自身 `/healthz=OK`、JSON API 从网关容器返回 HTTP 200，
+但 `results=[]`，brave / duckduckgo / google cse / wikidata / wikipedia 五个上游引擎全部
+`timeout`。这是「软件免费不等于上游可达」的直接证据，不声称通用全网搜索可用。
+免费 API 的真实限额与 429 降级仍**未执行**，见验收报告。
+
+基线表中 `dblp.org` 202 反自动化页、`api.semanticscholar.org` 429、Unpaywall 占位邮箱 422、
+公共 SearXNG 实例超时等结论仍然成立：代码把它们作为「可选源 / 显式报错」处理，不隐瞒失败。
+
+### 9.3 检索质量修复
+
+| 基线缺陷 | V3 修复 |
+| --- | --- |
+| `from_year` 五源为「单年精确」，与 OpenAlex / arXiv / Crossref 的「≥年」不一致 | 统一为「该年及之后」：Europe PMC 改 `FIRST_PDATE:[y-01-01 TO *]`、PubMed 用日期区间、OpenReview / dblp / S2 客户端 `>=` 过滤；新增 `to_year` |
+| 无跨源去重、仅按来源轮流交错 | `gateway/research/metadata.py` 提供 DOI > arXiv ID > 标准化标题的 `canonical_key`，跨源合并（关联预印本与正式版）、日期精度归一 |
+| `sort=date` 先截断再排序 | 改为「先合并去重 → 再全局排序 → 最后截断」 |
+| 引用数缺失与真实零引用都用 `0` | `Paper.citation_count: int \| None`，`None` = unavailable、`0` = 真实零引用 |
+| 只有文本输出 | `search_papers` / `get_paper` 追加可选 `format="json"`（默认仍为文本，参数向后兼容） |
+| 单源失败掩盖整体结果 | 逐源显式报告失败原因，其余来源结果照常返回 |
+
+### 9.4 抓取安全加固
+
+新增 `gateway/net/client.py::SafeHttpClient`，检索、OA 发现与下载共用同一客户端：
+
+- **DNS rebinding 防护**：一次解析并校验全部 IP，连接时固定到已校验 IP，TLS SNI / 证书与
+  Host 仍按原主机名校验；保留「不拦 `198.18.0.0/15` 透明代理」的环境特例说明。
+- **重定向逐跳重校验**：每一跳重新做协议 / IP / 主机校验，不因首跳合法就放行后续私网地址。
+- **私网放行收窄**：不再是「任意自建 SearXNG / 内网实例自动豁免」，只允许
+  `MCP_SEARCH_SEARXNG_URL` 中显式配置的主机。
+- **Content-Type 与非文本检测**：拒绝把 HTML 登录页 / 错误页当作 PDF 或 JSON；
+  下载链路额外校验 `%PDF-` 头、最终 URL、大小、EOF 与 SHA-256。
+- 保留超时、体积上限、每来源限速与缓存、429/5xx 指数退避（含 `Retry-After`）、
+  GET 流式分块与 Range 读取。
+
+### 9.5 依赖与 profile 的变更（修正第 1、7 节）
+
+- 基线「检索零新增依赖」对**检索本身**仍成立；但 V3 阶段 B 的 PDF 按页解析引入了
+  **唯一一个纯 Python 依赖 `pypdf`**（`docker/requirements.txt`）。标准库无法可靠解析 PDF
+  页码 / 页数 / 完整性，`Dockerfile` 无需改动。**OCR 仍为可选能力，默认不安装、不调用**。
+- 基线「自建 SearXNG 未做」已落地：`searxng/settings.yml`（JSON API + 限速）、
+  `docker-compose.yml` 的 `search` profile（仅内部网络、不发布宿主端口、带健康检查）。
+- 新增 4 个网页工具（`search_web_advanced` / `fetch_web_page` / `extract_web_content` /
+  `search_website`）与 8 个论文工具；`docker/server.py` 当前共 **49 个 `@mcp.tool()`**。
+- 结构化检索事件写入 `search_events`，后台 `/api/search/events` 用单条聚合查询输出逐源
+  请求 / 成败 / 耗时 / 条数 / API 限流 / 缓存命中矩阵；关键词脱敏后落库。
+
+### 9.6 已验证与未验证
+
+- **已执行**：离线 mock 测试（`tests/test_search_web.py`、`test_paper_search.py`、
+  `test_pdf_download.py`、`test_pdf_read.py`、`test_library.py`）；
+  MarkItDown 与 `read_paper_pdf` 在本地模拟 2 页 PDF 及**真实 arXiv OA PDF** 上交叉比对通过
+  （真实 PDF 15 页 / 39,597 字符，MarkItDown 40,174 字符，标题 / 作者 / `transformer` 双向命中）。
+  全量离线单测 `143 passed`（含文档/配置一致性用例与文献库回归用例）。
+  独立真实网络集成 `-m integration` → `13 passed, 1 skipped`；五源真实学术检索返回 24 条、
+  真实 arXiv OA PDF 下载并校验成功（2,215,244 字节）。
+- **已执行但不可达**：自建 SearXNG 上游引擎（真实启动 `search` profile 后 5 个引擎全部超时）。
+- **未执行**：免费 API 真实限额 / 429 降级观测、PMC OA PDF 真实下载。这些需要在部署环境实测，
+  不得据本文件推断通过。垂直社区搜索不是全网通用搜索；免费 API 不等于无限调用。

@@ -1,5 +1,6 @@
-# 四服务部署：MCP API、Admin Web（独立认证）、审计维护、可选 HTTPS 隧道。
-# 构建：docker compose --profile tunnel up -d --build
+# 7 个 service：3 个常驻（MCP 网关、Admin Web 独立认证、审计维护）
+# + 4 个 profile（search / host / tunnel / postgres）。
+# 构建：docker compose up -d --build；可选：--profile search 等。
 # 本地构建使用仓库根作为 context，包含 gateway/ 统一采集层。
 services:
   mcp-gateway:
@@ -31,6 +32,28 @@ services:
       - MCP_SEARCH_FETCH_ENABLED=${MCP_SEARCH_FETCH_ENABLED:-}
       - MCP_SEARCH_FETCH_MAX_CHARS=${MCP_SEARCH_FETCH_MAX_CHARS:-}
       - MCP_SEARCH_FETCH_ALLOW_HOSTS=${MCP_SEARCH_FETCH_ALLOW_HOSTS:-}
+      # 一次 DNS 解析并固定 IP，防 DNS rebinding；自建 SearXNG/内网实例自动豁免。
+      - MCP_SEARCH_PIN_DNS=${MCP_SEARCH_PIN_DNS:-1}
+      # 论文库与合法 OA PDF 下载
+      - MCP_PAPER_DIR=${MCP_PAPER_DIR:-/workspace/research/papers}
+      - MCP_PAPER_MAX_MB=${MCP_PAPER_MAX_MB:-64}
+      - MCP_DOWNLOAD_CONCURRENCY=${MCP_DOWNLOAD_CONCURRENCY:-3}
+      - MCP_PAPER_TEXT_CACHE_DIR=${MCP_PAPER_TEXT_CACHE_DIR:-/tmp/mcp_paper_text}
+      - MCP_PAPER_EXTRA_HOSTS=${MCP_PAPER_EXTRA_HOSTS:-}
+      - MCP_PAPER_ALLOW_PRIVATE=${MCP_PAPER_ALLOW_PRIVATE:-0}
+      # 通用分块 / Range 文件传输
+      - MCP_TRANSFER_DIR=${MCP_TRANSFER_DIR:-/workspace/transfers}
+      - TRANSFER_MAX_MB=${TRANSFER_MAX_MB:-256}
+      - MCP_TRANSFER_SECRET=${MCP_TRANSFER_SECRET:-}
+      - MCP_TRANSFER_ALLOW_PRIVATE=${MCP_TRANSFER_ALLOW_PRIVATE:-0}
+      # 访问模式 / 双执行后端（host 需启用 host profile 并挂载授权目录）
+      - MCP_ACCESS_MODE=${MCP_ACCESS_MODE:-full_admin}
+      - MCP_DANGER_GUARD=${MCP_DANGER_GUARD:-1}
+      - MCP_INDEPENDENT_CONFIRM=${MCP_INDEPENDENT_CONFIRM:-0}
+      - MCP_EXEC_BACKEND=${MCP_EXEC_BACKEND:-container}
+      - MCP_HOST_AGENT_SOCKET=${MCP_HOST_AGENT_SOCKET:-/var/run/mcp-host-agent/agent.sock}
+      - MCP_HOST_AGENT_TOKEN=${MCP_HOST_AGENT_TOKEN:-}
+      - MCP_HOST_AGENT_ROOTS=${MCP_HOST_AGENT_ROOTS:-/workspace}
       - CF_TUNNEL_TOKEN=${CF_TUNNEL_TOKEN:-}
       # 启用独立 cloudflared profile 时设为 1，避免两个公网入口并存。
       - MCP_TUNNEL_DISABLED=${MCP_TUNNEL_DISABLED:-0}
@@ -40,8 +63,15 @@ services:
       - AUDIT_STRICT=${AUDIT_STRICT:-0}
       - AUDIT_MAX_FIELD_CHARS=${AUDIT_MAX_FIELD_CHARS:-32768}
       - AUDIT_BUFFER_MAX=${AUDIT_BUFFER_MAX:-1000}
+      # 阶段 A：审计不可用时的显式启动策略与磁盘持久化缓冲（均在共享卷内）
+      - AUDIT_REQUIRED=${AUDIT_REQUIRED:-0}
+      - AUDIT_ALLOW_UNAUDITED=${AUDIT_ALLOW_UNAUDITED:-0}
+      - AUDIT_SPOOL_ENABLED=${AUDIT_SPOOL_ENABLED:-1}
+      - AUDIT_SPOOL_MAX_MB=${AUDIT_SPOOL_MAX_MB:-64}
+      - AUDIT_SPOOL_MAX_FILES=${AUDIT_SPOOL_MAX_FILES:-4}
+      - OAUTH_PERSIST_ENABLED=${OAUTH_PERSIST_ENABLED:-1}
       - MCP_SESSION_TTL=${MCP_SESSION_TTL:-3600}
-      - MCP_TASK_LOG_DIR=/data/audit/task-logs
+      - MCP_TASK_LOG_DIR=${MCP_TASK_LOG_DIR:-/data/audit/task-logs}
       # OAuth 兼容开关默认关闭；开启会放宽回调精确匹配 / PKCE 强制要求
       - OAUTH_ALLOW_ANY_REDIRECT=${OAUTH_ALLOW_ANY_REDIRECT:-0}
       - OAUTH_ALLOW_NO_PKCE=${OAUTH_ALLOW_NO_PKCE:-0}
@@ -52,6 +82,8 @@ services:
     volumes:
       - ./workspace:/workspace
       - audit-data:/data/audit
+      # host profile 启用时才由用户显式授权；未启用时该卷为空。
+      - host-socket:/var/run/mcp-host-agent
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8765/health"]
       interval: 30s
@@ -77,6 +109,7 @@ services:
       - ADMIN_SESSION_TTL=${ADMIN_SESSION_TTL:-28800}
       - ADMIN_LOGIN_MAX_FAILURES=${ADMIN_LOGIN_MAX_FAILURES:-5}
       - ADMIN_LOGIN_LOCK_MINUTES=${ADMIN_LOGIN_LOCK_MINUTES:-15}
+      - ADMIN_MAX_SESSIONS=${ADMIN_MAX_SESSIONS:-8}
       - ADMIN_TOTP_SECRET=${ADMIN_TOTP_SECRET:-}
       # 通过 HTTPS 域名访问后台时必须设为 1。
       - ADMIN_COOKIE_SECURE=${ADMIN_COOKIE_SECURE:-0}
@@ -87,13 +120,31 @@ services:
       - AUDIT_DB_PATH=/data/audit/audit.db
       - AUDIT_DB_DSN=${AUDIT_DB_DSN:-}
       - AUDIT_EXPORT_DIR=/data/audit/exports
-      - MCP_TASK_LOG_DIR=/data/audit/task-logs
+      - MCP_TASK_LOG_DIR=${MCP_TASK_LOG_DIR:-/data/audit/task-logs}
+      # gateway/audit/storage.py 在本进程同样被 import；这些值必须与网关一致，
+      # 否则后台的归档批次、脱敏长度上限与磁盘缓冲会静默使用默认值。
+      - AUDIT_STRICT=${AUDIT_STRICT:-0}
+      - AUDIT_MAX_FIELD_CHARS=${AUDIT_MAX_FIELD_CHARS:-32768}
+      - AUDIT_BUFFER_MAX=${AUDIT_BUFFER_MAX:-1000}
+      - AUDIT_ARCHIVE_BATCH=${AUDIT_ARCHIVE_BATCH:-1000}
+      - AUDIT_SPOOL_ENABLED=${AUDIT_SPOOL_ENABLED:-1}
+      - AUDIT_SPOOL_MAX_MB=${AUDIT_SPOOL_MAX_MB:-64}
+      - AUDIT_SPOOL_MAX_FILES=${AUDIT_SPOOL_MAX_FILES:-4}
+      - AUDIT_REQUIRED=${AUDIT_REQUIRED:-0}
+      - AUDIT_ALLOW_UNAUDITED=${AUDIT_ALLOW_UNAUDITED:-0}
+      - OAUTH_PERSIST_ENABLED=${OAUTH_PERSIST_ENABLED:-1}
+      - MCP_PAPER_DIR=${MCP_PAPER_DIR:-/workspace/research/papers}
+      - MCP_TRANSFER_DIR=${MCP_TRANSFER_DIR:-/workspace/transfers}
+      - MCP_TRANSFER_SECRET=${MCP_TRANSFER_SECRET:-}
+      - TRANSFER_MAX_MB=${TRANSFER_MAX_MB:-256}
     # 默认只允许宿主机本机访问后台；CNB / 云平台端口预览需要设置 ADMIN_BIND_HOST=0.0.0.0，
     # 此时后台有独立登录鉴权，务必配合强口令、ADMIN_COOKIE_SECURE 与可选 MFA。
     ports:
       - "${ADMIN_BIND_HOST:-127.0.0.1}:${ADMIN_HOST_PORT:-8788}:8788"
     volumes:
       - audit-data:/data/audit
+      # 论文库只读挂载：后台可签名下载，但不能改写网关下载结果。
+      - ./workspace:/workspace:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8788/healthz"]
       interval: 30s
@@ -115,6 +166,9 @@ services:
       - AUDIT_BACKUP_KEEP=${AUDIT_BACKUP_KEEP:-7}
       - AUDIT_BACKUP_ENABLED=${AUDIT_BACKUP_ENABLED:-1}
       - AUDIT_MAINTENANCE_INTERVAL=${AUDIT_MAINTENANCE_INTERVAL:-300}
+      - AUDIT_SPOOL_ENABLED=${AUDIT_SPOOL_ENABLED:-1}
+      - AUDIT_SPOOL_MAX_MB=${AUDIT_SPOOL_MAX_MB:-64}
+      - AUDIT_SPOOL_MAX_FILES=${AUDIT_SPOOL_MAX_FILES:-4}
     volumes:
       - audit-data:/data/audit
     healthcheck:
@@ -123,6 +177,49 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+
+  # 可选自建通用搜索：docker compose --profile search up -d
+  # 官方镜像（软件免费），仅容器内部网络可达，不发布端口、不暴露公网。
+  # 同时在 .env 设置 MCP_SEARCH_SEARXNG_URL=http://searxng:8080 与
+  # MCP_SEARCH_WEB_PROVIDERS=hn,stackexchange,searxng 才会真正启用。
+  # 上游搜索引擎是否可达、是否限流取决于运行时网络，需实际探测，不视为全网可达。
+  searxng:
+    image: searxng/searxng:latest
+    profiles: ["search"]
+    container_name: cnb-mcp-searxng
+    restart: unless-stopped
+    environment:
+      - SEARXNG_BASE_URL=http://searxng:8080/
+      - SEARXNG_SECRET=${SEARXNG_SECRET:-}
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # 可选宿主执行后端：docker compose --profile host up -d
+  # 说明：此 profile 是「容器内 Host Agent」，仅能访问下方显式挂载的目录，
+  # 不等于取得真实宿主 root 权限。真实宿主权限必须由用户在宿主机上自行
+  # 运行 python -m gateway.host.agent 并共享 socket，网关不自动提权。
+  host-agent:
+    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway:latest}
+    profiles: ["host"]
+    container_name: cnb-mcp-host-agent
+    restart: unless-stopped
+    environment:
+      - MCP_SERVICE_ROLE=host-agent
+      - MCP_HOST_AGENT_TOKEN=${MCP_HOST_AGENT_TOKEN:-}
+      - MCP_HOST_AGENT_SOCKET=/var/run/mcp-host-agent/agent.sock
+      - MCP_HOST_AGENT_ROOTS=${MCP_HOST_AGENT_ROOTS:-/workspace}
+    # 不发布任何端口；只通过 Unix Socket 与网关通信。
+    expose: []
+    volumes:
+      - host-socket:/var/run/mcp-host-agent
+      - ${MCP_HOST_AGENT_HOST_DIR:-./workspace}:/workspace
 
   # 可选 HTTPS 入口：docker compose --profile tunnel up -d
   # 同时在 .env 设置 MCP_TUNNEL_DISABLED=1，避免网关内置 quick tunnel 重复暴露。
@@ -136,7 +233,7 @@ services:
         condition: service_started
     environment:
       - MCP_SERVICE_ROLE=cloudflared
-      - MCP_UPSTREAM_URL=http://mcp-gateway:8765
+      - MCP_UPSTREAM_URL=${MCP_UPSTREAM_URL:-http://mcp-gateway:8765}
       - CF_TUNNEL_TOKEN=${CF_TUNNEL_TOKEN:-}
     command: ["/app/entrypoint.sh"]
 
@@ -162,3 +259,4 @@ services:
 volumes:
   audit-data:
   pg-data:
+  host-socket:

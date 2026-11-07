@@ -35,6 +35,17 @@ case "$ROLE" in
     exec python -m gateway.maintenance
     ;;
 
+  host-agent)
+    # Host Agent：仅 Unix Socket（0600）+ HMAC，不监听任何 TCP 端口。
+    # 真实宿主权限由部署时显式挂载目录并注入共享密钥授予，脚本不自动提权。
+    if [ -z "${MCP_HOST_AGENT_TOKEN:-}" ]; then
+      echo "[entrypoint] MCP_HOST_AGENT_TOKEN 为空，拒绝以无认证方式启动 Host Agent" >&2
+      exit 1
+    fi
+    echo "[entrypoint] 启动 Host Agent（unix socket，无公网端口）"
+    exec python -m gateway.host.agent
+    ;;
+
   cloudflared)
     UPSTREAM="${MCP_UPSTREAM_URL:-http://localhost:8765}"
     if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
@@ -90,8 +101,36 @@ SEARCH_VARS=(
   MCP_SEARCH_FETCH_ENABLED
   MCP_SEARCH_FETCH_MAX_CHARS
   MCP_SEARCH_FETCH_ALLOW_HOSTS
+  MCP_SEARCH_PIN_DNS
+  MCP_PAPER_DIR
+  MCP_PAPER_MAX_MB
+  MCP_DOWNLOAD_CONCURRENCY
+  MCP_PAPER_TEXT_CACHE_DIR
+  MCP_PAPER_EXTRA_HOSTS
+  MCP_PAPER_ALLOW_PRIVATE
+  SEARXNG_SECRET
+  MCP_ACCESS_MODE
+  MCP_DANGER_GUARD
+  MCP_INDEPENDENT_CONFIRM
+  MCP_EXEC_BACKEND
+  MCP_HOST_AGENT_TOKEN
+  MCP_HOST_AGENT_SOCKET
+  MCP_HOST_AGENT_ROOTS
+  MCP_TRANSFER_DIR
+  MCP_TRANSFER_SECRET
+  MCP_TRANSFER_ALLOW_PRIVATE
+  TRANSFER_MAX_MB
+  MCP_TASK_LOG_DIR
   MCP_DENY_PREFIXES
   MCP_REQUIRE_CONFIRM
+  # 阶段 A：显式审计策略、磁盘 spool、OAuth 持久化与会话上限
+  AUDIT_REQUIRED
+  AUDIT_ALLOW_UNAUDITED
+  AUDIT_SPOOL_ENABLED
+  AUDIT_SPOOL_MAX_MB
+  AUDIT_SPOOL_MAX_FILES
+  OAUTH_PERSIST_ENABLED
+  ADMIN_MAX_SESSIONS
 )
 for name in "${SEARCH_VARS[@]}"; do
   value="${!name:-}"

@@ -42,8 +42,19 @@ def warn(storage, message: str) -> None:
 
 
 def tick(storage) -> None:
-    if not storage.health()["healthy"]:
-        warn(storage, "审计数据库不可用，网关已进入有界缓冲/降级模式")
+    health = storage.health()
+    if not health["healthy"]:
+        warn(storage, "审计数据库不可用，网关已进入内存缓冲 + 磁盘 spool 降级模式")
+    if health.get("spool_pending"):
+        warn(storage, f"磁盘审计缓冲仍有 {health['spool_pending']} 条事件未补写；"
+                      "严格审计模式下高风险调用会被拒绝，请检查数据库连通性")
+    if health.get("spool_error"):
+        warn(storage, f"审计磁盘缓冲告警: {health['spool_error']}")
+    for row in storage._query(
+            "SELECT path, detail FROM archive_manifest WHERE status='corrupt' "
+            "ORDER BY id DESC LIMIT 10"):
+        warn(storage, f"归档摘要/行数校验失败，原记录已保留: "
+                      f"{row.get('path')} {row.get('detail')}")
     result = storage.archive_and_prune(RETENTION_DAYS, MAX_DB_MB)
     for message in result.get("errors", []):
         warn(storage, f"归档未完成，原记录已保留: {message}")

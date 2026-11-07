@@ -6,3 +6,5 @@ jinja2>=3.1
 python-multipart>=0.0.12
 psutil>=6.0
 psycopg[binary]>=3.2
+# PDF 按页文本/页码/页数与完整性解析（纯 Python）。OCR 为可选，默认不安装。
+pypdf>=5.0,<8

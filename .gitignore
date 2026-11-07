@@ -4,6 +4,20 @@ plugin-package/
 plugins/
 marketplace.json
 
+# V3 运行时数据（论文、磁盘审计缓冲、归档临时文件、宿主 socket）
+# 仓库根目录 / 绑定挂载内两种运行时布局都要忽略。
+workspace/research/
+workspace/papers/
+workspace/transfers/
+research/papers/
+transfers/
+# 分块上传临时分片（.part）；签名下载用 HMAC 查询参数，不产生临时文件。
+**/*.part
+**/spool/
+**/archive/*.tmp
+**/*.manifest.tmp
+*.sock
+
 # 运行期敏感/临时文件
 .env
 audit*.log
@@ -19,4 +33,7 @@ __pycache__/
 
 # 文件管理器回收站（可能含本地文件，只忽略不删除）
 .Trash-0/
+
+# SearXNG 本地密钥覆盖配置（含真实 secret_key，禁止提交）
+searxng/settings.local.yml
 

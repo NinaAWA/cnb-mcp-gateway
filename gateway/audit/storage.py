@@ -8,11 +8,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
 import threading
 import time
+import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,6 +22,7 @@ from typing import Any, Iterable, Iterator
 
 from .events import TERMINAL_STATUSES, ToolCallRecord, utcnow
 from .redaction import ArtifactStore, redact_params, redact_structure
+from .spool import DiskSpool
 
 DEFAULT_DB_PATH = os.environ.get("AUDIT_DB_PATH", "/data/audit/audit.db")
 MAX_FIELD_CHARS = int(os.environ.get("AUDIT_MAX_FIELD_CHARS", "32768"))
@@ -32,7 +35,9 @@ ARCHIVE_BATCH = max(100, min(5000, int(os.environ.get("AUDIT_ARCHIVE_BATCH", "10
 SESSION_TTL = max(60, int(os.environ.get("MCP_SESSION_TTL", "3600")))
 # SQL 聚合不可用时的有界回退行数，避免把整表拉进内存
 AGGREGATION_FALLBACK_ROWS = 20_000
-# 纳入保留策略的历史表：(表名, 时间列, 主键)。admin_settings 是配置，不清理。
+# 纳入保留策略的历史表：(表名, 时间列, 主键)。
+# 不纳入的表：admin_settings（运行配置）、oauth_* / paper_library（当前有效状态，
+# 按时间删除会误删仍有效的授权与文献）、spool_applied（幂等去重标记）。
 ARCHIVE_TABLES = (
     ("tool_calls", "timestamp_start", "id"),
     ("audit_events", "ts", "id"),
@@ -44,13 +49,29 @@ ARCHIVE_TABLES = (
     ("export_jobs", "ts", "id"),
     ("admin_sessions", "expires_at", "id"),
     ("client_sessions", "last_seen", "id"),
+    ("search_events", "ts", "id"),
+    ("paper_downloads", "ts", "id"),
+    ("paper_text_cache", "ts", "id"),
+    ("file_transfers", "ts", "id"),
+    ("task_state", "ts", "id"),
+    ("archive_manifest", "ts", "id"),
 )
 
-# 需要严格审计的高风险工具（strict 模式下写库失败即拒绝）
+# 需要严格审计的高风险工具（strict 模式下写库失败即拒绝）。
+# 新增的论文下载 / 结构化 Git / 传输 / 宿主工具全部纳入同一道门。
 HIGH_RISK_TOOLS = frozenset({
     "run_command", "run_command_background", "write_file", "kill_process",
-    "stop_task", "read_web_page",
+    "stop_task", "read_web_page", "fetch_web_page", "search_website",
+    "download_paper", "batch_download_papers", "read_paper_pdf",
+    "git_clone", "git_branch", "git_stage", "git_commit", "git_sync",
+    "git_recover", "git_worktree", "upload_file", "download_file",
+    "host_exec", "host_spawn", "host_system_info",
+    # 非 MCP 的 HTTP 传输端点也走 trace_call，严格模式下同样不得绕过审计。
+    "files.upload", "files.download",
 })
+
+# 归档校验：流式 SHA-256 清单 + 删前二次读回比对
+ARCHIVE_MANIFEST_SUFFIX = ".manifest.json"
 
 _SQLITE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS tool_calls (
@@ -140,6 +161,70 @@ CREATE INDEX IF NOT EXISTS ix_events_req ON audit_events(request_id);
 CREATE INDEX IF NOT EXISTS ix_git_repo ON git_operations(repo_path, ts);
 CREATE INDEX IF NOT EXISTS ix_exp_task ON experiment_runs(task_id, ts);
 CREATE INDEX IF NOT EXISTS ix_tasks_task ON background_tasks(task_id, ts);
+-- V3：以下 DDL 保持方言中性（PG 由 _PG_SCHEMA 的字符串替换生成）。
+CREATE TABLE IF NOT EXISTS oauth_clients (
+  client_id TEXT PRIMARY KEY, redirect_uris TEXT, created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS oauth_codes (
+  code_hash TEXT PRIMARY KEY, client_id TEXT, redirect_uri TEXT,
+  challenge TEXT, challenge_method TEXT, expires_at TEXT,
+  consumed INTEGER DEFAULT 0, created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+  token_hash TEXT PRIMARY KEY, client_id TEXT, expires_at TEXT,
+  revoked INTEGER DEFAULT 0, created_at TEXT
+);
+CREATE TABLE IF NOT EXISTS spool_applied (
+  event_id TEXT PRIMARY KEY, applied_at TEXT
+);
+CREATE TABLE IF NOT EXISTS archive_manifest (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, path TEXT, table_name TEXT,
+  batch INTEGER DEFAULT 0, row_count INTEGER DEFAULT 0, sha256 TEXT,
+  status TEXT, verified_at TEXT, detail TEXT
+);
+CREATE TABLE IF NOT EXISTS search_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, request_id TEXT, trace_id TEXT,
+  tool_name TEXT, client_id TEXT, source TEXT, query_hash TEXT, keyword TEXT,
+  provider TEXT, status TEXT, duration_ms INTEGER DEFAULT 0,
+  result_count INTEGER DEFAULT 0, cached INTEGER DEFAULT 0,
+  rate_limited INTEGER DEFAULT 0, error TEXT, detail TEXT
+);
+CREATE TABLE IF NOT EXISTS paper_library (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, paper_id TEXT UNIQUE,
+  title TEXT, authors TEXT, publication_year INTEGER, venue TEXT,
+  doi TEXT, arxiv_id TEXT, pmid TEXT, pmcid TEXT, citation_count INTEGER,
+  oa_status TEXT, landing_url TEXT, pdf_url TEXT, sources TEXT,
+  file_path TEXT, sha256 TEXT, file_size INTEGER DEFAULT 0,
+  project TEXT, tags TEXT, reading_status TEXT, detail TEXT
+);
+CREATE TABLE IF NOT EXISTS paper_downloads (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, request_id TEXT, trace_id TEXT,
+  paper_id TEXT, title TEXT, source TEXT, url TEXT, file_path TEXT,
+  status TEXT, bytes INTEGER DEFAULT 0, total_bytes INTEGER DEFAULT 0,
+  sha256 TEXT, project TEXT, error_type TEXT, error_message TEXT, detail TEXT
+);
+CREATE TABLE IF NOT EXISTS paper_text_cache (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, paper_id TEXT,
+  page_count INTEGER DEFAULT 0, cache_path TEXT, sha256 TEXT, detail TEXT
+);
+CREATE TABLE IF NOT EXISTS file_transfers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, request_id TEXT, trace_id TEXT,
+  direction TEXT, path TEXT, status TEXT, bytes INTEGER DEFAULT 0,
+  total_bytes INTEGER DEFAULT 0, sha256 TEXT, detail TEXT
+);
+CREATE TABLE IF NOT EXISTS task_state (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, task_id TEXT, pid INTEGER,
+  pgid INTEGER, command TEXT, cwd TEXT, log_path TEXT, status TEXT,
+  git_commit TEXT, output_path TEXT, detail TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_search_events_ts ON search_events(ts);
+CREATE INDEX IF NOT EXISTS ix_search_events_req ON search_events(request_id);
+CREATE INDEX IF NOT EXISTS ix_paper_downloads_req ON paper_downloads(request_id);
+CREATE INDEX IF NOT EXISTS ix_paper_downloads_status ON paper_downloads(status, ts);
+CREATE INDEX IF NOT EXISTS ix_paper_library_doi ON paper_library(doi);
+CREATE INDEX IF NOT EXISTS ix_transfers_req ON file_transfers(request_id);
+CREATE INDEX IF NOT EXISTS ix_task_state_task ON task_state(task_id, ts);
+CREATE INDEX IF NOT EXISTS ix_archive_manifest_ts ON archive_manifest(ts);
 """
 
 _PG_SCHEMA = _SQLITE_SCHEMA.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
@@ -161,10 +246,14 @@ class AuditStorage:
         )
         self._lock = threading.RLock()
         self._buffer: deque[dict[str, Any]] = deque(maxlen=MAX_BUFFER)
+        self.spool = DiskSpool(Path(self.db_path).parent / "spool")
+        self._spool_error = self.spool.last_error
+        self._spool_replayed = 0
         self._healthy = True
         self._last_error = ""
         self._strict_violations = 0
         self._init_db()
+        self._startup_replay()
 
     # ---------------------------------------------------------------- backend
     def _connect(self) -> Any:
@@ -209,24 +298,38 @@ class AuditStorage:
             "last_error": self._last_error,
             "strict": STRICT,
             "strict_violations": self._strict_violations,
+            # 磁盘 spool：>0 表示仍有事件未补写，严格审计门必须拒绝高风险调用
+            "spool_pending": self.spool.pending(),
+            "spool_error": self._spool_error or self.spool.last_error,
+            "spool_replayed": self._spool_replayed,
+            "archive_dir": str(Path(self.db_path).parent / "archive"),
         }
 
     def available(self) -> bool:
         """是否仍能接收写入（含缓冲）；不代表已持久化。"""
         return self._healthy or len(self._buffer) < MAX_BUFFER
 
+    def _durable(self) -> bool:
+        return (bool(self._healthy) and not self._buffer
+                and self.spool.pending() == 0
+                and not self._spool_error and not self.spool.last_error)
+
     def persistence_state(self) -> dict[str, Any]:
-        """区分「数据库健康」「可缓冲写入」「已确认持久化」三态。"""
+        """区分「数据库健康」「可缓冲写入」「已确认持久化」三态。
+
+        对外仍保持四个既有字段（后台与既有测试依赖精确结构）；spool 状态放在
+        ``health()``，但严格门判定必须把磁盘缓冲是否为空计入。
+        """
         return {
             "healthy": bool(self._healthy),
             "buffered": len(self._buffer),
             "bufferable": self.available(),
-            "persisted": bool(self._healthy and not self._buffer),
+            "persisted": self._durable(),
         }
 
     def confirm_persisted(self, request_id: str) -> bool:
-        """严格审计：数据库健康、缓冲已清空，且刚写入的调用确实可读回。"""
-        if not self._healthy or self._buffer:
+        """严格审计：DB 健康、内存缓冲与磁盘 spool 均为空，且调用确实可读回。"""
+        if not self._durable():
             return False
         rows = self._query(
             "SELECT request_id FROM tool_calls WHERE request_id=?", [request_id]
@@ -240,31 +343,91 @@ class AuditStorage:
                        request_id=request_id, tool_name=tool_name, source="audit",
                        detail=f"{phase}写入失败；该调用可能缺少终态记录")
 
-    def _execute(self, sql: str, params: Iterable[Any] = (), *, many: bool = False) -> bool:
-        """唯一 SQL 写边界：所有字符串参数在此统一脱敏；失败时进入有界缓冲。"""
-        safe_params = redact_params(list(params))
-        payload = {"sql": sql, "params": safe_params, "many": many}
+    def _apply_payload(self, conn: Any, payload: dict[str, Any]) -> None:
+        """在同一连接/事务内执行一条已脱敏的写载荷。"""
+        sql = payload["sql"]
+        params = tuple(payload.get("params") or ())
+        if self.pg:
+            with conn.cursor() as cur:
+                cur.execute(_to_pg(sql), params)
+        else:
+            conn.execute(sql, params)
+
+    def _applied(self, conn: Any, event_id: str) -> bool:
+        if not event_id:
+            return False
+        sql = ("SELECT event_id FROM spool_applied WHERE event_id=?"
+               if not self.pg else
+               "SELECT event_id FROM spool_applied WHERE event_id=%s")
+        if self.pg:
+            with conn.cursor() as cur:
+                cur.execute(sql, (event_id,))
+                return cur.fetchone() is not None
+        return conn.execute(sql, (event_id,)).fetchone() is not None
+
+    def _mark_applied(self, conn: Any, event_id: str) -> None:
+        if not event_id:
+            return
+        sql = ("INSERT OR IGNORE INTO spool_applied (event_id,applied_at) VALUES (?,?)"
+               if not self.pg else
+               "INSERT INTO spool_applied (event_id,applied_at) VALUES (%s,%s) "
+               "ON CONFLICT DO NOTHING")
+        if self.pg:
+            with conn.cursor() as cur:
+                cur.execute(sql, (event_id, utcnow()))
+        else:
+            conn.execute(sql, (event_id, utcnow()))
+
+    def _flush_pending(self, conn: Any) -> None:
+        """按 event_id 幂等地补写内存缓冲 + 磁盘 spool，成功后才清空 spool。"""
+        while self._buffer:
+            item = self._buffer[0]
+            self._apply_payload(conn, item)
+            self._mark_applied(conn, str(item.get("event_id") or ""))
+            self._buffer.popleft()
+        spooled = list(self.spool.read_all())
+        for item in spooled:
+            event_id = str(item.get("event_id") or "")
+            if event_id and self._applied(conn, event_id):
+                continue
+            self._apply_payload(conn, item)
+            self._mark_applied(conn, event_id)
+        if not self.pg:
+            conn.commit()
+        self.spool.clear()
+        self._spool_error = self.spool.last_error
+        self._spool_replayed += len(spooled)
+
+    def _startup_replay(self) -> None:
+        """服务重启后回放上次进程未及补写的审计事件。"""
+        if not self._healthy or self.spool.pending() == 0:
+            return
         try:
             with self._lock:
                 conn = self._connect()
                 try:
-                    if self.pg:
-                        with conn.cursor() as cur:
-                            cur.execute(_to_pg(sql), tuple(safe_params))
-                    else:
-                        conn.execute(sql, tuple(safe_params))
-                        conn.commit()
-                    # 缓冲恢复：尽力补写之前失败的事件
-                    while self._buffer:
-                        item = self._buffer[0]
-                        if self.pg:
-                            with conn.cursor() as cur:
-                                cur.execute(_to_pg(item["sql"]), tuple(item["params"]))
-                        else:
-                            conn.execute(item["sql"], tuple(item["params"]))
-                        self._buffer.popleft()
+                    self._flush_pending(conn)
+                finally:
+                    conn.close()
+            self._healthy = True
+            self._last_error = ""
+        except Exception as exc:  # noqa: BLE001
+            self._healthy = False
+            self._last_error = f"spool 启动回放失败: {exc!r}"
+
+    def _execute(self, sql: str, params: Iterable[Any] = (), *, many: bool = False) -> bool:
+        """唯一 SQL 写边界：统一脱敏；失败时同时进入有界内存缓冲与磁盘 spool。"""
+        safe_params = redact_params(list(params))
+        payload = {"event_id": uuid.uuid4().hex, "sql": sql,
+                   "params": safe_params, "many": many}
+        try:
+            with self._lock:
+                conn = self._connect()
+                try:
+                    self._apply_payload(conn, payload)
                     if not self.pg:
                         conn.commit()
+                    self._flush_pending(conn)
                 finally:
                     conn.close()
             self._healthy = True
@@ -274,6 +437,9 @@ class AuditStorage:
             self._healthy = False
             self._last_error = repr(exc)
             self._buffer.append(payload)
+            if not self.spool.append(payload):
+                self._spool_error = (self.spool.last_error
+                                     or "磁盘 spool 写入失败，事件仅存于内存缓冲")
             return False
 
     def _query_checked(self, sql: str,
@@ -394,7 +560,7 @@ class AuditStorage:
             clauses.append("timestamp_start <= ?")
             args.append(cls._normalize_ts(f["until"]))
         for key in ("tool_name", "status", "client_id", "actor_id", "request_id",
-                    "task_id", "git_repo", "experiment_id"):
+                    "task_id", "git_repo", "experiment_id", "source"):
             if f.get(key):
                 clauses.append(f"{key} = ?")
                 args.append(f[key])
@@ -738,27 +904,237 @@ class AuditStorage:
         except OSError:
             return 0.0
 
+    @staticmethod
+    def _archive_table(label: str) -> str:
+        """归档文件名前缀 -> 真实表名；配额归档复用 tool_calls 的标签。"""
+        return label.split("-quota", 1)[0]
+
     def _write_archive(self, rows: list[dict[str, Any]], directory: Path,
                        label: str, seq: int) -> Path:
-        """0600 创建、fsync 落盘、回读核验行数；核验失败不留下误导性副本。"""
+        """0600 创建、fsync、流式 SHA-256 + 清单；核验失败不留下误导性副本。"""
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
         path = directory / f"{label}-{stamp}-{seq}.jsonl"
+        manifest_path = path.with_suffix(ARCHIVE_MANIFEST_SUFFIX)
+        digest = hashlib.sha256()
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 for row in rows:
                     # 兼容修复前落库的历史行：归档文件也经过同一脱敏入口
                     safe = redact_structure(row)
-                    fh.write(json.dumps(safe, ensure_ascii=False, default=str) + "\n")
+                    line = json.dumps(safe, ensure_ascii=False, default=str) + "\n"
+                    fh.write(line)
+                    digest.update(line.encode("utf-8"))
                 fh.flush()
                 os.fsync(fh.fileno())
-            with path.open("r", encoding="utf-8") as fh:
-                if sum(1 for _ in fh) != len(rows):
-                    raise OSError("归档文件行数校验失败")
+            check = hashlib.sha256()
+            count = 0
+            with path.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(65536), b""):
+                    check.update(chunk)
+                    count += chunk.count(b"\n")
+            if count != len(rows) or check.hexdigest() != digest.hexdigest():
+                raise OSError("归档文件行数/摘要校验失败")
+            manifest = {
+                "version": 1, "path": path.name, "table": self._archive_table(label),
+                "label": label, "batch": seq, "row_count": len(rows),
+                "sha256": digest.hexdigest(), "created_at": utcnow(),
+            }
+            tmp = manifest_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            tmp.replace(manifest_path)
+            self._insert("archive_manifest", {
+                "ts": utcnow(), "path": str(path), "table_name": manifest["table"],
+                "batch": seq, "row_count": len(rows), "sha256": manifest["sha256"],
+                "status": "written", "verified_at": "", "detail": "",
+            })
         except Exception:
             path.unlink(missing_ok=True)
+            manifest_path.unlink(missing_ok=True)
             raise
         return path
+
+    @staticmethod
+    def _read_manifest(path: Path) -> dict[str, Any]:
+        try:
+            return json.loads(path.with_suffix(ARCHIVE_MANIFEST_SUFFIX).read_text(
+                encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def verify_archive(self, source: str) -> dict[str, Any]:
+        """流式重算行数与 SHA-256，与清单比对；结果同步写回 archive_manifest。"""
+        path = Path(source)
+        result: dict[str, Any] = {"path": str(path), "ok": False, "rows": 0,
+                                  "sha256": "", "reason": ""}
+        if not path.is_file():
+            result["reason"] = "归档文件不存在"
+            return result
+        manifest = self._read_manifest(path)
+        digest = hashlib.sha256()
+        count = 0
+        try:
+            with path.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(65536), b""):
+                    digest.update(chunk)
+                    count += chunk.count(b"\n")
+        except OSError as exc:
+            result["reason"] = f"归档文件不可读: {exc!r}"
+            return result
+        result.update({"rows": count, "sha256": digest.hexdigest()})
+        if not manifest:
+            result["reason"] = "缺少 SHA-256 清单，无法确认完整性"
+        elif count != int(manifest.get("row_count", -1)):
+            result["reason"] = (f"行数不符：清单 {manifest.get('row_count')}，"
+                                f"实际 {count}")
+        elif digest.hexdigest() != str(manifest.get("sha256", "")):
+            result["reason"] = "SHA-256 摘要不符，归档可能已损坏或被篡改"
+        else:
+            result["ok"] = True
+        self._execute("UPDATE archive_manifest SET status=?, verified_at=?, detail=? "
+                      "WHERE path=?",
+                      ["verified" if result["ok"] else "corrupt", utcnow(),
+                       result["reason"], str(path)])
+        if not result["ok"]:
+            self.add_event("audit_archive_warning", status="FAILED",
+                           source="audit-storage",
+                           detail=f"归档校验失败，原记录不得删除: {path.name} "
+                                  f"{result['reason']}")
+        return result
+
+    def list_archives(self, filters: dict[str, Any] | None = None,
+                      limit: int = 100) -> list[dict[str, Any]]:
+        f = filters or {}
+        root = Path(f.get("directory") or str(Path(self.db_path).parent / "archive"))
+        if not root.is_dir():
+            return []
+        rows = self._query(
+            "SELECT path, table_name, batch, row_count, sha256, status, ts, "
+            "verified_at, detail FROM archive_manifest ORDER BY id DESC LIMIT ?",
+            [min(max(1, limit), 1000)],
+        )
+        by_path = {str(r.get("path")): r for r in rows}
+        out: list[dict[str, Any]] = []
+        for path in sorted(root.glob("*.jsonl"), key=lambda p: p.name, reverse=True):
+            manifest = self._read_manifest(path)
+            stored = by_path.get(str(path), {})
+            record = {
+                "path": str(path), "name": path.name,
+                "table": manifest.get("table") or stored.get("table_name") or
+                         self._archive_table(path.name.split("-")[0]),
+                "row_count": int(manifest.get("row_count") or stored.get("row_count") or 0),
+                "sha256": manifest.get("sha256") or stored.get("sha256") or "",
+                "status": stored.get("status") or ("written" if manifest else "unverified"),
+                "created_at": manifest.get("created_at") or stored.get("ts") or "",
+                "verified_at": stored.get("verified_at") or "",
+                "size_bytes": path.stat().st_size,
+                "has_manifest": bool(manifest),
+            }
+            if f.get("table") and record["table"] != f["table"]:
+                continue
+            if f.get("request_id"):
+                hits = self.query_archive(str(f["request_id"]), [path])
+                if not hits:
+                    continue
+                record["match_count"] = len(hits)
+            out.append(record)
+            if len(out) >= min(max(1, limit), 1000):
+                break
+        return out
+
+    def query_archive(self, request_id: str,
+                      paths: list[Path] | None = None) -> list[dict[str, Any]]:
+        """按 request_id 在归档 JSONL 中查找（只读，用于恢复前定位）。"""
+        if not request_id:
+            return []
+        root = Path(self.db_path).parent / "archive"
+        candidates = paths or sorted(root.glob("*.jsonl"))
+        hits: list[dict[str, Any]] = []
+        for path in candidates:
+            try:
+                with path.open("r", encoding="utf-8") as fh:
+                    for line in fh:
+                        if request_id not in line or not line.strip():
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except (ValueError, TypeError):
+                            continue
+                        if row.get("request_id") == request_id:
+                            hits.append({"path": str(path), "row": redact_structure(row)})
+            except OSError:
+                continue
+            if len(hits) >= 200:
+                break
+        return hits
+
+    def _table_columns(self, table: str) -> list[str]:
+        if self.pg:
+            rows = self._query(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name=?", [table])
+            return [str(r["column_name"]) for r in rows]
+        return [str(r["name"]) for r in self._query(f"PRAGMA table_info({table})")]
+
+    def restore_archive(self, source: str) -> dict[str, Any]:
+        """幂等恢复归档行：先校验摘要，再逐行 INSERT OR IGNORE / ON CONFLICT DO NOTHING。"""
+        path = Path(source)
+        verified = self.verify_archive(str(path))
+        result: dict[str, Any] = {
+            "ok": False, "path": str(path),
+            "table": self._read_manifest(path).get("table", ""),
+            "rows": 0, "restored": 0, "already_present": 0, "reason": "",
+        }
+        if not verified["ok"]:
+            result["reason"] = verified["reason"]
+            return result
+        table = result["table"] or self._archive_table(path.name.split("-")[0])
+        if table not in {t[0] for t in ARCHIVE_TABLES}:
+            result["reason"] = f"未知归档表 {table}，拒绝恢复"
+            return result
+        columns = self._table_columns(table)
+        if not columns:
+            result["reason"] = f"无法读取表 {table} 的列定义"
+            return result
+        pk = next((t[2] for t in ARCHIVE_TABLES if t[0] == table), "id")
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except (ValueError, TypeError):
+                        continue
+                    result["rows"] += 1
+                    keys = [k for k in row if k in columns]
+                    if not keys:
+                        continue
+                    if pk in row:
+                        found = self._query(
+                            f"SELECT 1 AS hit FROM {table} WHERE {pk}=? LIMIT 1",
+                            [row[pk]])
+                        if found:
+                            result["already_present"] += 1
+                            continue
+                    marks = ",".join("?" for _ in keys)
+                    prefix = "" if self.pg else "OR IGNORE "
+                    sql = (f"INSERT {prefix}INTO {table} ({','.join(keys)}) "
+                           f"VALUES ({marks})")
+                    if self.pg:
+                        sql += " ON CONFLICT DO NOTHING"
+                    if self._execute(sql, [row[k] for k in keys]):
+                        result["restored"] += 1
+        except OSError as exc:
+            result["reason"] = f"读取归档失败: {exc!r}"
+            return result
+        result["ok"] = result["rows"] > 0
+        self.add_event("audit_archive_restore",
+                       status="OK" if result["ok"] else "FAILED",
+                       source="admin", detail=result)
+        return result
 
     def _delete_ids(self, table: str, pk: str, ids: list[Any]) -> bool:
         """只删除已成功归档的主键；分片避开 SQLite 的变量数量上限。"""
@@ -811,7 +1187,10 @@ class AuditStorage:
                     break
                 seq += 1
                 try:
-                    self._write_archive(rows, directory, table, seq)
+                    archived_path = self._write_archive(rows, directory, table, seq)
+                    checked = self.verify_archive(str(archived_path))
+                    if not checked["ok"]:
+                        raise OSError(f"归档删前二次校验失败: {checked['reason']}")
                 except OSError as exc:
                     result["errors"].append(f"{table} 归档失败，已保留原记录: {exc!r}")
                     break
@@ -836,7 +1215,11 @@ class AuditStorage:
                     break
                 seq += 1
                 try:
-                    self._write_archive(rows, directory, "tool_calls-quota", seq)
+                    archived_path = self._write_archive(
+                        rows, directory, "tool_calls-quota", seq)
+                    checked = self.verify_archive(str(archived_path))
+                    if not checked["ok"]:
+                        raise OSError(f"归档删前二次校验失败: {checked['reason']}")
                 except OSError as exc:
                     result["errors"].append(f"配额归档失败，已保留原记录: {exc!r}")
                     break

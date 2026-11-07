@@ -21,6 +21,10 @@ SOURCE_LABELS = {
     "mcp-gateway": "MCP 网关容器（实际命令执行后端）",
     "admin-container": "管理后台容器（仅展示自身指标）",
     "host": "宿主机",
+    # 阶段 C 双执行后端：明确区分容器与经授权的宿主机，避免把容器内指标
+    # 误报为宿主机指标，也不虚构未授权的 GPU/宿主数据。
+    "container": "MCP 网关容器（container 后端）",
+    "host-agent": "宿主机（host-agent 后端，需部署时显式授权）",
 }
 
 

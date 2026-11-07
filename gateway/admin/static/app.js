@@ -80,8 +80,26 @@
       navigator.clipboard.writeText(text).then(() => toast('已复制'), fallback);
     } else fallback();
   }
+  function csrfToken() {
+    const match = document.cookie.match(/(?:^|;\s*)mcp_admin_csrf=([^;]+)/);
+    return match ? decodeURIComponent(match[1]) : '';
+  }
   async function api(path, options) {
-    const res = await fetch(path, Object.assign({ credentials: 'same-origin' }, options || {}));
+    const opts = Object.assign({ credentials: 'same-origin' }, options || {});
+    const method = String(opts.method || 'GET').toUpperCase();
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].indexOf(method) >= 0) {
+      const headers = Object.assign({}, opts.headers || {});
+      const token = csrfToken();
+      if (token && !headers['X-CSRF-Token']) headers['X-CSRF-Token'] = token;
+      opts.headers = headers;
+    }
+    const res = await fetch(path, opts);
+    if (res.status === 403) {
+      let csrfMsg = '请求被安全策略拒绝';
+      try { const j = await res.json(); csrfMsg = j.detail || csrfMsg; } catch (e) { /* noop */ }
+      toast(csrfMsg + '，请刷新页面后重试');
+      throw new Error(csrfMsg);
+    }
     if (res.status === 401) { location.href = '/login'; throw new Error('未登录或会话已过期'); }
     if (!res.ok) {
       let msg = res.statusText;
@@ -227,7 +245,11 @@
       '<span class="muted" id="dash-range-label"></span></div><div id="dash-body"><div class="loading">正在加载…</div></div>';
     bindRange('dash-range');
     const load = async () => {
-      const d = await api('/api/dashboard?' + rangeParams().toString());
+      const q = rangeParams().toString();
+      const [d, v3] = await Promise.all([
+        api('/api/dashboard?' + q),
+        api('/api/v3/overview?' + q).catch(() => ({}))
+      ]);
       if (!alive()) return;
       const st = d.stats || {}, by = st.by_status || {}, gw = d.gateway || {}, audit = d.audit || {};
       const okCount = num(by.SUCCESS);
@@ -283,9 +305,32 @@
         metricCard('服务器状态 · 管理后台容器', mon) +
         metricCard('服务器状态 · MCP 网关容器', gatewayMon) +
         '</div>' +
+        '<div class="grid cols-2" style="margin-top:14px">' +
+        card('V3 能力占比', bars([
+          { label: '搜索事件', count: num(v3.search_events) },
+          { label: '论文库条目', count: num(v3.papers) },
+          { label: '下载任务', count: Object.values(v3.downloads || {}).reduce((a, b) => a + num(b), 0) },
+          { label: '文件传输', count: Object.values(v3.transfers || {}).reduce((a, b) => a + num(b), 0) },
+          { label: '工具调用来源数', count: Object.keys(v3.tool_sources || {}).length }
+        ]), '统计区间：' + esc((v3.range || {}).label || d.range.label) + ' · 缺失数据标明「暂无数据」') +
+        card('最近失败下载', table([
+          { key: 'ts', label: '时间', render: (r) => fmtTime(r.ts) },
+          { key: 'title', label: '论文', render: (r) => tr(r.title, 46) },
+          { key: 'status', label: '状态', render: (r) => dlBadge(r.status) },
+          { key: 'error_message', label: '原因', render: (r) => tr(r.error_message, 60) }
+        ], v3.recent_failed_downloads || [], { empty: '暂无失败下载或来源不可达提示' }),
+        '如实列出失败原因，不以「任务创建成功」冒充文件下载成功') +
+        '</div>' +
         '<div style="margin-top:14px">' + card('最近异常调用', errors, '来自 tool_calls 终态记录') + '</div>' +
-        '<p class="hint" style="margin-top:14px">说明：以上 CPU / 内存 / 磁盘指标分别来自两个容器自身，不是宿主机全机指标；' +
-        'Shell、文件、Git 与实验命令实际在 MCP 网关容器内执行。审计数据已默认脱敏，大输出仅保存受保护引用。</p>';
+        scopeBar([
+          ['数据来自', sourceChip('container', '容器') + ' ' + sourceChip('external', '外部来源') +
+            (v3.tool_sources && Object.keys(v3.tool_sources).length
+              ? ' · 调用来源 ' + Object.keys(v3.tool_sources).map((s) => esc(s)).join('/') : '')],
+          ['审计状态', audit.healthy ? '<span class="badge ok">正常</span>' : '<span class="badge err">降级</span>'],
+          ['缓冲 / spool', esc(audit.buffered) + ' / ' + esc(audit.spool_pending === undefined ? '—' : audit.spool_pending)],
+          ['最后刷新', esc(new Date().toLocaleString('zh-CN', { hour12: false }))],
+          ['指标口径', 'CPU / 内存 / 磁盘来自容器自身，不是宿主机全机指标；审计数据已脱敏']
+        ]);
     };
     $('#dash-refresh').addEventListener('click', () => load().catch(showError));
     $('#dash-all').addEventListener('click', () => { location.hash = '#calls'; });
@@ -351,8 +396,11 @@
     { key: 'status', label: '状态', sort: 'status', render: (r) => statusBadge(r.status) },
     { key: 'duration_ms', label: '耗时', sort: 'duration_ms', render: (r) => fmtDuration(r.duration_ms) },
     { key: 'client_id', label: '客户端', sort: 'client_id', render: (r) => '<span class="mono">' + tr(r.declared_client || r.client_id, 28) + '</span>' },
-    { key: 'source', label: '来源', sort: 'source', render: (r) => esc(r.source || 'mcp') },
+    { key: 'source', label: '来源', sort: 'source', render: (r) => sourceChip(r.source || 'mcp', r.source || 'mcp') },
     { key: 'task_id', label: '任务', render: (r) => tr(r.task_id, 20) },
+    { key: 'result', label: '结果摘要', render: (r) =>
+      '<span class="mono">' + tr(r.result, 46) + '</span>' +
+      (r.result_ref ? '<span class="muted"> · 引用 ' + tr(r.result_ref, 12) + '</span>' : '') },
     { key: 'error_message', label: '异常', render: (r) => tr(r.error_type || r.error_message, 46) },
     { key: 'request_id', label: '请求 ID', render: (r) => '<span class="mono">' + tr(r.request_id, 24) + '</span>' }
   ];
@@ -379,6 +427,9 @@
       '<input id="f-task" placeholder="后台任务 ID">' +
       '<input id="f-repo" placeholder="Git 仓库">' +
       '<input id="f-file" placeholder="文件路径">' +
+      '<select id="f-source"><option value="">全部来源</option>' +
+      ['mcp', 'rest', 'admin', 'http', 'task', 'host-agent', 'oauth', 'system'].map((s) =>
+        '<option value="' + s + '"' + (state.filters.source === s ? ' selected' : '') + '>' + s + '</option>').join('') + '</select>' +
       '<select id="f-limit"><option>25</option><option>50</option><option>100</option><option>200</option></select>' +
       '<button class="btn primary" id="f-apply">查询</button><button class="btn ghost" id="f-reset">重置</button></div></div>' +
       '<div class="card" style="margin-top:14px"><div class="controls"><h3 style="margin:0;flex:1">完整调用记录' +
@@ -393,7 +444,7 @@
     const FILTER_IDS = {
       'f-tool': 'tool_name', 'f-status': 'status', 'f-client': 'client_id',
       'f-actor': 'actor_id', 'f-task': 'task_id', 'f-repo': 'git_repo',
-      'f-file': 'file_path', 'f-keyword': 'keyword'
+      'f-file': 'file_path', 'f-keyword': 'keyword', 'f-source': 'source'
     };
     Object.keys(FILTER_IDS).forEach((id) => {
       const el = $('#' + id);
@@ -537,28 +588,82 @@
   async function renderExperiments(alive) {
     rootEl.innerHTML = '<div class="card"><h3>科研实验 / 后台任务监控<span class="sub">启动工具的调用结果与任务真实运行结果分开记录</span></h3>' +
       '<div id="exp-body"><div class="loading">正在加载…</div></div></div>';
-    const d = await api('/api/experiments');
+    const [d, backend, audit] = await Promise.all([
+      api('/api/experiments'),
+      api('/api/host/status').catch(() => ({})),
+      api('/api/v3/overview?' + rangeParams().toString()).catch(() => ({}))
+    ]);
     if (!alive()) return;
     $('#exp-body').innerHTML = table([
       { key: 'ts', label: '时间', render: (r) => fmtTime(r.ts) },
       { key: 'name', label: '名称 / 任务', render: (r) => esc(r.name || r.task_id) },
       { key: 'status', label: '状态', render: (r) => statusBadge(r.status) },
-      { key: 'command', label: '命令', render: (r) => tr(r.command, 70) },
+      { key: 'command', label: '命令', render: (r) => tr(r.command, 60) },
       { key: 'pid', label: 'PID' },
-      { key: 'git_commit', label: '代码版本', render: (r) => tr(r.git_commit, 16) },
+      { key: 'git_commit', label: '代码版本', render: (r) => tr(r.git_commit, 14) },
+      { key: 'output_path', label: '输出路径', render: (r) => tr(r.output_path, 26) },
+      { key: 'backend', label: '执行后端', render: () => sourceChip(backend.default || 'container',
+          backend.default || 'container') },
       { key: 'detail', label: '操作', render: (r) => '<button class="btn" data-log="' + esc(r.task_id) + '">查看日志</button>' }
-    ], d.rows, { empty: '暂无后台实验运行记录' }) + '<div id="exp-log"></div>';
+    ], d.rows, { empty: '暂无后台实验运行记录' }) + '<div id="exp-log"></div>' +
+      scopeBar([
+        ['来源标识', sourceChip('container', '容器后端') + ' ' +
+          ((backend['host-agent'] || {}).available
+            ? sourceChip('host-agent', '宿主已授权')
+            : '<span class="source-chip offline">宿主未连接 / 未授权</span>')],
+        ['复现元数据', 'Git commit、输出路径与命令写入 experiment_runs / task_state'],
+        ['审计健康', (audit.audit || {}).healthy === false ? '<span class="badge err">降级</span>' : '<span class="badge ok">正常</span>'],
+        ['更新时间', esc(new Date().toLocaleString('zh-CN', { hour12: false }))]
+      ]);
   }
 
   async function renderServer(alive) {
     rootEl.innerHTML = '<div id="server-body"><div class="loading">正在加载…</div></div>';
-    const d = await api('/api/monitoring');
+    const [d, backend] = await Promise.all([
+      api('/api/monitoring'), api('/api/host/status').catch(() => ({}))
+    ]);
     if (!alive()) return;
-    $('#server-body').innerHTML = '<div class="grid cols-2">' +
+    const host = backend['host-agent'] || {};
+    $('#server-body').innerHTML = '<div class="controls">' +
+      '<select id="server-scope"><option value="container">容器来源</option>' +
+      '<option value="host-agent">宿主来源（需授权）</option></select>' +
+      '<span class="muted" id="server-scope-note">' + esc(d.scope_note) + '</span></div>' +
+      '<div class="grid cols-2" id="server-cards">' +
       metricCard('管理后台容器', d.admin_container) + metricCard('MCP 网关容器', d.gateway_container) +
-      '</div><p class="hint" style="margin-top:14px">' + esc(d.scope_note) +
-      ' 网关状态：' + (d.gateway_online ? '在线' : '离线') +
-      '。GPU 与 Docker 容器列表仅在显式透传设备 / 挂载 socket 后可用。</p>';
+      '</div>' +
+      card('执行后端与宿主来源', kv([
+        ['默认后端', sourceChip(backend.default || 'container', backend.default || 'container')],
+        ['容器后端', (backend.container || {}).available ? '<span class="badge ok">可用</span>' : '—'],
+        ['Host Agent', host.available ? '<span class="badge ok">已连接（Unix Socket）</span>'
+          : '<span class="badge err">未连接 / 未授权</span>'],
+        ['未授权原因', esc(host.reason || '（无）')],
+        ['传输方式', esc(host.transport || 'unix-socket') + ' · 无 TCP 公网端口'],
+        ['授权说明', esc(host.note || '真实宿主权限需部署时由用户授予')]
+      ]), '不可用项给出具体原因，不虚构 GPU / 宿主数据') +
+      scopeBar([
+        ['数据来自', sourceChip('container', '容器自身指标') + ' ' +
+          (host.available ? sourceChip('host-agent', '宿主机（已授权）') : '<span class="source-chip offline">宿主未授权</span>')],
+        ['采集时间', esc(new Date().toLocaleString('zh-CN', { hour12: false }))],
+        ['网关状态', d.gateway_online ? '<span class="badge ok">在线</span>' : '<span class="badge err">离线</span>'],
+        ['指标口径', 'GPU / Docker 列表仅在显式透传设备或挂载 socket 后可用']
+      ]);
+    $('#server-scope').addEventListener('change', () => {
+      const isHost = $('#server-scope').value === 'host-agent';
+      $('#server-scope-note').textContent = isHost
+        ? '宿主来源：' + (host.available ? 'Host Agent 已连接，数据由授权宿主目录采集。'
+            : 'Host Agent 未连接或未授权，以下不展示任何宿主指标，避免把容器指标误报为宿主指标。')
+        : d.scope_note;
+      $('#server-cards').innerHTML = isHost
+        ? (host.available ? card('宿主机（Host Agent 握手信息）', kv([
+              ['角色', esc((host.ping || {}).role || 'host-agent')],
+              ['传输', 'Unix Socket（无 TCP 端口）'],
+              ['授权目录', esc(((host.ping || {}).roots || []).join('；') || '未返回')],
+              ['资源指标', '当前仅完成协议握手，未采集 CPU / 内存 / GPU；不虚构宿主指标']
+            ])) : '<div class="card"><p class="empty muted">Host Agent 未连接 / 未授权：' +
+            esc(host.reason || '') + '。真实宿主权限只能在部署时由用户显式授予。</p></div>')
+        : metricCard('管理后台容器', d.admin_container) +
+          metricCard('MCP 网关容器', d.gateway_container);
+    });
   }
 
   async function renderClients(alive) {
@@ -673,12 +778,247 @@
     await load();
   }
 
+  // ------------------------------------------------------------------ V3 组件
+  function fmtBytes(v) {
+    const n = num(v);
+    if (!n) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+    return (n / Math.pow(1024, i)).toFixed(i ? 1 : 0) + ' ' + units[i];
+  }
+  function sourceChip(source, label) {
+    const s = String(source || 'unknown').toLowerCase();
+    const kind = s.indexOf('host') >= 0 ? 'host-agent'
+      : (s.indexOf('container') >= 0 || s.indexOf('gateway') >= 0 || s.indexOf('admin') >= 0)
+        ? 'container' : 'external';
+    return '<span class="source-chip ' + kind + '">' + esc(label || source || '未知来源') + '</span>';
+  }
+  function scopeBar(items) {
+    return '<div class="scope-bar fade-in">' + items.map(([k, v]) =>
+      '<span><strong>' + esc(k) + '：</strong>' + v + '</span>').join('') + '</div>';
+  }
+  function dlBadge(s) {
+    return '<span class="status ' + esc(String(s || '').toLowerCase()) + '">' + esc(s || '—') + '</span>';
+  }
+  function flowStrip(status) {
+    const steps = ['created', 'downloading', 'verifying', 'success'];
+    const bad = ['failed', 'error', 'no_oa', 'source_unavailable'];
+    const cur = String(status || '').toLowerCase();
+    const idx = steps.indexOf(cur);
+    return '<span class="flow-strip">' + steps.map((s, i) =>
+      '<span class="flow-step ' + (bad.indexOf(cur) >= 0 && i === 0 ? 'bad'
+        : idx >= 0 && i <= idx ? (i === steps.length - 1 ? 'good' : 'on') : '') + '">' +
+      esc(s) + '</span>').join('<span class="muted">›</span>') +
+      (bad.indexOf(cur) >= 0 ? '<span class="flow-step bad">' + esc(cur) + '</span>' : '') + '</span>';
+  }
+  function progressBar(status, bytes, total) {
+    const s = String(status || '').toLowerCase();
+    const pct = total > 0 ? Math.min(100, Math.round(num(bytes) / num(total) * 100))
+      : (s === 'success' || s === 'duplicate' ? 100 : 0);
+    const cls = s === 'success' || s === 'duplicate' ? 'done'
+      : (s === 'failed' || s === 'error' ? 'failed' : '');
+    return '<div class="progress ' + cls + '"><i style="width:' + pct + '%"></i></div>' +
+      '<span class="muted">' + fmtBytes(bytes) + (total ? ' / ' + fmtBytes(total) : '') + ' · ' + pct + '%</span>';
+  }
+
+  const SEARCH_SOURCES = ['arxiv', 'crossref', 'openalex', 'pubmed', 'europepmc',
+                          'semanticscholar', 'dblp', 'openreview', 'hn', 'stackexchange',
+                          'searxng', 'duckduckgo', 'wikipedia'];
+
+  // ------------------------------------------------------------------ 搜索监控
+  async function renderSearch(alive) {
+    rootEl.innerHTML = '<div class="card"><h3>搜索监控' +
+      '<span class="sub">垂直学术源 / 社区源 / 可选通用搜索，覆盖范围如实标注</span></h3>' +
+      '<div class="controls">' + rangeSelect('search-range') + rangeInputs() +
+      '<select id="search-provider"><option value="">全部数据源</option>' +
+      SEARCH_SOURCES.map((s) => '<option value="' + s + '">' + s + '</option>').join('') + '</select>' +
+      '<input id="search-keyword" type="search" placeholder="脱敏关键词 / 查询摘要">' +
+      '<select id="search-status"><option value="">全部状态</option>' +
+      ['SUCCESS', 'FAILED', 'SOURCE_UNAVAILABLE', 'RATE_LIMITED', 'CACHED'].map((s) =>
+        '<option value="' + s + '">' + s + '</option>').join('') + '</select>' +
+      '<button class="btn primary" id="search-refresh">刷新</button></div></div>' +
+      '<div id="search-body" style="margin-top:14px"><div class="loading">正在加载…</div></div>';
+    bindRange('search-range');
+    const load = async () => {
+      const p = rangeParams({ provider: $('#search-provider').value,
+                              keyword: $('#search-keyword').value.trim(),
+                              status: $('#search-status').value, limit: 200 });
+      const d = await api('/api/search/events?' + p.toString());
+      if (!alive()) return;
+      const matrix = d.by_provider || [];
+      const total = matrix.reduce((a, m) => a + num(m.requests), 0);
+      const failures = matrix.reduce((a, m) => a + num(m.failures), 0);
+      const limited = matrix.reduce((a, m) => a + num(m.rate_limited), 0);
+      const cached = matrix.reduce((a, m) => a + num(m.cached), 0);
+      const avg = total ? Math.round(matrix.reduce((a, m) => a + num(m.avg_ms) * num(m.requests), 0) / total) : 0;
+      const matrixHtml = total ? '<div class="matrix-row head"><span>数据源（外部）</span>' +
+        '<span class="num">请求 / 失败</span><span class="num">平均耗时</span>' +
+        '<span class="num">返回条数</span><span class="num">限流 / 缓存</span></div>' +
+        matrix.map((m) => '<div class="matrix-row ' + (num(m.failures) ? 'fail' : '') + '">' +
+          '<span>' + sourceChip(m.provider, m.provider || '未标注') + '</span>' +
+          '<span class="num">' + num(m.requests) + ' / ' + num(m.failures) + '</span>' +
+          '<span class="num">' + fmtDuration(m.avg_ms) + '</span>' +
+          '<span class="num">' + num(m.results) + '</span>' +
+          '<span class="num">' + num(m.rate_limited) + ' / ' + num(m.cached) + '</span></div>').join('')
+        : '<p class="empty muted">暂无搜索事件（区间内没有真实调用记录）</p>';
+      $('#search-body').innerHTML =
+        '<div class="grid kpis">' +
+        kpi('检索请求', total, '统计区间：' + d.range.label) +
+        kpi('失败 / 不可达', failures, '按数据源逐项统计，不掩盖逐源失败') +
+        kpi('平均耗时', fmtDuration(avg), '按请求数加权') +
+        kpi('API 限流', limited, '429 / Retry-After 触发次数') +
+        kpi('缓存命中', cached, '仅统计真实缓存命中事件') +
+        '</div>' +
+        '<div class="grid cols-2" style="margin-top:14px">' +
+        card('来源矩阵', matrixHtml, '数据来源：审计库 search_events（外部来源调用结果）') +
+        card('覆盖范围与上游状态', kv([
+          ['覆盖范围', esc(d.coverage_note)],
+          ['上游连通性', '<span class="source-chip offline">' + esc(d.upstream.status) + '</span>'],
+          ['探测说明', esc(d.upstream.note)],
+          ['数据来源', esc(d.source_note)],
+          ['采样说明', '仅显示区间内最近 ' + d.total + ' 条事件；未落库的请求不在其中']
+        ])) +
+        '</div>' +
+        '<div style="margin-top:14px">' + card('最近检索事件', table([
+          { key: 'ts', label: '时间', render: (r) => fmtTime(r.ts) },
+          { key: 'tool_name', label: '工具' },
+          { key: 'provider', label: '来源', render: (r) => sourceChip(r.provider, r.provider) },
+          { key: 'keyword', label: '脱敏关键词', render: (r) => tr(r.keyword || r.query_hash, 40) },
+          { key: 'status', label: '状态', render: (r) => dlBadge(r.status) },
+          { key: 'duration_ms', label: '耗时', render: (r) => fmtDuration(r.duration_ms) },
+          { key: 'result_count', label: '条数' },
+          { key: 'rate_limited', label: '限流', render: (r) => num(r.rate_limited) ? '是' : '—' },
+          { key: 'error', label: '失败原因', render: (r) => tr(r.error, 60) }
+        ], d.rows, { empty: '区间内暂无检索事件' }), '逐源失败原因独立展示，不以「整体成功」掩盖') + '</div>' +
+        scopeBar([
+          ['数据来自', sourceChip('external', '外部免费数据源') + ' ' + sourceChip('container', '容器内审计库')],
+          ['更新时间', esc(new Date().toLocaleString('zh-CN', { hour12: false }))],
+          ['限额提示', '免费 API 有额度与限速，SearXNG 软件免费不等于上游可达']
+        ]);
+    };
+    ['search-provider', 'search-keyword', 'search-status', 'search-range'].forEach((id) => {
+      const el = $('#' + id);
+      if (el) el.addEventListener('change', () => load().catch(showError));
+    });
+    $('#search-refresh').addEventListener('click', () => load().catch(showError));
+    await load();
+  }
+
+  // ------------------------------------------------------------------ 论文库与下载
+  async function renderPapers(alive) {
+    rootEl.innerHTML = '<div class="card"><h3>论文库与下载' +
+      '<span class="sub">合法开放获取全文 · 任务创建成功 ≠ 文件最终校验成功</span></h3>' +
+      '<div class="controls">' +
+      '<input id="p-keyword" type="search" placeholder="标题 / 作者关键词">' +
+      '<input id="p-id" placeholder="DOI / arXiv ID / PMID">' +
+      '<select id="p-oa"><option value="">全部 OA 状态</option>' +
+      ['oa_pdf', 'oa_html', 'metadata_only', 'subscription_required'].map((v) =>
+        '<option value="' + v + '">' + v + '</option>').join('') + '</select>' +
+      '<input id="p-year" type="number" min="1900" max="2100" placeholder="起始年份" style="width:110px">' +
+      '<input id="p-project" placeholder="项目">' +
+      '<input id="p-tag" placeholder="标签">' +
+      '<button class="btn primary" id="p-apply">查询</button>' +
+      '<button class="btn" data-p-export="bibtex">BibTeX</button>' +
+      '<button class="btn" data-p-export="ris">RIS</button>' +
+      '<button class="btn" data-p-export="csv">CSV</button>' +
+      '<button class="btn" data-p-export="json">JSON</button></div></div>' +
+      '<div id="papers-body" style="margin-top:14px"><div class="loading">正在加载…</div></div>';
+    const params = () => {
+      const p = new URLSearchParams();
+      [['p-keyword', 'keyword'], ['p-id', 'identifier'], ['p-oa', 'oa_status'],
+       ['p-year', 'from_year'], ['p-project', 'project'], ['p-tag', 'tag']].forEach(([id, key]) => {
+        const el = $('#' + id); if (el && el.value.trim()) p.set(key, el.value.trim());
+      });
+      return p;
+    };
+    const load = async () => {
+      const q = params().toString();
+      const [lib, dl, tr] = await Promise.all([
+        api('/api/papers?' + q), api('/api/papers/downloads?limit=100'),
+        api('/api/transfers?limit=50').catch(() => ({ rows: [], counts: {} }))
+      ]);
+      if (!alive()) return;
+      const st = lib.stats || {};
+      const cards = (lib.rows || []).map((r) => '<article class="paper-card fade-in">' +
+        '<h4>' + esc(r.title || '(无标题)') + '</h4>' +
+        '<div class="meta">' + esc((r.authors || []).join(', ') || '作者未标注') + ' · ' +
+        esc(r.publication_year || '年份未知') + ' · ' + esc(r.venue || '来源未标注') + '</div>' +
+        '<div class="chips">' + dlBadge(r.oa_status) +
+        '<span class="badge' + (r.sha256_verified ? ' ok' : '') + '">' +
+        (r.sha256_verified ? 'SHA-256 已校验' : '尚未校验') + '</span>' +
+        sourceChip('external', (r.sources || [])[0] || 'metadata') + '</div>' +
+        '<div class="meta mono">' + esc(r.doi || r.arxiv_id || r.paper_id) + ' · ' +
+        fmtBytes(r.file_size) + '</div>' +
+        '<div class="actions">' +
+        (r.file_path ? '<button class="btn" data-paper-file="' + esc(r.paper_id) + '">PDF 预览 / 下载</button>' : '<span class="muted">无本地 PDF</span>') +
+        (r.landing_url ? '<a class="btn ghost" href="' + esc(r.landing_url) + '" target="_blank" rel="noopener">原始页面</a>' : '') +
+        '</div></article>').join('');
+      const taskRows = (dl.rows || []).slice(0, 40);
+      $('#papers-body').innerHTML =
+        '<div class="grid kpis">' +
+        kpi('文献库条目', st.total, '本地索引持久化于审计库') +
+        kpi('已下载并校验', st.verified, '校验通过率 ' + num(st.verified_rate) + '%') +
+        kpi('占用空间', fmtBytes(st.bytes), '容器内论文目录') +
+        kpi('下载任务', dl.total, Object.keys(dl.counts || {}).map((k) => k + ':' + dl.counts[k]).join(' · ') || '暂无') +
+        '</div>' +
+        '<div style="margin-top:14px">' + card('论文卡片',
+          cards ? '<div class="paper-grid">' + cards + '</div>' : '<p class="empty muted">暂无论文条目（可先用学术检索与 OA 下载工具入库）</p>',
+          '共 ' + lib.total + ' 条 · 数据来源：本地文献库') + '</div>' +
+        '<div class="grid cols-2" style="margin-top:14px">' +
+        card('下载任务面板', taskRows.length ? taskRows.map((r) =>
+          '<div style="padding:10px 0;border-bottom:1px solid var(--line)">' +
+          '<div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap">' +
+          '<b>' + esc(r.title || r.paper_id) + '</b>' + dlBadge(r.status) + '</div>' +
+          '<div class="meta">' + esc(r.ts) + ' · ' + sourceChip('external', r.source || 'oa') +
+          ' · 请求 ' + esc(r.request_id || '—') + '</div>' +
+          '<div style="margin:7px 0">' + progressBar(r.status, r.bytes, r.total_bytes) + '</div>' +
+          flowStrip(r.status) +
+          (r.error_message ? '<div class="hint">失败原因：' + esc(r.error_message) + '</div>' : '') +
+          '</div>').join('') : '<p class="empty muted">暂无下载任务</p>',
+          esc(dl.note)) +
+        card('任务状态口径', kv([
+          ['created', '任务已创建，尚未拿到文件或尚未校验'],
+          ['downloading / verifying', '流式下载中 / 校验 %PDF- 头、EOF、SHA-256 中'],
+          ['success', '文件最终校验通过并原子改名落盘'],
+          ['duplicate', '同 SHA-256 已存在，未重复下载'],
+          ['failed / no_oa', '明确失败原因，绝不假报下载成功'],
+          ['数据来源', esc(dl.source_note)]
+        ])) +
+        '</div>' +
+        '<div style="margin-top:14px">' + card('通用文件传输', table([
+          { key: 'ts', label: '时间', render: (r) => fmtTime(r.ts) },
+          { key: 'direction', label: '方向', render: (r) => sourceChip('container', r.direction) },
+          { key: 'path', label: '路径', render: (r) => tr(r.path, 50) },
+          { key: 'status', label: '状态', render: (r) => dlBadge(r.status) },
+          { key: 'bytes', label: '大小', render: (r) => fmtBytes(r.bytes) },
+          { key: 'sha256', label: 'SHA-256', render: (r) => tr(r.sha256, 16) },
+          { key: 'op', label: '操作', render: (r) => r.status === 'success'
+            ? '<button class="btn" data-transfer-link="' + esc(r.path) + '">签名下载</button>' : '—' }
+        ], (tr.rows || []).slice(0, 20), { empty: '暂无文件传输任务' }),
+        esc(tr.note || 'created 仅表示任务创建，success 表示最终校验通过')) + '</div>' +
+        scopeBar([
+          ['数据来自', sourceChip('container', '容器内论文目录与审计库') + ' ' + sourceChip('external', '合法 OA 来源')],
+          ['索引持久化', 'paper_library / paper_downloads（共享审计数据卷）'],
+          ['OCR', esc(lib.ocr_note)],
+          ['更新时间', esc(new Date().toLocaleString('zh-CN', { hour12: false }))]
+        ]);
+    };
+    $('#p-apply').addEventListener('click', () => load().catch(showError));
+    $$('[data-p-export]').forEach((btn) => btn.addEventListener('click', () => {
+      const p = params(); p.set('fmt', btn.dataset.pExport);
+      window.location.href = '/api/papers/export?' + p.toString();
+    }));
+    await load();
+  }
+
   // ------------------------------------------------------------------ 路由
   const VIEWS = {
     dashboard: { title: '首页仪表盘', sub: '调用总量、成功率、趋势与服务器状态', render: renderDashboard },
     realtime: { title: '实时调用监控', sub: 'SSE · 只推送真实调用与任务事件', render: renderRealtime },
     calls: { title: '完整调用记录', sub: '组合筛选、排序、分页、详情与导出', render: renderCalls },
     call: { title: '调用详情', sub: '参数、结果、时间线与关联记录', render: renderCallDetail },
+    search: { title: '搜索监控', sub: '垂直学术源与可选通用搜索的逐源成败、耗时与限额', render: renderSearch },
+    papers: { title: '论文库与下载', sub: '合法 OA 全文、按状态区分的下载任务与文献导出', render: renderPapers },
     git: { title: 'Git 操作审计', sub: 'commit / push / status 等命令推导', render: renderGit },
     experiments: { title: '科研实验监控', sub: '后台任务生命周期与日志', render: renderExperiments },
     server: { title: '服务器状态', sub: '容器指标来源明确区分', render: renderServer },
@@ -730,6 +1070,26 @@
         await api('/api/sessions/' + encodeURIComponent(revoke.dataset.revoke), { method: 'DELETE' });
         toast('会话已撤销'); render();
       } catch (e) { toast('撤销失败：' + e.message); }
+      return;
+    }
+    const paperFile = ev.target.closest('[data-paper-file]');
+    if (paperFile) {
+      try {
+        const r = await api('/api/papers/link?paper_id=' +
+          encodeURIComponent(paperFile.dataset.paperFile));
+        if (!r.ok) { toast(r.error || '无法生成下载链接'); return; }
+        window.open(r.url, '_blank', 'noopener');
+      } catch (e) { toast('获取论文链接失败：' + e.message); }
+      return;
+    }
+    const transferLink = ev.target.closest('[data-transfer-link]');
+    if (transferLink) {
+      try {
+        const r = await api('/api/transfers/link?path=' +
+          encodeURIComponent(transferLink.dataset.transferLink));
+        if (!r.ok) { toast(r.error || '无法生成签名下载链接'); return; }
+        window.open(r.url, '_blank', 'noopener');
+      } catch (e) { toast('获取传输链接失败：' + e.message); }
       return;
     }
     const link = ev.target.closest('[data-export-link]');

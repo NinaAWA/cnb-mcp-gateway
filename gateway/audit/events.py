@@ -24,6 +24,25 @@ TERMINAL_STATUSES = frozenset(
     {"SUCCESS", "FAILED", "DENIED", "TIMEOUT", "CANCELLED", "INTERRUPTED"}
 )
 
+# V3 新增事件类别 / 状态。保持既有 TOOL_STATUSES 语义不变。
+EVENT_KINDS = (
+    "tool_call", "task_lifecycle", "admin_auth", "admin_export", "service_start",
+    "search_event", "paper_download", "paper_read", "file_transfer",
+    "host_agent", "approval", "audit_strict_violation", "audit_storage_warning",
+    "audit_archive", "audit_archive_warning", "audit_archive_restore",
+    "oauth_persistence_warning", "oauth_revoke", "audit_unavailable",
+)
+SOURCES = ("mcp", "rest", "admin", "task", "system", "host-agent", "external",
+           "audit-storage", "oauth", "container")
+DOWNLOAD_STATUSES = ("created", "downloading", "verifying", "success",
+                     "failed", "cancelled", "duplicate")
+TRANSFER_STATUSES = ("created", "uploading", "downloading", "verifying",
+                     "success", "failed", "cancelled")
+
+
+class StrictAuditDenied(RuntimeError):
+    """统一严格审计门拒绝执行；调用方必须把 DENIED 终态如实返回给客户端。"""
+
 
 def utcnow() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds")

@@ -16,6 +16,7 @@ import os
 import re
 import threading
 import time
+import urllib.parse
 import urllib.request
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -24,8 +25,8 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import (
-    FileResponse, HTMLResponse, JSONResponse, RedirectResponse,
-    StreamingResponse,
+    FileResponse, HTMLResponse, JSONResponse, PlainTextResponse,
+    RedirectResponse, StreamingResponse,
 )
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -34,7 +35,83 @@ from pydantic import BaseModel
 from gateway.audit.redaction import redact_structure, redact_text
 from gateway.audit.storage import SESSION_TTL, get_storage
 from gateway.monitoring.system import collect
-from .auth import COOKIE_NAME, get_auth
+from gateway.transfer.http_api import iter_file, parse_range
+from .auth import (
+    COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_EXEMPT_PATHS, CSRF_SAFE_METHODS,
+    csrf_cookie, csrf_valid, get_auth, new_csrf_token,
+)
+
+
+class AdminCsrfMiddleware:
+    """纯 ASGI 双提交 Cookie 校验，避免 BaseHTTPMiddleware 干扰 SSE / 流式导出。"""
+
+    def __init__(self, app):
+        self.app = app
+
+    @staticmethod
+    def _headers(scope) -> dict[str, str]:
+        return {key.decode("latin-1").lower(): value.decode("latin-1")
+                for key, value in scope.get("headers", [])}
+
+    @staticmethod
+    def _cookie(headers: dict[str, str], name: str) -> str:
+        from http.cookies import SimpleCookie
+        jar = SimpleCookie()
+        try:
+            jar.load(headers.get("cookie", ""))
+        except Exception:  # noqa: BLE001
+            return ""
+        item = jar.get(name)
+        return item.value if item else ""
+
+    @staticmethod
+    def _with_cookie(message: dict, cookie: str) -> dict:
+        headers = list(message.get("headers") or [])
+        headers.append((b"set-cookie", cookie.encode("latin-1")))
+        return {**message, "headers": headers}
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = self._headers(scope)
+        method = str(scope.get("method", "GET")).upper()
+        path = str(scope.get("path", ""))
+        existing = self._cookie(headers, CSRF_COOKIE_NAME)
+        token = existing or new_csrf_token()
+        cookie = csrf_cookie(COOKIE_SECURE).format(token=token) if not existing else ""
+        needs_check = (method not in CSRF_SAFE_METHODS and path.startswith("/api/")
+                       and path not in CSRF_EXEMPT_PATHS)
+        if needs_check:
+            # 首次请求尚无 Cookie 时，用刚生成的 token 组成响应头供客户端重试。
+            probe = dict(headers)
+            if not existing:
+                probe["cookie"] = (headers.get("cookie", "") + "; " if headers.get("cookie") else "") \
+                    + f"{CSRF_COOKIE_NAME}={token}"
+            ok, reason = csrf_valid(probe)
+            if not ok:
+                body = json.dumps({"ok": False, "detail": reason},
+                                  ensure_ascii=False).encode("utf-8")
+                start = {
+                    "type": "http.response.start", "status": 403,
+                    "headers": [(b"content-type", b"application/json; charset=utf-8"),
+                                (b"content-length", str(len(body)).encode())],
+                }
+                if cookie:
+                    start = self._with_cookie(start, cookie)
+                await send(start)
+                await send({"type": "http.response.body", "body": body})
+                return
+        if not cookie:
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_cookie(message):
+            if message.get("type") == "http.response.start":
+                message = self._with_cookie(message, cookie)
+            await send(message)
+
+        await self.app(scope, receive, send_with_cookie)
 
 BASE_DIR = Path(__file__).parent
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://mcp-gateway:8765").rstrip("/")
@@ -61,6 +138,7 @@ async def _lifespan(_app: FastAPI):
 app = FastAPI(title="MCP Admin Dashboard", docs_url=None, redoc_url=None,
               openapi_url=None, lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+app.add_middleware(AdminCsrfMiddleware)
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
@@ -76,14 +154,27 @@ CONFIG_WHITELIST = (
     "MCP_SEARCH_CACHE_TTL", "MCP_SEARCH_ARXIV_MIN_INTERVAL",
     "MCP_SEARCH_WEB_PROVIDERS", "MCP_SEARCH_FETCH_ENABLED",
     "AUDIT_STRICT", "AUDIT_RETENTION_DAYS", "AUDIT_MAX_DB_MB",
-    "AUDIT_ARCHIVE_BATCH", "AUDIT_BUFFER_MAX", "MCP_SESSION_TTL",
+    "AUDIT_ARCHIVE_BATCH", "AUDIT_BUFFER_MAX", "AUDIT_MAX_FIELD_CHARS",
+    "MCP_SESSION_TTL",
+    "AUDIT_REQUIRED", "AUDIT_ALLOW_UNAUDITED", "AUDIT_SPOOL_ENABLED",
+    "AUDIT_SPOOL_MAX_MB", "AUDIT_SPOOL_MAX_FILES", "OAUTH_PERSIST_ENABLED",
+    "MCP_SEARCH_PIN_DNS", "MCP_SEARCH_SEARXNG_URL",
+    "MCP_PAPER_DIR", "MCP_PAPER_MAX_MB", "MCP_DOWNLOAD_CONCURRENCY",
+    "MCP_PAPER_ALLOW_PRIVATE", "MCP_PAPER_TEXT_CACHE_DIR",
+    "MCP_PAPER_EXTRA_HOSTS",
+    "MCP_ACCESS_MODE", "MCP_DANGER_GUARD", "MCP_INDEPENDENT_CONFIRM",
+    "MCP_EXEC_BACKEND", "MCP_HOST_AGENT_SOCKET", "MCP_HOST_AGENT_ROOTS",
+    "MCP_TRANSFER_DIR", "MCP_TRANSFER_ALLOW_PRIVATE", "TRANSFER_MAX_MB",
+    "MCP_TASK_LOG_DIR",
     "MCP_OAUTH_TOKEN_TTL", "OAUTH_ALLOW_ANY_REDIRECT", "OAUTH_ALLOW_NO_PKCE",
     "ADMIN_SESSION_TTL", "ADMIN_LOGIN_MAX_FAILURES", "ADMIN_LOGIN_LOCK_MINUTES",
+    "ADMIN_MAX_SESSIONS",
 )
 SENSITIVE_CONFIG = (
     "MCP_TOKEN", "ADMIN_PASSWORD", "ADMIN_SESSION_SECRET", "ADMIN_TOTP_SECRET",
     "CF_TUNNEL_TOKEN", "MCP_SEARCH_TAVILY_KEY", "MCP_SEARCH_MAILTO",
     "MCP_SEARCH_SEARXNG_URL", "AUDIT_DB_DSN", "GATEWAY_METRICS_TOKEN",
+    "MCP_TRANSFER_SECRET", "MCP_HOST_AGENT_TOKEN",
 )
 EDITABLE_SETTINGS = ("default_range", "page_size", "theme")
 
@@ -246,7 +337,7 @@ def _gateway_health() -> dict[str, Any]:
 def _filters(request: Request) -> dict[str, Any]:
     allowed = ("since", "until", "tool_name", "status", "client_id", "actor_id",
                "request_id", "task_id", "git_repo", "experiment_id", "keyword",
-               "file_path")
+               "file_path", "source")
     return {key: request.query_params[key] for key in allowed
             if request.query_params.get(key)}
 
@@ -643,3 +734,391 @@ def export_stream(request: Request, session: dict = Depends(require_admin)):
     )
 
 
+# ------------------------------------------------------------- 归档查询与恢复
+class ArchiveBody(BaseModel):
+    path: str = ""
+
+
+def _archive_path(raw: str) -> Path | None:
+    """路径必须解析到审计归档目录内，杜绝任意文件读取 / 恢复。"""
+    if not raw:
+        return None
+    root = Path(get_storage().health().get("archive_dir") or "").resolve()
+    try:
+        candidate = Path(raw).resolve()
+    except OSError:
+        return None
+    if not root or root not in candidate.parents or candidate.suffix != ".jsonl":
+        return None
+    return candidate
+
+
+def _archive_event(kind: str, status: str, session: dict, detail: Any) -> None:
+    get_storage().add_event(
+        kind, status=status, source="admin",
+        actor_id=f"admin:{session.get('username', '')}",
+        detail=redact_text(detail, limit=1000),
+    )
+
+
+@app.get("/api/archives")
+def archives(request: Request, session: dict = Depends(require_admin)):
+    storage = get_storage()
+    rows = storage.list_archives({
+        "table": request.query_params.get("table", ""),
+        "request_id": request.query_params.get("request_id", ""),
+    }, min(500, max(1, int(request.query_params.get("limit", "100")))))
+    return {"rows": _safe_rows(rows), "total": len(rows),
+            "audit": storage.health(),
+            "note": "归档文件位于审计数据卷；status=verified 表示行数与 SHA-256 均已复核。"}
+
+
+@app.get("/api/archives/query")
+def archives_query(request: Request, session: dict = Depends(require_admin)):
+    request_id = request.query_params.get("request_id", "")
+    hits = get_storage().query_archive(request_id)
+    return {"request_id": request_id, "rows": hits, "total": len(hits)}
+
+
+@app.post("/api/archives/verify")
+def archives_verify(body: ArchiveBody, session: dict = Depends(require_admin)):
+    path = _archive_path(body.path)
+    if not path:
+        raise HTTPException(status_code=400, detail="归档路径不在允许的归档目录内")
+    result = get_storage().verify_archive(str(path))
+    _archive_event("audit_archive_verify", "OK" if result["ok"] else "FAILED",
+                   session, result)
+    return {"ok": result["ok"], "result": result}
+
+
+@app.post("/api/archives/restore")
+def archives_restore(body: ArchiveBody, session: dict = Depends(require_admin)):
+    path = _archive_path(body.path)
+    if not path:
+        raise HTTPException(status_code=400, detail="归档路径不在允许的归档目录内")
+    storage = get_storage()
+    try:
+        from gateway.audit.middleware import trace_call
+    except Exception:  # noqa: BLE001 - 后台进程未安装 fastmcp 时仍要记录事件
+        trace_call = None
+    arguments = {"path": str(path)}
+    if trace_call is not None:
+        with trace_call("restore_archive", arguments, source="admin") as rec:
+            result = storage.restore_archive(str(path))
+            rec.ok(json.dumps(result, ensure_ascii=False))
+            if not result["ok"]:
+                rec.status = "FAILED"
+    else:
+        result = storage.restore_archive(str(path))
+        storage.add_event("audit_archive_restore",
+                          status="OK" if result["ok"] else "FAILED",
+                          source="admin", detail=result)
+    _archive_event("audit_archive_restore", "OK" if result["ok"] else "FAILED",
+                   session, result)
+    return {"ok": result["ok"], "result": result}
+
+
+# ------------------------------------------------------------------ V3 阶段 E
+# 搜索监控 / 论文库与下载 / 文件传输 / 执行后端来源标识。
+# 所有接口都走 require_admin，返回前经 _safe_rows() 脱敏；
+# 上游连通性不自动探测，只如实报告「未检测」，避免虚构可达性。
+PAPER_DIR = Path(os.environ.get("MCP_PAPER_DIR", "/workspace/research/papers")).resolve()
+TRANSFER_DIR = Path(os.environ.get("MCP_TRANSFER_DIR", "/workspace/transfers")).resolve()
+
+
+def _limit(request: Request, default: int = 100) -> int:
+    try:
+        return min(500, max(1, int(request.query_params.get("limit", default))))
+    except ValueError:
+        return default
+
+
+def _paper_filters(request: Request) -> dict[str, str]:
+    keys = ("keyword", "project", "tag", "reading_status", "from_year",
+            "to_year", "doi", "identifier", "oa_status")
+    return {k: request.query_params.get(k, "").strip() for k in keys
+            if request.query_params.get(k, "").strip()}
+
+
+def _paper_link_token(paper_id: str, expiry: int) -> str:
+    secret = os.environ.get("ADMIN_SESSION_SECRET", "")
+    payload = f"paper:{paper_id}:{expiry}".encode()
+    return hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()[:32]
+
+
+def _paper_file(paper_id: str) -> Path | None:
+    rows = get_storage()._query(
+        "SELECT file_path FROM paper_library WHERE paper_id=?", [paper_id])
+    raw = (rows[0].get("file_path") if rows else "") or ""
+    if not raw:
+        return None
+    try:
+        path = Path(raw).resolve()
+    except OSError:
+        return None
+    if path != PAPER_DIR and PAPER_DIR not in path.parents:
+        return None
+    return path if path.is_file() else None
+
+
+@app.get("/api/search/events")
+def search_events(request: Request, session: dict = Depends(require_admin)):
+    """结构化检索事件：逐源耗时/成败/条数/限流/缓存命中，均为真实落库数据。"""
+    since, until, label = _range(request)
+    clauses = ["ts >= ?", "ts <= ?"]
+    params: list[Any] = [since, until]
+    for key in ("provider", "status", "tool_name", "client_id"):
+        value = request.query_params.get(key, "").strip()
+        if value:
+            clauses.append(f"{key} = ?")
+            params.append(value)
+    keyword = request.query_params.get("keyword", "").strip()
+    if keyword:
+        clauses.append("(keyword LIKE ? OR query_hash LIKE ?)")
+        params.extend([f"%{keyword}%", f"%{keyword}%"])
+    where = " WHERE " + " AND ".join(clauses)
+    limit = _limit(request)
+    storage = get_storage()
+    rows = _safe_rows(storage._query(
+        f"SELECT * FROM search_events{where} ORDER BY id DESC LIMIT ?",
+        [*params, limit]))
+    matrix = storage._query(
+        "SELECT provider, COUNT(*) AS requests, "
+        "SUM(CASE WHEN status IN ('SUCCESS','OK','success') THEN 1 ELSE 0 END) AS successes, "
+        "SUM(CASE WHEN status IN ('FAILED','ERROR','SOURCE_UNAVAILABLE','failed','error') "
+        "THEN 1 ELSE 0 END) AS failures, "
+        "AVG(duration_ms) AS avg_ms, SUM(result_count) AS results, "
+        "SUM(rate_limited) AS rate_limited, SUM(cached) AS cached "
+        f"FROM search_events{where} GROUP BY provider ORDER BY requests DESC", params)
+    return {
+        "rows": rows, "total": len(rows), "by_provider": matrix,
+        "range": {"label": label, "since": since, "until": until},
+        "coverage_note": "垂直学术源与社区源不等于全网通用搜索；可选 SearXNG/通用源需单独启用，"
+                         "软件免费不等于上游可达。",
+        "upstream": {"status": "未检测",
+                     "note": "后台不自动发起外部请求；上游可达性由独立集成测试记录，"
+                             "此处不虚构探测结果。"},
+        "source_note": "数据来源：审计库 search_events（外部来源的调用结果，已脱敏关键词）",
+    }
+
+
+@app.get("/api/papers")
+def papers(request: Request, session: dict = Depends(require_admin)):
+    from gateway.research.library import list_papers
+
+    filters = _paper_filters(request)
+    rows = _safe_rows(list_papers(filters, _limit(request, 200)))
+    stats = get_storage()._query(
+        "SELECT COUNT(*) AS total, "
+        "SUM(CASE WHEN file_path != '' AND sha256 != '' THEN 1 ELSE 0 END) AS verified, "
+        "SUM(file_size) AS bytes FROM paper_library")
+    stat = stats[0] if stats else {}
+    total, verified = int(stat.get("total") or 0), int(stat.get("verified") or 0)
+    return {
+        "rows": rows, "total": len(rows),
+        "stats": {"total": total, "verified": verified,
+                  "bytes": int(stat.get("bytes") or 0),
+                  "verified_rate": round(verified / total * 100, 1) if total else 0.0},
+        "source_note": "数据来源：本地文献库（审计库 paper_library）+ 容器内已校验 PDF 文件",
+        "ocr_note": "OCR 为可选能力，默认未安装、未启用；扫描版 PDF 需另行处理。",
+        "download_note": "「任务创建成功」不等于「文件最终校验成功」，请查看下载任务面板。",
+    }
+
+
+@app.get("/api/papers/downloads")
+def paper_downloads(request: Request, session: dict = Depends(require_admin)):
+    limit = _limit(request)
+    rows = _safe_rows(get_storage()._query(
+        "SELECT * FROM paper_downloads ORDER BY id DESC LIMIT ?", [limit]))
+    grouped = get_storage()._query(
+        "SELECT status, COUNT(*) AS n FROM paper_downloads GROUP BY status")
+    return {"rows": rows, "total": len(rows),
+            "counts": {str(r["status"]): int(r["n"]) for r in grouped},
+            "note": "created 仅表示任务创建；success 才表示文件通过 %PDF-/EOF/SHA-256 最终校验。",
+            "source_note": "数据来源：审计库 paper_downloads（容器内下载任务）"}
+
+
+@app.get("/api/papers/export")
+def papers_export(request: Request, session: dict = Depends(require_admin)):
+    from gateway.research.library import export_bibliography
+
+    fmt = request.query_params.get("fmt", "bibtex").strip().lower()
+    try:
+        content = export_bibliography(fmt, _paper_filters(request))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    media = {"csv": "text/csv", "json": "application/json"}.get(fmt, "text/plain")
+    filename = f"bibliography.{fmt if fmt != 'bibtex' else 'bib'}"
+    get_storage().add_event("paper_export", status="OK", source="admin",
+                            detail=f"format={fmt} rows_exported")
+    return PlainTextResponse(content, media_type=media + "; charset=utf-8",
+                             headers={"Content-Disposition":
+                                      f'attachment; filename="{filename}"'})
+
+
+@app.get("/api/papers/link")
+def paper_link(request: Request, session: dict = Depends(require_admin)):
+    paper_id = request.query_params.get("paper_id", "").strip()
+    if not paper_id or not _paper_file(paper_id):
+        return {"ok": False, "error": "论文不存在或未通过校验，不生成下载链接"}
+    expiry = int(time.time()) + 600
+    token = _paper_link_token(paper_id, expiry)
+    return {"ok": True, "paper_id": paper_id, "expires_in": 600,
+            "url": f"/api/papers/file?paper_id={urllib.parse.quote(paper_id)}"
+                   f"&exp={expiry}&sig={token}",
+            "note": "短期 HMAC 签名绑定论文 ID 与过期时间；文件不存在时明确失败。"}
+
+
+@app.get("/api/papers/file")
+def paper_file(request: Request):
+    """已校验 PDF 的 Range 下载：有效后台会话或短期 HMAC 签名，二选一。
+
+    刻意不挂 require_admin 依赖，否则纯签名链接会在进入函数前被 401 拦截。
+    二者皆无时明确拒绝，绝不因「已登录过」而放行无效签名。
+    """
+    paper_id = request.query_params.get("paper_id", "").strip()
+    expiry = request.query_params.get("exp", "")
+    signature = request.query_params.get("sig", "")
+    try:
+        exp = int(expiry)
+    except ValueError:
+        exp = 0
+    signed = bool(signature) and exp > time.time() and exp <= time.time() + 3600 \
+        and hmac.compare_digest(signature, _paper_link_token(paper_id, exp))
+    session = _session(request)
+    if not signed and not session:
+        raise HTTPException(status_code=401, detail="签名无效/已过期，且未登录")
+    path = _paper_file(paper_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail="文件不存在、未校验或路径越界")
+    size = path.stat().st_size
+    span = parse_range(request.headers.get("range", ""), size)
+    if span is None:
+        raise HTTPException(status_code=416, detail="Range 不合法")
+    start, end = span
+    partial = request.headers.get("range", "").startswith("bytes=")
+    headers = {"Accept-Ranges": "bytes",
+               "Content-Length": str(end - start + 1),
+               "Content-Disposition": f'attachment; filename="{path.name}"'}
+    if partial:
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    get_storage().add_event(
+        "paper_file_download", status="OK", source="admin",
+        actor_id=f"admin:{(session or {}).get('username', 'signed-link')}",
+        detail=redact_text(f"paper_id={paper_id} bytes={end - start + 1} "
+                           f"range={start}-{end} signed={signed}", limit=300))
+    return StreamingResponse(iter_file(path, start, end),
+                             status_code=206 if partial else 200,
+                             media_type="application/pdf", headers=headers)
+
+
+@app.get("/api/transfers")
+def transfers(request: Request, session: dict = Depends(require_admin)):
+    rows = _safe_rows(get_storage()._query(
+        "SELECT * FROM file_transfers ORDER BY id DESC LIMIT ?", [_limit(request)]))
+    grouped = get_storage()._query(
+        "SELECT status, COUNT(*) AS n FROM file_transfers GROUP BY status")
+    return {"rows": rows, "total": len(rows),
+            "counts": {str(r["status"]): int(r["n"]) for r in grouped},
+            "note": "created 仅表示任务创建；success 表示最终校验/传输成功。",
+            "source_note": "数据来源：审计库 file_transfers（容器内传输）"}
+
+
+@app.get("/api/transfers/link")
+def transfer_link(request: Request, session: dict = Depends(require_admin)):
+    """为已落盘的通用文件生成短期 HMAC 签名下载链接（后台侧）。"""
+    from gateway.transfer.http_api import safe_path, sign_path
+
+    if not os.environ.get("MCP_TRANSFER_SECRET", "").strip():
+        return {"ok": False, "error": "MCP_TRANSFER_SECRET 未配置，拒绝用弱默认密钥签发链接"}
+    raw = request.query_params.get("path", "").strip()
+    path = safe_path(TRANSFER_DIR, raw)
+    if path is None or not path.is_file():
+        return {"ok": False, "error": "文件不存在或路径不在授权传输目录内"}
+    expiry, signature = sign_path(raw, 600)
+    return {"ok": True, "path": str(path), "expires_in": 600,
+            "url": f"/api/transfers/file?path={urllib.parse.quote(raw)}"
+                   f"&exp={expiry}&sig={signature}",
+            "note": "签名绑定原始路径与过期时间；后台只读挂载，不改写网关下载结果。"}
+
+
+@app.get("/api/transfers/file")
+def transfer_file(request: Request):
+    """通用文件 Range 下载：有效后台会话或短期签名，二选一。"""
+    from gateway.transfer.http_api import safe_path, verify_path
+
+    raw = request.query_params.get("path", "").strip()
+    expiry = request.query_params.get("exp", "")
+    signature = request.query_params.get("sig", "")
+    signed = bool(signature) and verify_path(raw, expiry, signature)
+    if not signed and not _session(request):
+        raise HTTPException(status_code=401, detail="签名无效/已过期，且未登录")
+    path = safe_path(TRANSFER_DIR, raw)
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在或路径越界")
+    size = path.stat().st_size
+    span = parse_range(request.headers.get("range", ""), size)
+    if span is None:
+        raise HTTPException(status_code=416, detail="Range 不合法")
+    start, end = span
+    partial = request.headers.get("range", "").startswith("bytes=")
+    headers = {"Accept-Ranges": "bytes", "Content-Length": str(end - start + 1),
+               "Content-Disposition": f'attachment; filename="{path.name}"'}
+    if partial:
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    get_storage().add_event(
+        "transfer_file_download", status="OK", source="admin",
+        detail=redact_text(f"range={start}-{end} signed={signed}", limit=200))
+    return StreamingResponse(iter_file(path, start, end),
+                             status_code=206 if partial else 200,
+                             media_type="application/octet-stream", headers=headers)
+
+
+@app.get("/api/host/status")
+def host_status(session: dict = Depends(require_admin)):
+    from gateway.exec.backends import backend_status
+    from gateway.monitoring.system import SOURCE_LABELS
+
+    info = backend_status()
+    info["source_labels"] = SOURCE_LABELS
+    info["scope_note"] = "容器指标来自容器自身；宿主指标仅在用户显式挂载授权目录并启用 Host Agent 后可用。"
+    return info
+
+
+@app.get("/api/v3/overview")
+def v3_overview(request: Request, session: dict = Depends(require_admin)):
+    """仪表盘单条聚合查询：避免每页 N+1 请求。"""
+    since, until, label = _range(request)
+    storage = get_storage()
+    def _count(table: str, column: str = "ts") -> int:
+        rows = storage._query(
+            f"SELECT COUNT(*) AS n FROM {table} WHERE {column} >= ? AND {column} <= ?",
+            [since, until])
+        return int(rows[0]["n"]) if rows else 0
+
+    def _grouped(table: str, key: str = "status") -> dict[str, int]:
+        rows = storage._query(
+            f"SELECT {key}, COUNT(*) AS n FROM {table} "
+            f"WHERE ts >= ? AND ts <= ? GROUP BY {key}", [since, until])
+        return {str(r[key]): int(r["n"]) for r in rows}
+
+    failed_downloads = _safe_rows(storage._query(
+        "SELECT ts,title,status,error_message,request_id FROM paper_downloads "
+        "WHERE status IN ('failed','error','no_oa','source_unavailable') "
+        "ORDER BY id DESC LIMIT 5"))
+    source_counts = storage._query(
+        "SELECT source, COUNT(*) AS n FROM tool_calls "
+        "WHERE timestamp_start >= ? AND timestamp_start <= ? GROUP BY source",
+        [since, until])
+    return {
+        "range": {"label": label, "since": since, "until": until},
+        "search_events": _count("search_events"),
+        "papers": int(storage._query(
+            "SELECT COUNT(*) AS n FROM paper_library")[0]["n"]),
+        "downloads": _grouped("paper_downloads"),
+        "transfers": _grouped("file_transfers"),
+        "tool_sources": {str(r["source"]): int(r["n"]) for r in source_counts},
+        "recent_failed_downloads": failed_downloads,
+        "audit": storage.health(),
+        "source_note": "全部数据来自共享审计库；标记为外部来源的是上游 API 的调用结果，非本机指标。",
+    }

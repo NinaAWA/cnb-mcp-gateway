@@ -21,11 +21,85 @@ from fastmcp.server.middleware import Middleware
 from fastmcp.tools.base import ToolResult
 
 from .enrich import derive_status, enrich, extract_exit_code, result_text
-from .events import RequestTrace, ToolCallRecord, bind_trace, current_trace, new_trace, utcnow
-from .redaction import fingerprint, redact_json, redact_text
+from .events import (
+    RequestTrace, StrictAuditDenied, ToolCallRecord, bind_trace, current_trace,
+    new_trace, utcnow,
+)
+from .redaction import fingerprint, redact_json, redact_params, redact_text
 from .storage import HIGH_RISK_TOOLS, STRICT, get_storage
 
 _MAX_PREVIEW = 200_000
+_AUDIT_DENIED_MESSAGE = "审计存储不可用，严格审计模式已拒绝执行该高风险操作"
+
+
+def strict_gate(tool_name: str, request_id: str, source: str,
+                storage: Any | None = None) -> None:
+    """MCP / REST / 后台任务共用的唯一严格审计门。
+
+    只有「DB 健康 + 内存缓冲与磁盘 spool 均为空 + RECEIVED 行可读回」才放行。
+    拒绝时先如实写入 DENIED 终态与告警事件，再抛出专用异常。
+    """
+    if not STRICT or tool_name not in HIGH_RISK_TOOLS:
+        return
+    store = storage or get_storage()
+    if store.confirm_persisted(request_id):
+        return
+    store.update_call(request_id, status="DENIED", timestamp_end=utcnow(),
+                      strict_denied=1, error_type="AuditUnavailable",
+                      error_message=_AUDIT_DENIED_MESSAGE)
+    store.add_event("tool_call", status="DENIED", request_id=request_id,
+                    tool_name=tool_name, source=source,
+                    detail=_AUDIT_DENIED_MESSAGE)
+    store.note_strict_violation(request_id, tool_name, "入口")
+    raise StrictAuditDenied(_AUDIT_DENIED_MESSAGE)
+
+
+def _token_expiry() -> str:
+    """从已验证的 Bearer 令牌查询持久化的过期时间（ISO），失败返回空。"""
+    headers = _headers()
+    raw = headers.get("authorization", "")
+    token = raw[7:].strip() if raw.lower().startswith("bearer ") else ""
+    if not token:
+        return ""
+    try:
+        from gateway.oauth.store import get_oauth_store
+        return get_oauth_store().token_expiry_iso(token)
+    except Exception:  # noqa: BLE001 - 审计字段不可用不得影响调用
+        return ""
+
+
+def _insert_redacted(table: str, values: dict[str, Any]) -> bool:
+    """结构化事件的统一写入口：字段与值都经过既有脱敏规则。"""
+    values.setdefault("ts", utcnow())
+    keys = list(values)
+    marks = ",".join("?" for _ in keys)
+    return get_storage()._execute(
+        f"INSERT INTO {table} ({','.join(keys)}) VALUES ({marks})",
+        redact_params([values[k] for k in keys]),
+    )
+
+
+def record_search_event(values: dict[str, Any]) -> bool:
+    return _insert_redacted("search_events", values)
+
+
+def record_download_event(values: dict[str, Any]) -> bool:
+    return _insert_redacted("paper_downloads", values)
+
+
+def record_transfer_event(values: dict[str, Any]) -> bool:
+    return _insert_redacted("file_transfers", values)
+
+
+def record_task_state(values: dict[str, Any]) -> bool:
+    return _insert_redacted("task_state", values)
+
+
+def record_host_event(status: str, *, request_id: str = "", tool_name: str = "",
+                      detail: Any = "") -> None:
+    get_storage().add_event("host_agent", status=status, request_id=request_id,
+                            tool_name=tool_name, source="host-agent",
+                            detail=redact_text(detail, limit=2000))
 
 
 def bind_http_context(scope: dict[str, Any]) -> RequestTrace | None:
@@ -122,18 +196,14 @@ class AuditMiddleware(Middleware):
                           actor_id=trace.actor_id, client_id=trace.client_id,
                           source="mcp", detail={"arguments": redact_json(arguments)[:2000]})
         storage.upsert_session(trace.session_id or trace.request_id,
-                               trace.client_id, trace.declared_client)
+                               trace.client_id, trace.declared_client,
+                               token_expires=_token_expiry())
 
-        # 严格审计：要求 RECEIVED 行确实已持久化（读回确认），而非仅能进入缓冲
-        if STRICT and name in HIGH_RISK_TOOLS and not storage.confirm_persisted(trace.request_id):
-            message = "审计存储不可用，严格审计模式已拒绝执行该高风险操作"
-            record.status, record.strict_denied = "DENIED", 1
-            record.error_type, record.error_message = "AuditUnavailable", message
-            record.timestamp_end = utcnow()
-            storage.insert_call(record)
-            storage.add_event("tool_call", status="DENIED", request_id=trace.request_id,
-                              trace_id=trace.trace_id, tool_name=name, detail=message)
-            return _denied_result(message)
+        # 严格审计门：MCP / REST / 后台共用 strict_gate，判定口径完全一致
+        try:
+            strict_gate(name, trace.request_id, "mcp", storage)
+        except StrictAuditDenied as exc:
+            return _denied_result(str(exc))
 
         storage.update_call(trace.request_id, status="RUNNING")
         result: Any = None
@@ -295,15 +365,18 @@ def trace_call(tool_name: str, arguments: dict[str, Any] | None = None,
         client_id=trace.client_id, actor_id=trace.actor_id,
         declared_client=trace.declared_client, session_id=trace.session_id,
         remote_ip=trace.remote_ip, arguments=redact_json(arguments or {}),
-        status="RUNNING",
+        status="RECEIVED",
     )
     storage.insert_call(record)
-    storage.add_event("tool_call", status="RUNNING", request_id=trace.request_id,
+    storage.add_event("tool_call", status="RECEIVED", request_id=trace.request_id,
                       trace_id=trace.trace_id, tool_name=tool_name,
                       actor_id=trace.actor_id, client_id=trace.client_id,
                       source=source, detail={"arguments": redact_json(arguments or {})[:2000]})
     recorder = CallRecorder(trace.request_id, trace.trace_id, tool_name,
                             arguments or {}, trace)
+    # REST 入口原先直接以 RUNNING 落库、完全绕过严格审计门；此处与 MCP 共用同一判定。
+    strict_gate(tool_name, trace.request_id, source, storage)
+    storage.update_call(trace.request_id, status="RUNNING")
     try:
         yield recorder
     except Exception as exc:  # noqa: BLE001
