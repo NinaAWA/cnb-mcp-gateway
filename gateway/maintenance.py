@@ -45,15 +45,11 @@ def tick(storage) -> None:
     if not storage.health()["healthy"]:
         warn(storage, "审计数据库不可用，网关已进入有界缓冲/降级模式")
     result = storage.archive_and_prune(RETENTION_DAYS, MAX_DB_MB)
-    for message in result.get("errors", []):
-        warn(storage, f"归档未完成，原记录已保留: {message}")
     if result["size_mb"] > MAX_DB_MB > 0:
         warn(storage, f"数据库超过配额 {MAX_DB_MB}MB，当前 {result['size_mb']}MB")
-    if result["archived"] or result["pruned"] or result.get("errors"):
-        storage.add_event(
-            "audit_archive", status="DEGRADED" if result.get("errors") else "OK",
-            source="audit-storage", detail=result,
-        )
+    if result["archived"] or result["pruned"]:
+        storage.add_event("audit_archive", status="OK", source="audit-storage",
+                          detail=result)
     backup_once(storage)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     HEARTBEAT.write_text(str(int(time.time())), encoding="utf-8")

@@ -12,6 +12,7 @@ Bearer/OAuth 令牌的不可逆指纹。
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from contextlib import contextmanager
 from typing import Any, Iterator
@@ -22,10 +23,12 @@ from fastmcp.tools.base import ToolResult
 
 from .enrich import derive_status, enrich, extract_exit_code, result_text
 from .events import RequestTrace, ToolCallRecord, bind_trace, current_trace, new_trace, utcnow
-from .redaction import fingerprint, redact_json, redact_text
+from .redaction import fingerprint, redact_json, redact_structure, redact_text
 from .storage import HIGH_RISK_TOOLS, STRICT, get_storage
 
 _MAX_PREVIEW = 200_000
+# 客户端可伪造 X-Forwarded-For；只有部署在可信反代后才允许据此记录来源 IP。
+TRUST_PROXY = os.environ.get("MCP_TRUST_PROXY", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def bind_http_context(scope: dict[str, Any]) -> RequestTrace | None:
@@ -44,8 +47,8 @@ def bind_http_context(scope: dict[str, Any]) -> RequestTrace | None:
     client_host = ""
     if scope.get("client"):
         client_host = str(scope["client"][0])
-    remote_ip = (headers.get("x-forwarded-for", "").split(",")[0].strip()
-                 or client_host)[:64]
+    forwarded = headers.get("x-forwarded-for", "").split(",")[0].strip() if TRUST_PROXY else ""
+    remote_ip = (forwarded or client_host)[:64]
     trace = new_trace(
         trace_id=headers.get("x-trace-id", ""),
         client_id=client_id,
@@ -124,8 +127,8 @@ class AuditMiddleware(Middleware):
         storage.upsert_session(trace.session_id or trace.request_id,
                                trace.client_id, trace.declared_client)
 
-        # 严格审计：要求 RECEIVED 行确实已持久化（读回确认），而非仅能进入缓冲
-        if STRICT and name in HIGH_RISK_TOOLS and not storage.confirm_persisted(trace.request_id):
+        # 严格审计：高风险操作无法可靠写入时按配置拒绝，而不是静默执行
+        if STRICT and name in HIGH_RISK_TOOLS and not storage.available():
             message = "审计存储不可用，严格审计模式已拒绝执行该高风险操作"
             record.status, record.strict_denied = "DENIED", 1
             record.error_type, record.error_message = "AuditUnavailable", message
@@ -170,7 +173,7 @@ class AuditMiddleware(Middleware):
                 {"request_id": trace.request_id, "trace_id": trace.trace_id,
                  "tool_name": name, "client_id": trace.client_id,
                  "status": status, "error_message": error_message},
-                arguments, text,
+                redact_structure(arguments), safe,
             )
             patch = {
                 "timestamp_end": utcnow(),
@@ -187,8 +190,7 @@ class AuditMiddleware(Middleware):
             for key, value in derived.items():
                 if key != "sub_events" and value not in (None, ""):
                     patch[key] = value
-            if not storage.update_call(trace.request_id, **patch) and STRICT:
-                storage.note_strict_violation(trace.request_id, name, "终态")
+            storage.update_call(trace.request_id, **patch)
             for kind, values in derived.get("sub_events", []):
                 if kind == "git":
                     values["status"] = status
@@ -224,6 +226,7 @@ class CallRecorder:
         self.error_message = ""
         self.result = ""
         self.extra: dict[str, Any] = {}
+        self.blocked = ""  # 严格审计拒绝时由 trace_call 设置，调用方必须据此跳过执行
 
     def set(self, **fields: Any) -> None:
         self.extra.update(fields)
@@ -250,7 +253,7 @@ class CallRecorder:
             {"request_id": self.request_id, "trace_id": self.trace_id,
              "tool_name": self.tool_name, "client_id": self.trace.client_id,
              "status": self.status, "error_message": self.error_message},
-            self.arguments, text,
+            redact_structure(self.arguments), redact_text(text, limit=_MAX_PREVIEW),
         )
         patch = {
             "timestamp_end": utcnow(),
@@ -289,21 +292,29 @@ def trace_call(tool_name: str, arguments: dict[str, Any] | None = None,
     trace = new_trace(**identity)
     bind_trace(trace)
     storage = get_storage()
+    # 与 MCP 入口一致：严格审计模式下，高风险工具在存储不可用时必须拒绝执行。
+    blocked = ""
+    if STRICT and tool_name in HIGH_RISK_TOOLS and not storage.available():
+        blocked = "审计存储不可用，严格审计模式已拒绝执行该高风险操作"
     record = ToolCallRecord(
         request_id=trace.request_id, trace_id=trace.trace_id,
         timestamp_start=trace.started_at, tool_name=tool_name, source=source,
         client_id=trace.client_id, actor_id=trace.actor_id,
         declared_client=trace.declared_client, session_id=trace.session_id,
         remote_ip=trace.remote_ip, arguments=redact_json(arguments or {}),
-        status="RUNNING",
+        status="DENIED" if blocked else "RUNNING",
     )
     storage.insert_call(record)
-    storage.add_event("tool_call", status="RUNNING", request_id=trace.request_id,
+    storage.add_event("tool_call", status="DENIED" if blocked else "RUNNING",
+                      request_id=trace.request_id,
                       trace_id=trace.trace_id, tool_name=tool_name,
                       actor_id=trace.actor_id, client_id=trace.client_id,
-                      source=source, detail={"arguments": redact_json(arguments or {})[:2000]})
+                      source=source,
+                      detail={"arguments": redact_json(arguments or {})[:2000],
+                              **({"reason": blocked} if blocked else {})})
     recorder = CallRecorder(trace.request_id, trace.trace_id, tool_name,
                             arguments or {}, trace)
+    recorder.blocked = blocked
     try:
         yield recorder
     except Exception as exc:  # noqa: BLE001

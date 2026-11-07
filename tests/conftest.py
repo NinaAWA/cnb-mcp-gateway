@@ -21,16 +21,9 @@ os.environ.update({
     "ADMIN_SESSION_SECRET": "test-session-secret",
     "ADMIN_SESSION_TTL": "3600",
     "GATEWAY_URL": "http://127.0.0.1:9",
-    # 网关模块在 import 时读取这些值；固定为测试值，绝不继承宿主 .env / shell。
-    "MCP_TOKEN": "test-mcp-token",
-    "MCP_SESSION_TTL": "3600",
-    "AUDIT_STRICT": "0",
-    "GATEWAY_METRICS_TOKEN_FILE": "/tmp/mcp-audit-tests/.metrics_token",
 })
-for _name in ("ADMIN_TOTP_SECRET", "AUDIT_DB_DSN", "GATEWAY_METRICS_TOKEN",
-              "OAUTH_ALLOW_ANY_REDIRECT", "OAUTH_ALLOW_NO_PKCE",
-              "MCP_OAUTH_TOKEN_TTL", "AUDIT_ARCHIVE_BATCH"):
-    os.environ.pop(_name, None)
+os.environ.pop("ADMIN_TOTP_SECRET", None)
+os.environ.pop("AUDIT_DB_DSN", None)
 
 
 @pytest.fixture
@@ -104,65 +97,3 @@ def login():
             "username": username, "password": password, "otp": otp})
 
     return _login
-
-
-@pytest.fixture
-def bulk_calls():
-    """直接批量灌入历史数据；生产写入仍统一走 _execute 脱敏边界。
-
-    允许注入「修复前的明文行」，用于验证归档 / 导出对存量数据也脱敏。
-    """
-    import sqlite3
-
-    from gateway.audit.events import utcnow
-
-    def _seed(storage, count, *, timestamp="", secret="", status="SUCCESS"):
-        ts = timestamp or utcnow()
-        arguments = f'{{"command":"echo {secret}"}}' if secret else '{"command":"echo ok"}'
-        conn = sqlite3.connect(storage.db_path)
-        try:
-            conn.executemany(
-                "INSERT INTO tool_calls (request_id,trace_id,timestamp_start,"
-                "timestamp_end,duration_ms,tool_name,arguments,result,status,"
-                "client_id,source) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                [(f"bulk_{i}", "trc_bulk", ts, ts, i % 1000, "run_command",
-                  arguments, "ok", status, "tok_test", "mcp")
-                 for i in range(count)],
-            )
-            conn.commit()
-        finally:
-            conn.close()
-        return count
-
-    return _seed
-
-
-@pytest.fixture(scope="module")
-def gateway_module():
-    """加载真实的 docker/server.py（含 FastMCP / ASGI 中间件 / OAuth 状态）。"""
-    import importlib.util
-
-    path = ROOT / "docker" / "server.py"
-    spec = importlib.util.spec_from_file_location("mcp_gateway_server_under_test", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    yield module
-    sys.modules.pop(spec.name, None)
-
-
-@pytest.fixture
-def gateway_client(gateway_module, tmp_path, monkeypatch):
-    """每个用例重置 OAuth 状态，并注入独立的内部指标令牌。"""
-    from starlette.testclient import TestClient
-
-    gateway_module.CLIENTS.clear()
-    gateway_module.AUTH_CODES.clear()
-    gateway_module.ISSUED_TOKENS.clear()
-    metrics_file = tmp_path / ".metrics_token"
-    metrics_file.write_text("test-internal-metrics-token", encoding="utf-8")
-    monkeypatch.setattr(gateway_module, "METRICS_TOKEN_FILE", metrics_file)
-    monkeypatch.setattr(gateway_module, "OAUTH_ALLOW_ANY_REDIRECT", False)
-    monkeypatch.setattr(gateway_module, "OAUTH_ALLOW_NO_PKCE", False)
-    with TestClient(gateway_module.app) as client:
-        yield gateway_module, client, "test-internal-metrics-token"

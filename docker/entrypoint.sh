@@ -18,11 +18,17 @@ case "$ROLE" in
         ADMIN_PASSWORD="$(python -c 'import secrets;print(secrets.token_urlsafe(24))')"
         (umask 077; printf '%s\n' "$ADMIN_PASSWORD" > "$PASS_FILE")
       fi
-      echo "==================================================================="
-      echo " [自动生成] Admin Web 管理员口令（已保存到 $PASS_FILE，重启不变）"
-      echo "   账号: $ADMIN_USERNAME"
-      echo "   密码: $ADMIN_PASSWORD"
-      echo "==================================================================="
+      if [ "${MCP_PRINT_SECRETS:-0}" = "1" ]; then
+        echo "==================================================================="
+        echo " [自动生成] Admin Web 管理员口令（已保存到 $PASS_FILE，重启不变）"
+        echo "   账号: $ADMIN_USERNAME"
+        echo "   密码: $ADMIN_PASSWORD"
+        echo "==================================================================="
+      else
+        echo "[entrypoint] 管理员口令已生成并保存到 $PASS_FILE（默认不写入容器日志）"
+        echo "  读取方式: docker exec cnb-mcp-admin-web cat $PASS_FILE"
+        echo "  如需在日志中显示，可设置 MCP_PRINT_SECRETS=1（仅建议在隔离环境使用）"
+      fi
     fi
     export ADMIN_PASSWORD ADMIN_USERNAME
     echo "[entrypoint] 启动 Admin Web @ ${ADMIN_BIND:-0.0.0.0}:${ADMIN_PORT:-8788}"
@@ -53,21 +59,6 @@ case "$ROLE" in
     exit 1
     ;;
 esac
-
-# 其余角色都在上面 exec 退出，只有 gateway 会执行到这里。
-# 共享 audit-data 卷上的内部只读指标令牌：仅供后台请求 /health/details，
-# 绝不把 MCP_TOKEN（远程 shell 钥匙）交给后台，也不写入 .env 或日志。
-if [ "$ROLE" = "gateway" ]; then
-  METRICS_FILE="${GATEWAY_METRICS_TOKEN_FILE:-/data/audit/.metrics_token}"
-  mkdir -p "$(dirname "$METRICS_FILE")"
-  if [ -n "${GATEWAY_METRICS_TOKEN:-}" ]; then
-    (umask 077; printf '%s\n' "$GATEWAY_METRICS_TOKEN" > "$METRICS_FILE")
-  elif [ ! -s "$METRICS_FILE" ]; then
-    (umask 077; python -c 'import secrets;print(secrets.token_urlsafe(32))' > "$METRICS_FILE")
-    echo "[entrypoint] 已生成内部指标令牌: $METRICS_FILE（0600，仅用于 /health/details）"
-  fi
-  chmod 600 "$METRICS_FILE"
-fi
 
 PORT="${MCP_PORT:-8765}"
 BIND="${MCP_BIND:-127.0.0.1}"
@@ -105,13 +96,40 @@ mkdir -p "$WORKDIR"
 
 # 密钥：未提供则随机生成（容器重建会变化，请从 docker logs 记录）
 if [ -z "${MCP_TOKEN:-}" ]; then
-  MCP_TOKEN="$(python -c 'import secrets,string;print("".join(secrets.choice(string.ascii_letters+string.digits) for _ in range(48)))')"
-  echo "==================================================================="
-  echo " [自动生成] MCP_TOKEN（重开容器会变化，请妥善保存）:"
-  echo "   $MCP_TOKEN"
-  echo "==================================================================="
+  MCP_TOKEN="$(python -c 'import secrets,string;print("".join(secrets.choice(string.ascii_letters+digits) for _ in range(48)))')"
+  if [ "${MCP_PRINT_SECRETS:-0}" = "1" ]; then
+    echo "==================================================================="
+    echo " [自动生成] MCP_TOKEN（重开容器会变化，请妥善保存）:"
+    echo "   $MCP_TOKEN"
+    echo "==================================================================="
+  else
+    echo "[entrypoint] 已生成 MCP_TOKEN 并写入 /app/.env（默认不写入容器日志）"
+    echo "  读取方式: docker exec cnb-mcp-gateway cat /app/.env"
+  fi
 fi
 export MCP_TOKEN MCP_PORT="$PORT" MCP_BIND="$BIND" MCP_WORKDIR="$WORKDIR" MCP_ALLOWED_PREFIXES="$ALLOWED"
+
+# 自动生成的令牌同步到共享卷，管理后台才能读取需鉴权的 /internal/metrics。
+# 单容器模式没有该挂载点，跳过即可。
+if [ -d /data/audit ]; then
+  (umask 077; printf '%s\n' "$MCP_TOKEN" > /data/audit/.mcp_token)
+fi
+
+# 容器内没有宿主机 /etc/gitconfig：显式提供 Git 身份与凭据，
+# 否则 git_commit 会报 "Please tell me who you are"、git_push 无法通过远端认证。
+# 凭据请通过只读卷挂载文件，绝不要放进环境变量、命令参数或日志。
+if [ -z "${GIT_CREDENTIALS_FILE:-}" ] && [ -f /root/.git-credentials ]; then
+  GIT_CREDENTIALS_FILE=/root/.git-credentials
+fi
+if [ -n "${GIT_USER_NAME:-}" ]; then
+  git config --global user.name "$GIT_USER_NAME"
+fi
+if [ -n "${GIT_USER_EMAIL:-}" ]; then
+  git config --global user.email "$GIT_USER_EMAIL"
+fi
+if [ -n "${GIT_CREDENTIALS_FILE:-}" ] && [ -f "$GIT_CREDENTIALS_FILE" ]; then
+  git config --global credential.helper "store --file=$GIT_CREDENTIALS_FILE"
+fi
 
 # 写 .env 供 server.py 加载；可选变量只在显式配置时写入，
 # 这样未配置的项会回落到 server.py 的默认值而不是空字符串。
@@ -168,8 +186,13 @@ else
     echo " ChatGPT 插件 OpenAPI 清单:"
     echo "   $URL/openapi.yaml"
     echo "   $URL/.well-known/ai-plugin.json"
-    echo " 密钥 (MCP_TOKEN):"
-    echo "   $MCP_TOKEN"
+    if [ "${MCP_PRINT_SECRETS:-0}" = "1" ]; then
+      echo " 密钥 (MCP_TOKEN):"
+      echo "   $MCP_TOKEN"
+    else
+      echo " 密钥 (MCP_TOKEN): 已写入 /app/.env，默认不在日志打印"
+      echo "   docker exec cnb-mcp-gateway cat /app/.env"
+    fi
     echo ""
     echo " 用法: ChatGPT 上传插件包(zip) 或 添加自定义 MCP 服务器 ${URL}/mcp"
     echo "       密钥在安装/连接时粘贴上面的 MCP_TOKEN"

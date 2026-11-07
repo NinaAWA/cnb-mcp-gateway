@@ -1,0 +1,13 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+exclude = [".git", ".venv", "node_modules"]
+
+[tool.ruff.lint]
+# 先只拦截语法级错误、未定义名等硬错误，避免历史代码风格问题阻塞 CI
+select = ["E9", "F63", "F7", "F82"]

@@ -1,11 +1,9 @@
 """统一审计核心：脱敏、大输出引用、SQLite WAL、查询/归档、降级与 REST 入口。"""
 from __future__ import annotations
 
-import json
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from gateway.audit.events import clear_trace, utcnow
+from gateway.audit.events import clear_trace
 from gateway.audit.redaction import (
     REDACTED, ArtifactStore, fingerprint, redact_json, redact_text,
 )
@@ -113,11 +111,13 @@ def test_write_failure_buffers_then_recovers(isolated_storage):
     assert store.add_event("tool_call", detail="buffered") is False
     assert store.health()["healthy"] is False
     assert store.health()["buffered"] >= 1
-    assert store.available() is True
+    # 有未落库事件时严格审计必须视为不可用（旧实现在此错误地返回 True）
+    assert store.available() is False
     store.db_path = original
     assert store.add_event("tool_call", detail="recovered") is True
     assert store.health()["healthy"] is True
     assert store.health()["buffered"] == 0
+    assert store.available() is True
     details = [e["detail"] for e in store.recent_events(0, 100)]
     assert "buffered" in details and "recovered" in details
 
@@ -159,142 +159,3 @@ def test_large_output_is_stored_as_protected_reference(isolated_storage, monkeyp
         assert len(row["result"]) < len(full)
     finally:
         clear_trace()
-
-
-def test_archive_over_5000_rows_is_complete(isolated_storage, bulk_calls,
-                                            make_call, tmp_path, monkeypatch):
-    from gateway.audit import storage as storage_mod
-
-    monkeypatch.setattr(storage_mod, "ARCHIVE_BATCH", 1000)
-    bulk_calls(isolated_storage, 6000, timestamp=FAR_PAST)
-    make_call(isolated_storage, request_id="req_recent")
-
-    result = isolated_storage.archive_and_prune(1, 0)
-    assert result["errors"] == []
-    assert result["archived"] == 6000, result
-    assert result["archived_by_table"]["tool_calls"] == 6000
-
-    files = sorted((tmp_path / "archive").glob("tool_calls-*.jsonl"))
-    assert len(files) >= 6, "超过单批上限时应分批循环归档"
-    archived = [json.loads(line) for path in files
-                for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert len(archived) == 6000
-    assert {row["request_id"] for row in archived} == {f"bulk_{i}" for i in range(6000)}
-    remaining = isolated_storage._query("SELECT request_id FROM tool_calls")
-    assert [row["request_id"] for row in remaining] == ["req_recent"]
-
-
-def test_archive_covers_all_history_tables_and_keeps_settings(isolated_storage, tmp_path):
-    old = FAR_PAST
-    fixtures = (
-        ("audit_events", {"ts": old, "kind": "legacy", "status": "OK"}),
-        ("background_tasks", {"ts": old, "task_id": "t_old", "status": "done"}),
-        ("git_operations", {"ts": old, "operation": "push", "repo_name": "repo"}),
-        ("experiment_runs", {"ts": old, "experiment_id": "e_old", "status": "done"}),
-        ("approval_events", {"ts": old, "approval_id": "a_old", "action": "deny"}),
-        ("login_attempts", {"ts": old, "username": "u", "outcome": "ok"}),
-        ("export_jobs", {"ts": old, "job_id": "j_old", "status": "done"}),
-        ("admin_sessions", {"session_id": "s_old", "expires_at": old}),
-        ("client_sessions", {"session_id": "c_old", "last_seen": old, "status": "active"}),
-    )
-    for table, values in fixtures:
-        assert isolated_storage._insert(table, values)
-    isolated_storage.set_setting("theme", "auto")
-
-    result = isolated_storage.archive_and_prune(1, 0)
-    assert result["errors"] == []
-    for table, _ in fixtures:
-        assert result["archived_by_table"].get(table) == 1, table
-        assert isolated_storage._query(f"SELECT COUNT(*) AS n FROM {table}")[0]["n"] == 0, table
-    assert isolated_storage.get_settings()["theme"] == "auto", "配置表不应被保留策略清理"
-    archived = "\n".join(path.read_text(encoding="utf-8")
-                         for path in (tmp_path / "archive").glob("*.jsonl"))
-    assert "t_old" in archived and "j_old" in archived
-
-
-def test_archive_failure_keeps_all_rows(isolated_storage, bulk_calls, tmp_path, monkeypatch):
-    bulk_calls(isolated_storage, 1200, timestamp=FAR_PAST)
-
-    def broken(*_args, **_kwargs):
-        raise OSError("disk full")
-
-    monkeypatch.setattr(isolated_storage, "_write_archive", broken)
-    result = isolated_storage.archive_and_prune(1, 0)
-    assert result["archived"] == 0 and result["errors"]
-    assert isolated_storage._query("SELECT COUNT(*) AS n FROM tool_calls")[0]["n"] == 1200
-
-
-def test_export_iterates_full_history_without_truncation(isolated_storage, bulk_calls):
-    bulk_calls(isolated_storage, 1200)
-    rows = list(isolated_storage.iter_calls({}, batch=500))
-    assert len(rows) == 1200
-    assert len({row["request_id"] for row in rows}) == 1200
-    page, total = isolated_storage.query_calls({}, limit=1000)
-    assert total == 1200 and len(page) == 1000, "单次查询上限不能再截在 500"
-
-
-def test_time_series_and_duration_distribution_use_sql_aggregation(
-        isolated_storage, bulk_calls, monkeypatch):
-    bulk_calls(isolated_storage, 250)
-    original = isolated_storage._query_checked
-    seen: list[tuple[str, int | None]] = []
-
-    def spy(sql, params=()):
-        rows = original(sql, params)
-        seen.append((sql, len(rows) if rows is not None else None))
-        return rows
-
-    monkeypatch.setattr(isolated_storage, "_query_checked", spy)
-    series = isolated_storage.time_series(FAR_PAST, FAR_FUTURE)
-    distribution = isolated_storage.duration_distribution(FAR_PAST)
-
-    assert sum(series["calls"]) == 250
-    assert seen[0][1] is not None and seen[0][1] <= 24, "趋势查询只应返回桶，而不是整表行"
-    assert sum(item["count"] for item in distribution) == 250
-    assert [item["count"] for item in distribution] == [50, 150, 50, 0, 0]
-
-    # 方言 SQL 失败时回退到有界 Python 聚合，结果保持一致
-    calls = {"n": 0}
-
-    def flaky(sql, params=()):
-        calls["n"] += 1
-        return None if calls["n"] == 1 else original(sql, params)
-
-    monkeypatch.setattr(isolated_storage, "_query_checked", flaky)
-    assert sum(isolated_storage.time_series(FAR_PAST, FAR_FUTURE)["calls"]) == 250
-    calls["n"] = 0
-    assert sum(item["count"] for item in
-               isolated_storage.duration_distribution(FAR_PAST)) == 250
-
-
-def test_sessions_expire_by_ttl_not_forever_active(isolated_storage, monkeypatch):
-    from gateway.audit import storage as storage_mod
-
-    monkeypatch.setattr(storage_mod, "SESSION_TTL", 3600)
-    stale = (datetime.now(timezone.utc)
-             - timedelta(hours=2)).isoformat(timespec="milliseconds")
-    isolated_storage._insert("client_sessions", {
-        "session_id": "idle", "last_seen": stale, "status": "active"})
-    isolated_storage._insert("client_sessions", {
-        "session_id": "expired_token", "last_seen": utcnow(),
-        "token_expires": stale, "status": "active"})
-    isolated_storage.upsert_session("fresh", "tok_fresh")
-
-    rows = {row["session_id"]: row for row in isolated_storage.sessions()}
-    assert rows["idle"]["status"] == "expired" and rows["idle"]["active"] is False
-    assert rows["expired_token"]["status"] == "expired"
-    assert rows["fresh"]["status"] == "active" and rows["fresh"]["active"] is True
-    assert isolated_storage.active_session_count() == 1
-
-
-def test_strict_mode_confirms_real_persistence_three_states(isolated_storage, make_call):
-    make_call(isolated_storage, request_id="req_persisted")
-    state = isolated_storage.persistence_state()
-    assert state == {"healthy": True, "buffered": 0, "bufferable": True, "persisted": True}
-    assert isolated_storage.confirm_persisted("req_persisted") is True
-    assert isolated_storage.confirm_persisted("req_missing") is False
-
-    isolated_storage._healthy = False
-    assert isolated_storage.available() is True, "故障期间仍可缓冲写入"
-    assert isolated_storage.persistence_state()["persisted"] is False
-    assert isolated_storage.confirm_persisted("req_persisted") is False

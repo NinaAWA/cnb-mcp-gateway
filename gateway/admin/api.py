@@ -16,6 +16,7 @@ import os
 import re
 import threading
 import time
+import urllib.parse
 import urllib.request
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -31,8 +32,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from gateway.audit.redaction import redact_structure, redact_text
-from gateway.audit.storage import SESSION_TTL, get_storage
+from gateway.audit.redaction import redact_text
+from gateway.audit.storage import get_storage
 from gateway.monitoring.system import collect
 from .auth import COOKIE_NAME, get_auth
 
@@ -41,18 +42,23 @@ GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://mcp-gateway:8765").rstrip("/
 EXPORT_DIR = Path(os.environ.get("AUDIT_EXPORT_DIR", "/data/audit/exports"))
 TASK_LOG_DIR = Path(os.environ.get("MCP_TASK_LOG_DIR", "/tmp/mcp_tasks")).resolve()
 COOKIE_SECURE = os.environ.get("ADMIN_COOKIE_SECURE", "0").strip().lower() in ("1", "true", "yes")
-METRICS_TOKEN_FILE = Path(
-    os.environ.get("GATEWAY_METRICS_TOKEN_FILE", "/data/audit/.metrics_token"))
+# 默认不信任客户端自报的 X-Forwarded-For；只有部署在可信反向代理后才开启。
+TRUST_PROXY = os.environ.get("ADMIN_TRUST_PROXY", "0").strip().lower() in ("1", "true", "yes", "on")
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     auth = get_auth()
     if auth.generated_password:
-        print("=" * 70, flush=True)
-        print(" [自动生成] Admin Web 管理员密码（未配置 ADMIN_PASSWORD 时随机生成）:", flush=True)
-        print(f"   账号: {auth.username}", flush=True)
-        print(f"   密码: {auth.generated_password}", flush=True)
-        print("=" * 70, flush=True)
+        show = os.environ.get("MCP_PRINT_SECRETS", "0").strip().lower() in ("1", "true", "yes", "on")
+        if show:
+            print("=" * 70, flush=True)
+            print(" [自动生成] Admin Web 管理员密码（未配置 ADMIN_PASSWORD 时随机生成）:", flush=True)
+            print(f"   账号: {auth.username}", flush=True)
+            print(f"   密码: {auth.generated_password}", flush=True)
+            print("=" * 70, flush=True)
+        else:
+            print("[admin] 已生成管理员口令并持久化，默认不写入容器日志；"
+                  "请从 ADMIN_PASSWORD_FILE 读取（或设置 MCP_PRINT_SECRETS=1）", flush=True)
     get_storage().add_event("admin_service", status="UP", source="admin",
                             detail="管理后台已启动")
     yield
@@ -60,6 +66,39 @@ async def _lifespan(_app: FastAPI):
 
 app = FastAPI(title="MCP Admin Dashboard", docs_url=None, redoc_url=None,
               openapi_url=None, lifespan=_lifespan)
+
+
+class CSRFGuard:
+    """管理端写操作的跨站防护（SameSite=Lax 的补充）。
+
+    使用纯 ASGI 而非 @app.middleware("http") 的 BaseHTTPMiddleware，
+    避免缓冲响应体、破坏 /api/live/stream 的 SSE 事件流。
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and scope.get("method") not in ("GET", "HEAD", "OPTIONS"):
+            headers = {
+                key.decode("latin-1").lower(): value.decode("latin-1")
+                for key, value in scope.get("headers", [])
+            }
+            origin = headers.get("origin", "")
+            host = headers.get("host", "")
+            blocked = bool(origin) and urllib.parse.urlsplit(origin).netloc != host
+            if not origin and headers.get("sec-fetch-site") in ("cross-site", "same-site"):
+                blocked = True
+            if blocked:
+                response = JSONResponse({"detail": "跨站请求被拒绝"}, status_code=403)
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(CSRFGuard)
+
+
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
@@ -75,23 +114,26 @@ CONFIG_WHITELIST = (
     "MCP_SEARCH_TIMEOUT", "MCP_SEARCH_MAX_RESULTS", "MCP_SEARCH_RETRIES",
     "MCP_SEARCH_CACHE_TTL", "MCP_SEARCH_ARXIV_MIN_INTERVAL",
     "MCP_SEARCH_WEB_PROVIDERS", "MCP_SEARCH_FETCH_ENABLED",
+    "MCP_OAUTH_REQUIRE_PKCE", "MCP_TRUST_PROXY", "ADMIN_TRUST_PROXY",
+    "MCP_GIT_EXTRA_SUBCOMMANDS",
     "AUDIT_STRICT", "AUDIT_RETENTION_DAYS", "AUDIT_MAX_DB_MB",
-    "AUDIT_ARCHIVE_BATCH", "AUDIT_BUFFER_MAX", "MCP_SESSION_TTL",
-    "MCP_OAUTH_TOKEN_TTL", "OAUTH_ALLOW_ANY_REDIRECT", "OAUTH_ALLOW_NO_PKCE",
     "ADMIN_SESSION_TTL", "ADMIN_LOGIN_MAX_FAILURES", "ADMIN_LOGIN_LOCK_MINUTES",
 )
 SENSITIVE_CONFIG = (
     "MCP_TOKEN", "ADMIN_PASSWORD", "ADMIN_SESSION_SECRET", "ADMIN_TOTP_SECRET",
     "CF_TUNNEL_TOKEN", "MCP_SEARCH_TAVILY_KEY", "MCP_SEARCH_MAILTO",
-    "MCP_SEARCH_SEARXNG_URL", "AUDIT_DB_DSN", "GATEWAY_METRICS_TOKEN",
+    "MCP_SEARCH_SEARXNG_URL", "AUDIT_DB_DSN",
 )
 EDITABLE_SETTINGS = ("default_range", "page_size", "theme")
 
 
 # --------------------------------------------------------------------- auth
 def _ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-    return (forwarded or (request.client.host if request.client else "unknown"))[:64]
+    direct = request.client.host if request.client else "unknown"
+    if TRUST_PROXY:
+        forwarded = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        return (forwarded or direct)[:64]
+    return direct[:64]
 
 
 def _session(request: Request) -> dict[str, Any] | None:
@@ -205,42 +247,34 @@ def _range(request: Request) -> tuple[str, str, str]:
     return (now - timedelta(hours=hours)).isoformat(), now.isoformat(), label
 
 
-def _metrics_token() -> str:
-    """内部只读指标令牌：优先环境变量，其次共享卷文件；绝不使用 MCP_TOKEN。"""
-    configured = os.environ.get("GATEWAY_METRICS_TOKEN", "").strip()
-    if configured:
-        return configured
-    try:
-        return METRICS_TOKEN_FILE.read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
+def _gateway_token() -> str:
+    """优先用环境变量；网关自动生成令牌时会同步到共享卷。"""
+    token = os.environ.get("MCP_TOKEN", "").strip()
+    if not token:
+        try:
+            token = Path("/data/audit/.mcp_token").read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+    return token
 
 
 def _gateway_health() -> dict[str, Any]:
-    """先取需鉴权的完整详情；令牌缺失或鉴权失败时降级到最小化的 /health。"""
-    fallback_reason = "缺少内部指标令牌"
-    token = _metrics_token()
+    """优先用 MCP_TOKEN 读取需鉴权的内部指标；公网 /health 只保留最小存活状态。"""
+    token = _gateway_token()
+    candidates = []
     if token:
-        request = urllib.request.Request(
-            GATEWAY_URL + "/health/details",
-            headers={"Authorization": f"Bearer {token}"},
-        )
+        candidates.append((GATEWAY_URL + "/internal/metrics",
+                           {"Authorization": f"Bearer {token}"}))
+    candidates.append((GATEWAY_URL + "/health", {}))
+    last_error = ""
+    for url, headers in candidates:
         try:
+            request = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(request, timeout=2) as resp:
-                data = json.loads(resp.read().decode("utf-8", "replace"))
-            data["detail_level"] = "full"
-            return data
+                return json.loads(resp.read().decode("utf-8", "replace"))
         except Exception as exc:  # noqa: BLE001
-            fallback_reason = f"详情接口不可用: {exc!r}"[:200]
-    try:
-        with urllib.request.urlopen(GATEWAY_URL + "/health", timeout=2) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
-        data["detail_level"] = "minimal"
-        data["detail_fallback"] = fallback_reason
-        return data
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "down", "error": repr(exc)[:200], "source": "mcp-gateway",
-                "detail_level": "minimal", "detail_fallback": fallback_reason}
+            last_error = repr(exc)[:200]
+    return {"status": "down", "error": last_error, "source": "mcp-gateway"}
 
 
 def _filters(request: Request) -> dict[str, Any]:
@@ -249,11 +283,6 @@ def _filters(request: Request) -> dict[str, Any]:
                "file_path")
     return {key: request.query_params[key] for key in allowed
             if request.query_params.get(key)}
-
-
-def _safe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """读取侧兜底：修复前落库的存量明文行也不会经后台接口外泄。"""
-    return [redact_structure(row) for row in rows]
 
 
 # ------------------------------------------------------------------ dashboard
@@ -266,9 +295,7 @@ def dashboard(request: Request, session: dict = Depends(require_admin)):
     gateway = _gateway_health()
     monitoring = collect("admin-container")
     monitoring["gateway_metrics"] = gateway.get("metrics")
-    monitoring["gateway_metrics_source"] = (
-        "mcp-gateway 容器（来自 /health/details，需鉴权）" if gateway.get("detail_level") == "full"
-        else "详情接口不可用，已降级到最小化 /health")
+    monitoring["gateway_metrics_source"] = "mcp-gateway 容器（来自 /health）"
     return {
         "range": {"label": label, "since": since, "until": until},
         "gateway": {
@@ -283,7 +310,7 @@ def dashboard(request: Request, session: dict = Depends(require_admin)):
         "last_24h": storage.stats(
             (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(), until)["total"],
         "active_tasks": storage.active_tasks(),
-        "active_sessions": storage.active_session_count(),
+        "active_sessions": sum(1 for s in storage.sessions() if s["status"] == "active"),
         "time_series": storage.time_series(since, until),
         "duration_distribution": storage.duration_distribution(since),
         "monitoring": monitoring,
@@ -314,7 +341,7 @@ def calls(request: Request, session: dict = Depends(require_admin)):
     sort = request.query_params.get("sort", "timestamp_start")
     rows, total = storage.query_calls(_filters(request), limit=limit,
                                       offset=offset, order=order, sort=sort)
-    return {"rows": _safe_rows(rows), "total": total, "limit": limit, "offset": offset}
+    return {"rows": rows, "total": total, "limit": limit, "offset": offset}
 
 
 @app.get("/api/calls/{request_id}")
@@ -325,14 +352,15 @@ def call_detail(request_id: str, session: dict = Depends(require_admin)):
         raise HTTPException(status_code=404, detail="记录不存在")
     result = row.get("result", "")
     if row.get("result_ref"):
-        full = storage.artifacts.read(row["result_ref"])
+        full = storage.artifacts.read(row["result_ref"],
+                                      expected_sha256=row.get("result_sha256", ""))
         if full is not None:
-            result = full
+            result = redact_text(full)
     related_tasks = storage.tasks(task_id=row.get("task_id", "")) if row.get("task_id") else []
     git = storage.git_for_request(request_id)
     experiments = storage.experiments_for_request(request_id, row.get("task_id", ""))
     return {
-        "call": {**redact_structure(row), "result": redact_text(result)},
+        "call": {**row, "result": result},
         "timeline": storage.call_timeline(request_id, row.get("trace_id", "")),
         "tasks": related_tasks, "git": git, "experiments": experiments,
         "source_note": "参数与输出已脱敏；大输出以受保护引用保存。",
@@ -342,9 +370,10 @@ def call_detail(request_id: str, session: dict = Depends(require_admin)):
 @app.get("/api/live/recent")
 def live_recent(request: Request, session: dict = Depends(require_admin)):
     after = int(request.query_params.get("after", "0"))
-    events = get_storage().recent_events(after, 100)
-    return {"events": _safe_rows(events),
-            "last_id": events[-1]["id"] if events else after}
+    storage = get_storage()
+    # 首屏展示最新事件；after>0 时仍按 id 升序追赶，供 SSE 增量使用
+    events = storage.latest_events(100) if after <= 0 else storage.recent_events(after, 100)
+    return {"events": events, "last_id": events[-1]["id"] if events else after}
 
 
 @app.get("/api/live/stream")
@@ -363,10 +392,9 @@ async def live_stream(request: Request, session: dict = Depends(require_admin)):
             for event in events:
                 last = event["id"]
                 if event["kind"] in ("tool_call", "task_lifecycle", "admin_auth"):
-                    safe = redact_structure(event)
                     yield "data: " + json.dumps(
                         {k: str(v) if not isinstance(v, (int, float, bool, type(None))) else v
-                         for k, v in safe.items()}, ensure_ascii=False
+                         for k, v in event.items()}, ensure_ascii=False
                     ) + "\n\n"
             if not events:
                 yield ": keepalive\n\n"
@@ -381,13 +409,12 @@ async def live_stream(request: Request, session: dict = Depends(require_admin)):
 
 @app.get("/api/git")
 def git_ops(request: Request, session: dict = Depends(require_admin)):
-    return {"rows": _safe_rows(get_storage().git_ops(
-        request.query_params.get("repo", ""), 200))}
+    return {"rows": get_storage().git_ops(request.query_params.get("repo", ""), 200)}
 
 
 @app.get("/api/experiments")
 def experiments(session: dict = Depends(require_admin)):
-    return {"rows": _safe_rows(get_storage().experiments(200))}
+    return {"rows": get_storage().experiments(200)}
 
 
 @app.get("/api/experiments/{task_id}/logs")
@@ -404,23 +431,20 @@ def experiment_logs(task_id: str, request: Request,
     tail = min(2000, max(10, int(request.query_params.get("tail", "300"))))
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-tail:]
-        return {"log": redact_text("\n".join(lines)), "path": str(path)}
+        return {"log": "\n".join(lines), "path": str(path)}
     except OSError as exc:
         return {"log": f"(读取失败: {exc})"}
 
 
 @app.get("/api/tasks")
 def tasks(session: dict = Depends(require_admin)):
-    return {"rows": _safe_rows(get_storage().tasks(200))}
+    return {"rows": get_storage().tasks(200)}
 
 
 @app.get("/api/clients")
 def clients(session: dict = Depends(require_admin)):
-    """客户端列表：只显示令牌指纹；活跃数按空闲/令牌有效期实时统计。"""
-    storage = get_storage()
-    rows = storage.sessions(200)
-    return {"rows": rows, "active": sum(1 for r in rows if r["active"]),
-            "total": len(rows), "ttl_seconds": SESSION_TTL}
+    """客户端列表：只显示令牌指纹，绝不显示明文 Token。"""
+    return {"rows": get_storage().sessions(200)}
 
 
 @app.get("/api/sessions")
@@ -491,9 +515,20 @@ def _csv_row(row: dict[str, Any]) -> dict[str, str]:
             for k, v in row.items()}
 
 
-def _safe_export_row(row: dict[str, Any]) -> dict[str, Any]:
-    """兼容修复前落库的历史行：所有导出都再走一次统一脱敏入口。"""
-    return redact_structure(row)
+def _serialize(rows: list[dict[str, Any]], fmt: str) -> tuple[str, str]:
+    if fmt == "json":
+        return json.dumps(rows, ensure_ascii=False, indent=2, default=str), "application/json"
+    if fmt == "jsonl":
+        return ("\n".join(json.dumps(r, ensure_ascii=False, default=str) for r in rows)
+                + ("\n" if rows else "")), "application/x-ndjson"
+    if fmt == "csv":
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=EXPORT_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(_csv_row(row))
+        return buf.getvalue(), "text/csv; charset=utf-8"
+    raise ValueError("fmt 只能是 csv / json / jsonl")
 
 
 def _run_export(job_id: str, filters: dict[str, Any], fmt: str) -> None:
@@ -507,21 +542,19 @@ def _run_export(job_id: str, filters: dict[str, Any], fmt: str) -> None:
             if fmt == "csv":
                 writer = csv.DictWriter(fh, fieldnames=EXPORT_COLUMNS, extrasaction="ignore")
                 writer.writeheader()
-                for raw in storage.iter_calls(filters, batch=1000):
-                    writer.writerow(_csv_row(_safe_export_row(raw)))
+                for row in storage.iter_calls(filters, batch=1000):
+                    writer.writerow(_csv_row(row))
                     count += 1
             elif fmt == "json":
                 fh.write("[\n")
-                for raw in storage.iter_calls(filters, batch=1000):
+                for row in storage.iter_calls(filters, batch=1000):
                     fh.write((",\n" if count else "") +
-                             json.dumps(_safe_export_row(raw), ensure_ascii=False,
-                                        indent=2, default=str))
+                             json.dumps(row, ensure_ascii=False, indent=2, default=str))
                     count += 1
                 fh.write("\n]\n")
             else:
-                for raw in storage.iter_calls(filters, batch=1000):
-                    fh.write(json.dumps(_safe_export_row(raw), ensure_ascii=False,
-                                        default=str) + "\n")
+                for row in storage.iter_calls(filters, batch=1000):
+                    fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
                     count += 1
         os.chmod(path, 0o600)
         storage.set_export(job_id, status="done", row_count=count, file_path=str(path))
@@ -596,49 +629,18 @@ def download_export(job_id: str, request: Request):
 
 @app.get("/api/export/stream")
 def export_stream(request: Request, session: dict = Depends(require_admin)):
-    """流式直接下载：内存 O(批)，不再一次性把全部历史读入列表。"""
+    """小数据量直接下载，同样遵守筛选与脱敏策略。"""
     fmt = request.query_params.get("fmt", "csv")
-    if fmt not in ("csv", "json", "jsonl"):
-        raise HTTPException(status_code=400, detail="fmt 只能是 csv / json / jsonl")
-    filters = _filters(request)
-    counter = {"rows": 0}
-
-    def generate():
-        storage = get_storage()
-        if fmt == "csv":
-            buf = io.StringIO()
-            writer = csv.DictWriter(buf, fieldnames=EXPORT_COLUMNS,
-                                    extrasaction="ignore")
-            writer.writeheader()
-            yield buf.getvalue()
-            for raw in storage.iter_calls(filters, batch=500):
-                buf.seek(0)
-                buf.truncate(0)
-                writer.writerow(_csv_row(_safe_export_row(raw)))
-                counter["rows"] += 1
-                yield buf.getvalue()
-        elif fmt == "json":
-            yield "[\n"
-            first = True
-            for raw in storage.iter_calls(filters, batch=500):
-                yield ("" if first else ",\n") + json.dumps(
-                    _safe_export_row(raw), ensure_ascii=False, indent=2, default=str)
-                first = False
-                counter["rows"] += 1
-            yield "\n]\n"
-        else:
-            for raw in storage.iter_calls(filters, batch=500):
-                yield json.dumps(_safe_export_row(raw), ensure_ascii=False,
-                                 default=str) + "\n"
-                counter["rows"] += 1
-        storage.add_event("admin_export", status="DIRECT", source="admin",
-                          actor_id=f"admin:{session['username']}",
-                          detail=f"fmt={fmt} rows={counter['rows']}")
-
-    media = {"csv": "text/csv; charset=utf-8", "json": "application/json",
-             "jsonl": "application/x-ndjson"}[fmt]
+    try:
+        rows = list(get_storage().iter_calls(_filters(request), batch=1000))
+        text, media = _serialize(rows, fmt)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    get_storage().add_event("admin_export", status="DIRECT", source="admin",
+                            actor_id=f"admin:{session['username']}",
+                            detail=f"fmt={fmt} rows={len(rows)}")
     return StreamingResponse(
-        generate(), media_type=media,
+        iter([text]), media_type=media,
         headers={"Content-Disposition": f'attachment; filename="mcp-calls.{fmt}"'},
     )
 

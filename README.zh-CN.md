@@ -18,7 +18,7 @@
 
 - **通用 MCP**：支持所有会说 MCP 的客户端：
   - **Bearer 直连（最简单）**：向 `/mcp` 发送 `Authorization: Bearer <MCP_TOKEN>`，无需 OAuth 往返。适用于 Claude Desktop / Cursor / VS Code / 各类 SDK。
-  - **OAuth 2.1（PKCE + DCR）**：给只支持 OAuth 的客户端（如 ChatGPT 连接器）用。`redirect_uri` 接受任意合法的绝对 URI（`https://`、`http://`、自定义 scheme），不会把非 ChatGPT 的 agent 挡在门外。
+  - **OAuth 2.1（PKCE + DCR）**：给只支持 OAuth 的客户端（如 ChatGPT 连接器）用。默认强制 S256 PKCE；`redirect_uri` 必须与 DCR 注册值精确一致，未注册客户端只接受 HTTPS 或本机回环 HTTP（自定义 scheme 需先 `/register` 注册），避免授权码被重定向到任意地址。
 - **远程管理工具集（灵感来自 Remote Desktop Commander，但适配 Linux）**——真正像 RDC 一样跑实验、配环境、看数据与图片：
   - `run_command` —— 执行 shell 命令（默认**开放**；破坏性命令需要 `confirm=true`；毁灭级命令被安全网**硬禁止**）。
   - `run_command_background` + `get_task_status` / `get_task_output` / `tail_task` / `stop_task` —— 跑**长实验**（训练/推理），不被超时掐断。
@@ -28,16 +28,17 @@
   - `read_image` —— 返回一张图片（图表、截图），让多模态 agent 能**看见**它。
   - `get_system_info` —— 内核、运行时间、CPU、内存、磁盘。
   - `get_environment_variables` —— 当前环境变量（密钥值已脱敏）。
+  - `git_status` / `git_log` / `git_diff` / `git_branch_list` / `git_branch_create` / `git_switch` / `git_add` / `git_commit` / `git_fetch` / `git_pull` / `git_push` / `git_remote_list` —— **结构化 Git 工具**（参数化执行、无删除接口），用于远端提交、切换/创建分支、推送与查看状态；详见 [Git 删除保护](#git-删除保护硬约束)。
 - **网页搜索 + 论文检索（零 API Key）**，方案调研见 [免费/开源数据源选型](./docs/search-sources-research.md)：
   - `search_papers` —— 聚合 OpenAlex、arXiv、CrossRef、PubMed、Europe PMC（另可选 OpenReview / dblp / Semantic Scholar）；多源结果轮流交错，带 DOI、引用数、摘要与开放全文链接。
   - `search_arxiv` / `get_paper` —— 按作者/分类查 arXiv；按 DOI / arXiv ID / PMID 查单篇论文。
   - `search_web` —— 可插拔 provider，默认 Hacker News + StackExchange（免密钥）；可选 GitHub、自建 SearXNG、Tavily。
   - `read_web_page` —— 可选抓取网页正文（默认关闭），带 SSRF 防护与不可信内容标注。
-- **安全模型**：默认开放（无白名单）+ 对破坏性命令的**确认门** + 一份**毁灭级黑名单**（`rm -rf /`、`mkfs`、`shutdown` 等）即便确认也无法绕过。每次操作都有完整审计日志。
+- **安全模型**：默认开放（无白名单）+ 对破坏性命令的**确认门** + **毁灭级黑名单**（`rm -rf /`、`mkfs`、`shutdown` 等）即便确认也无法绕过 + **Git 删除硬保护**（删除分支/仓库、删除型 refspec、别名与混淆执行一律硬禁止）。每次操作都有完整审计日志。
 - **可调旋钮（Sandbox knobs）**：可选的 `MCP_ALLOWED_PREFIXES` 白名单、`MCP_DENY_PREFIXES`、`MCP_REQUIRE_CONFIRM`、工作目录、审计日志。
 - **零配置入口**：cloudflared 快速隧道自动给你一个公网 HTTPS 地址（每次重启地址会变；设置 `CF_TUNNEL_TOKEN` 可固定地址）。
 - **自包含镜像**：服务器 + 隧道在同一个容器里。
-- **MCP Admin Dashboard（四服务 Compose 部署）**：独立管理员登录、实时调用监控、完整调用审计、
+- **MCP Admin Dashboard（多服务 Compose 部署，默认 3 容器 + 2 个可选 profile）**：独立管理员登录、实时调用监控、完整调用审计、
   Git/实验监控、容器状态、图表与日志导出；SQLite WAL 持久化，默认脱敏、大输出只存引用。
   详见 [中文部署与运维文档](./docs/admin-dashboard.zh-CN.md)。
 
@@ -50,9 +51,10 @@
 # 2) 启动（默认全开放；如需收紧可加 -e MCP_ALLOWED_PREFIXES="git|python3|ls"）
 docker run -d --name cnb-mcp-gateway --restart unless-stopped \
   -v "$PWD:/workspace" \
-  ghcr.io/ninaawa/cnb-mcp-gateway:latest
+  ghcr.io/ninaawa/cnb-mcp-gateway-plus:latest
 
-docker logs -f cnb-mcp-gateway   # 会打印 BASE_URL、/mcp、openapi、MCP_TOKEN
+docker logs -f cnb-mcp-gateway              # 打印 BASE_URL、/mcp、openapi（默认不打印密钥）
+docker exec cnb-mcp-gateway cat /app/.env   # 读取 MCP_TOKEN
 ```
 
 或用自带的辅助脚本（所有参数可用环境变量覆盖）：
@@ -67,7 +69,7 @@ docker logs -f cnb-mcp-gateway   # 会打印 BASE_URL、/mcp、openapi、MCP_TOK
 cp docker/.env.template .env
 # 建议在 .env 中固定 MCP_TOKEN 与 ADMIN_PASSWORD
 docker compose up -d --build
-docker logs cnb-mcp-admin-web       # 未设置 ADMIN_PASSWORD 时这里打印初始口令
+docker exec cnb-mcp-admin-web cat /data/audit/.admin_password   # 未设置 ADMIN_PASSWORD 时读取初始口令
 ```
 
 后台默认只在宿主机 `http://127.0.0.1:8788` 可达，使用**独立管理员账号**登录（与 `MCP_TOKEN` 无关）；
@@ -81,10 +83,11 @@ MCP API 仍通过网关容器日志里的隧道地址访问，两者访问控制
  公网根地址 (BASE_URL):   https://xxxx.trycloudflare.com
  MCP 连接器地址 (MCP_URL): https://xxxx.trycloudflare.com/mcp
  ChatGPT 插件 OpenAPI 清单: https://xxxx.trycloudflare.com/openapi.yaml
- 密钥 (MCP_TOKEN):        <随机 48 位令牌>
+ 密钥 (MCP_TOKEN):        已写入 /app/.env，默认不在日志打印
 ```
 
-> 每次重启容器 → **新的随机地址** + **新的随机令牌**（除非你固定它们，见下）。每次重启后重新看一眼 `docker logs`。
+> 每次重启容器 → **新的随机地址** + **新的随机令牌**（除非你固定它们，见下）。
+> 用 `docker exec cnb-mcp-gateway cat /app/.env` 取令牌；仅在隔离环境可设 `MCP_PRINT_SECRETS=1` 让日志打印密钥。
 
 ## 连接你的 agent
 
@@ -116,12 +119,8 @@ Authorization: Bearer <MCP_TOKEN>
 - 令牌地址 Token URL：`https://<BASE_URL>/token`
 - 注册地址 Registration URL：`https://<BASE_URL>/register`
 - 在同意页面：用户名 = 任意，**密码 = `MCP_TOKEN`**。
-
-本轮加固：`redirect_uri` 必须与 `/register` 注册值**精确匹配**（拒绝片段、通配符、内嵌凭据），
-GET / POST 都强制 PKCE `S256`，`/token` 会核对 `code_verifier`；签发的令牌按
-`MCP_OAUTH_TOKEN_TTL`（默认 30 天）过期并由中间件清理。老客户端可显式设置
-`OAUTH_ALLOW_ANY_REDIRECT=1` / `OAUTH_ALLOW_NO_PKCE=1` 降级兼容，默认均为 `0`，
-开启会削弱授权码流程，生产环境请勿启用。
+- 客户端需启用 PKCE S256（默认强制；确需兼容不支持的客户端时设 `MCP_OAUTH_REQUIRE_PKCE=0`），
+  并先用 `/register` 注册 `redirect_uri`（自定义 scheme 必须预注册）。
 
 ## 配置（环境变量）
 
@@ -147,6 +146,10 @@ GET / POST 都强制 PKCE `S256`，`/token` 会核对 `code_verifier`；签发�
 | `MCP_SEARCH_FETCH_ENABLED` | `0` | 设为 `1` 才启用 `read_web_page`。 |
 | `MCP_SEARCH_FETCH_MAX_CHARS` | `8000` | 抓取正文最大字符数。 |
 | `MCP_SEARCH_FETCH_ALLOW_HOSTS` | （空） | 页面抓取主机白名单（逗号分隔），留空允许任意公网 HTTPS 主机。 |
+| `MCP_OAUTH_REQUIRE_PKCE` | `1` | 强制 OAuth S256 PKCE；老客户端不发 `code_challenge` 时才设 `0`（不建议）。 |
+| `MCP_TRUST_PROXY` / `ADMIN_TRUST_PROXY` | `0` | 仅在可信反向代理之后设 `1`，否则客户端可伪造 `X-Forwarded-For` 绕过登录锁定 / 伪造审计来源 IP。 |
+| `MCP_GIT_EXTRA_SUBCOMMANDS` | （空） | 额外放行的 git 子命令（逗号分隔）；未知子命令默认拒绝，防止 alias 隐藏删除操作。 |
+| `MCP_PRINT_SECRETS` | `0` | `1` = 在容器日志打印 `MCP_TOKEN` 与管理员口令（仅隔离环境使用）；默认只写文件。 |
 
 ### Admin Dashboard 与审计变量（Compose 读取项目根目录 `.env`）
 
@@ -160,18 +163,83 @@ GET / POST 都强制 PKCE `S256`，`/token` 会核对 `code_verifier`；签发�
 | `ADMIN_COOKIE_SECURE` | `0` | 通过 HTTPS 访问后台时设为 `1`。 |
 | `ADMIN_HOST_PORT` / `ADMIN_BIND_HOST` | `8788` / `127.0.0.1` | 后台监听端口与绑定地址；CNB 等端口预览需设为 `0.0.0.0`，开放前请配置强口令与 MFA。 |
 | `AUDIT_DB_DSN` | （空 = SQLite WAL） | 可选 PostgreSQL DSN，配合 `postgres` profile。 |
-| `AUDIT_STRICT` | `0` | `1` = 只有确认 `RECEIVED` 行已持久化（数据库健康、缓冲为空、可回读）才放行高风险工具；默认降级缓冲，不中断实验。 |
-| `AUDIT_RETENTION_DAYS` / `AUDIT_MAX_DB_MB` | `90` / `512` | 保留天数与数据库配额；覆盖调用、事件、任务、Git、实验、审批、登录、导出与过期会话等所有历史表，`admin_settings` 不清理。 |
-| `AUDIT_ARCHIVE_BATCH` / `AUDIT_BUFFER_MAX` | `1000` / `1000` | 归档分批大小（100..5000）与写失败缓冲上限。 |
-| `MCP_SESSION_TTL` | `3600` | 客户端会话空闲 / 令牌有效期（秒），用于活跃客户端统计。 |
-| `OAUTH_ALLOW_ANY_REDIRECT` / `OAUTH_ALLOW_NO_PKCE` | `0` / `0` | 旧客户端兼容开关，默认关闭；开启有授权码被劫持风险。 |
-| `MCP_OAUTH_TOKEN_TTL` | `2592000` | OAuth 令牌有效期（秒）。 |
-| `GATEWAY_METRICS_TOKEN` | 自动生成 | `/health/details` 的内部只读令牌，落在共享卷 `/data/audit/.metrics_token`（600）；绝不能交给 agent。 |
+| `AUDIT_STRICT` | `0` | `1` = 审计存储不可用时拒绝高风险工具；默认降级放行，不中断实验。 |
+| `AUDIT_RETENTION_DAYS` / `AUDIT_MAX_DB_MB` | `90` / `512` | 归档保留天数与数据库配额。 |
 | `AUDIT_BACKUP_KEEP` / `AUDIT_MAINTENANCE_INTERVAL` | `7` / `300` | 备份保留数量与维护间隔（秒）。 |
 | `MCP_TUNNEL_DISABLED` | `0` | 启用独立 `cloudflared` 服务时设为 `1`。 |
 
 完整变量见 [`docker/.env.template`](./docker/.env.template)，部署细节见
 [部署与运维文档](./docs/admin-dashboard.zh-CN.md)。
+
+## Git 删除保护（硬约束）
+
+> 目标：agent 可以**提交、切换/创建分支、拉取、推送**，但**绝不能删除 git 仓库与分支**；
+> 这条规则属于硬禁止，`confirm=true` 也不可绕过。
+
+### 三层本地防护
+
+1. **命令层**（`gateway/git_guard.py`）：所有 `run_command`、`run_command_background`、
+   REST `/run_command` 在执行前先做引号感知的分段解析，识别 `git branch -D/-d/-m`、
+   `git push --delete/--mirror/--prune`、`:branch` / `branch:` / `+branch` 删除型 refspec、
+   `git update-ref`、`git remote/worktree prune`、`git fetch --prune`、对 `.git` 的重定向写入，
+   以及删除包含 `.git` 的仓库目录（运行时 `stat` 判断）。
+   `bash -c` / `sh -c` / `python -c` 内嵌删除命令、写脚本再执行、`base64 -d | sh`
+   等混淆写法同样被拒绝。
+2. **进程层**（`docker/git-guard-wrapper.py`）：镜像把真实 git 移到
+   `/usr/lib/git-core/git.real`，`/usr/bin/git` 换成防护 wrapper。因此**脚本里、
+   Python subprocess 里、后台任务里、显式写 `/usr/bin/git` 的调用**都经过
+   `check_argv`；未知子命令（可能是 alias）、`git -c alias.*`、`GIT_EXEC_PATH`
+   注入一律拒绝。可用 `MCP_GIT_EXTRA_SUBCOMMANDS` 放行你确需的额外子命令。
+3. **文件层**：`write_file` 禁止改写 `.git/**` 与系统凭据文件；
+   `CATASTROPHIC_PATTERNS` 对常见字面写法再做一次硬禁止。
+
+`git push --force`、`git reset --hard`、`git clean -fd` 仍属「需确认」的破坏性命令
+（它们不删除分支），`git status` / `commit` / `switch` / `branch -a` 等完全不受影响。
+
+### 正规通道：结构化 `git_*` 工具
+
+用参数化（`shell=False`）工具完成日常 Git 操作，它们没有删除接口：
+
+```text
+git_status(cwd="/workspace/repo")
+git_commit(cwd="/workspace/repo", message="exp: tune lr")
+git_switch(cwd="/workspace/repo", branch="exp", create=true)
+git_push(cwd="/workspace/repo", remote="origin", branch="exp")
+```
+
+`git_push` 参数不接受 `:`、`+`、以 `-` 开头的 ref，也不提供 `--force` / `--delete`。
+
+### 容器内 Git 身份与凭据
+
+镜像里没有宿主机的 `/etc/gitconfig`，首次使用 `git_commit` / `git_push` 前需要显式配置，
+否则会报 `Please tell me who you are` 或远端认证失败：
+
+```bash
+# Compose：在项目根目录 .env 中设置
+GIT_USER_NAME=your-name
+GIT_USER_EMAIL=you@example.com
+# 凭据文件以只读卷挂载（留空 GIT_CREDENTIALS_FILE 时自动探测 /root/.git-credentials）
+docker run -v "$HOME/.git-credentials:/root/.git-credentials:ro" ...
+```
+
+凭据文件绝不要放进环境变量、命令参数或日志。CNB 等平台会强制提交签名
+（`commit.gpgsign=true` + `cnb-gpgsign`），此时**提交作者必须与令牌用户一致**，
+否则提交会被签名程序拒绝——这在端到端自检中已复现。
+
+### 必须配合的远端措施（重要）
+
+本地防护防的是**误操作、以及被网页/论文内容诱导的提示注入**，不是对抗持有容器
+root 的攻击者（root 可直接改 `.git` 文件或替换二进制）。任何允许任意 shell 的
+系统都无法在客户端给出数学意义上的保证。要真正不可逆，请务必同时：
+
+1. 在 CNB / GitHub / GitLab 开启**分支保护**：禁止删除分支、禁止 force push，
+   删除仓库要求二次审批（服务端 bare 仓库可设 `receive.denyDeletes=true`、
+   `receive.denyNonFastForwards=true`）。
+2. 给 agent 使用**最小权限 PAT / 部署密钥**：只允许推送到指定分支，无仓库管理权限；
+   不要把管理员 token 放进容器。
+3. 配置**独立备份**并定期校验；仓库与分支删除的恢复能力比任何黑名单都可靠。
+4. 生产环境可让网关以非 root 用户运行（配合 UID 映射的绑定挂载），
+   不要挂载 `/var/run/docker.sock`。
 
 ## 权限模型：开放 + 确认门 + 黑名单
 
@@ -188,8 +256,10 @@ GET / POST 都强制 PKCE `S256`，`/token` 会核对 `code_verifier`；签发�
    - `rm -rf /`、`rm -rf /*`、`mkfs*`、`shutdown`/`halt`/`reboot`/`poweroff`
    - `dd ... of=/dev/*`、fork bomb（`:(){ :|:& };`）、`> /dev/sd*`、`chmod -R` 到根目录
    - `kill_process` 终止 PID 1 / init / systemd 也走硬禁止。
+4. **Git 删除（git-guard，优先级最高）**：删除分支/仓库、删除型 refspec、别名与混淆执行，
+   由 `gateway.git_guard` 和镜像内 `git` wrapper 硬禁止；详见上一章。
 
-> 所有拒绝、待确认、放行、后台启动/停止都会写进审计日志（容器内 `/app/audit.log`）。
+> 所有拒绝、待确认、放行、后台启动/停止都会写进审计日志（容器内 `/app/audit.log`，写入前脱敏）。
 
 ## 工具参考
 
@@ -208,6 +278,7 @@ GET / POST 都强制 PKCE `S256`，`/token` 会核对 `code_verifier`；签发�
 | `get_paper` | 查单篇论文 | 按 `doi` / `arxiv_id` / `pmid`；Unpaywall 开放全文需 `MCP_SEARCH_MAILTO`。 |
 | `search_web` | 网页 / 技术社区检索 | 默认 HN + StackExchange；可选 GitHub / SearXNG / Tavily。 |
 | `read_web_page` | 抓取网页正文 | 默认关闭（`MCP_SEARCH_FETCH_ENABLED=1`）；仅 HTTPS + SSRF 防护。 |
+| `git_status` / `git_commit` / `git_switch` / `git_branch_create` / `git_push` | 结构化 Git 操作 | 参数化执行，无删除接口；另有 `git_current_branch` / `git_log` / `git_diff` / `git_branch_list` / `git_add` / `git_fetch` / `git_pull` / `git_remote_list`。 |
 
 ### 检索示例
 
@@ -253,45 +324,15 @@ read_image(path="/workspace/results/loss_curve.png", max_dim=1024)
   且始终要求独立管理员登录。
 - 检索工具只访问固定域名白名单，限制响应体积并按来源限速；`read_web_page` 默认关闭，开启后也会拦截非 HTTPS、IP 字面量与私网地址（含跳转目标）。
 - 外部数据源返回的标题、摘要与正文都是**不可信数据**，工具输出会明确标注，避免提示注入；不要把它们当作指令执行。
-- 被执行过的命令，以及检索活动（查询词、来源、耗时、结果条数）都会写入容器内的 `/app/audit.log`；密钥与响应体不会写入日志。
-- 四服务部署还会把完整调用记录写入共享卷的 SQLite WAL 审计库：参数、输出与错误统一脱敏，
-  大输出只保存受保护引用；后台与 MCP API 的认证相互独立，未登录不能查询任何调用记录，
-  也不能用 `MCP_TOKEN` 登录后台。详见 [部署与运维文档](./docs/admin-dashboard.zh-CN.md)。
-- ⚠️ **密钥提醒**：如果你用的是共享/明文出现的 PAT 或令牌，建议用完后立即在对应平台撤销并轮换。
-- **健康接口拆分**：公开 `/health` 只返回 `status` / `service` / `uptime_seconds` /
-  `audit.healthy`；工具数、审计详情与进程 / 容器指标移到需鉴权的 `/health/details`
-  （Bearer 或内部只读指标令牌）。Compose healthcheck 仍指向 `/health`。
-- **单一脱敏入口**：所有 SQL 写参数统一经过 `redact_params`；派生 Git / 实验字段、
-  旧式 `audit.log`、任务日志回读、归档文件与三种导出也都脱敏。归档按批写 JSONL（600）、
-  flush + fsync 并核验行数后才按主键精确删除；任一步失败保留全部数据并写
-  `audit_storage_warning`。
-- **严格审计是三态判定**：`available()` 只表示「还能缓冲」。`AUDIT_STRICT=1` 时高风险
-  工具额外要求 `confirm_persisted(request_id)`；终态写入失败会记录
-  `audit_strict_violation` 并体现在 `health()["strict_violations"]`。
-
-## 本轮修复的验证命令
-
-```bash
-# 静态与回归
-bash -n docker/entrypoint.sh
-docker compose config --quiet
-.venv/bin/python -m pytest tests -q          # 覆盖 6000 条归档、1200 条导出、OAuth、启动
-
-# 空 MCP_TOKEN 启动（入口会自动生成 48 位随机口令并打印到容器日志）
-unset MCP_TOKEN; docker compose up -d --build mcp-gateway
-
-# 健康接口隔离（网关在容器网络内，本机可用 docker compose exec 调用）
-docker compose exec mcp-gateway curl -fsS http://127.0.0.1:8765/health
-docker compose exec mcp-gateway curl -fsS http://127.0.0.1:8765/health/details   # 期望 401
-TOKEN=$(docker compose exec mcp-gateway cat /data/audit/.metrics_token)
-docker compose exec mcp-gateway curl -fsS -H "Authorization: Bearer $TOKEN" \
-  http://127.0.0.1:8765/health/details
-
-# 重启持久化：重建后台容器后历史记录仍在
-docker compose up -d --force-recreate mcp-admin-web
-docker compose exec mcp-admin-web python -c \
-  "from gateway.audit.storage import get_storage; print(get_storage().query_calls({})[1])"
-```
+- 被执行过的命令，以及检索活动（查询词、来源、耗时、结果条数）都会写入容器内的 `/app/audit.log`；写入前统一脱敏并截断，命令里的 `TOKEN=...` / 连接串口令不会以明文落盘。
+- 多服务部署（默认 3 个容器 + 2 个可选 profile）还会把完整调用记录写入共享卷的 SQLite WAL 审计库：参数、输出、错误与派生子表统一脱敏，大输出只保存受保护引用（读取时校验 SHA-256）；
+  `AUDIT_STRICT=1` 在写库失败时会真正拒绝高风险工具（含 `git_*`），REST 入口同样受保护。
+  后台与 MCP API 的认证相互独立，未登录不能查询任何调用记录，也不能用 `MCP_TOKEN` 登录后台；
+  后台写操作额外校验 Origin / Sec-Fetch-Site，登录锁定默认不信任可伪造的 `X-Forwarded-For`。
+  详见 [部署与运维文档](./docs/admin-dashboard.zh-CN.md)。
+- 公网免鉴权的 `/health` 只返回最小存活状态；系统指标与工具数量改由需 Bearer 的 `/internal/metrics` 提供，后台用 `MCP_TOKEN` 读取。
+- `MCP_TOKEN` 与随机管理员口令**默认不再打印到容器日志**，分别从 `/app/.env` 与 `/data/audit/.admin_password` 读取；OAuth 默认强制 S256 PKCE、校验 `redirect_uri`、签发的 token 有过期并会回收。
+- ⚠️ **密钥提醒**：如果你用的是共享/明文出现的 PAT 或令牌，建议用完后立即在对应平台撤销并轮换；agent 用的 Git 凭据务必最小权限，并在远端开启分支保护（见 [Git 删除保护](#git-删除保护硬约束)）。
 
 ## 从源码构建
 
@@ -305,7 +346,10 @@ docker logs -f cnb-mcp-gateway
 ```
 
 > 构建上下文已改为仓库根目录，因为镜像现在还包含 `gateway/` 统一采集层与 Admin Web。
-> 四服务部署用 `docker compose up -d --build`；测试用 `.venv/bin/python -m pytest tests -q`。
+> 多服务部署用 `docker compose up -d --build`；测试用
+> `pip install -r docker/requirements.txt -r requirements-dev.txt && pytest tests -q`。
+> 只依赖标准库的策略回归测试可直接运行 `python3 -m unittest discover -s tests -p 'test_*.py'`；
+> CI（`.github/workflows/ci.yml`）会执行 ruff 检查与完整测试。
 
 ## 许可证
 
