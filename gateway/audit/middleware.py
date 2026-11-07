@@ -124,8 +124,8 @@ class AuditMiddleware(Middleware):
         storage.upsert_session(trace.session_id or trace.request_id,
                                trace.client_id, trace.declared_client)
 
-        # 严格审计：高风险操作无法可靠写入时按配置拒绝，而不是静默执行
-        if STRICT and name in HIGH_RISK_TOOLS and not storage.available():
+        # 严格审计：要求 RECEIVED 行确实已持久化（读回确认），而非仅能进入缓冲
+        if STRICT and name in HIGH_RISK_TOOLS and not storage.confirm_persisted(trace.request_id):
             message = "审计存储不可用，严格审计模式已拒绝执行该高风险操作"
             record.status, record.strict_denied = "DENIED", 1
             record.error_type, record.error_message = "AuditUnavailable", message
@@ -187,7 +187,8 @@ class AuditMiddleware(Middleware):
             for key, value in derived.items():
                 if key != "sub_events" and value not in (None, ""):
                     patch[key] = value
-            storage.update_call(trace.request_id, **patch)
+            if not storage.update_call(trace.request_id, **patch) and STRICT:
+                storage.note_strict_violation(trace.request_id, name, "终态")
             for kind, values in derived.get("sub_events", []):
                 if kind == "git":
                     values["status"] = status

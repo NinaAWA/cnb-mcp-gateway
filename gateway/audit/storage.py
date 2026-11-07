@@ -14,17 +14,37 @@ import sqlite3
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from .events import TERMINAL_STATUSES, ToolCallRecord, utcnow
-from .redaction import ArtifactStore
+from .redaction import ArtifactStore, redact_params, redact_structure
 
 DEFAULT_DB_PATH = os.environ.get("AUDIT_DB_PATH", "/data/audit/audit.db")
 MAX_FIELD_CHARS = int(os.environ.get("AUDIT_MAX_FIELD_CHARS", "32768"))
 MAX_BUFFER = int(os.environ.get("AUDIT_BUFFER_MAX", "1000"))
 STRICT = os.environ.get("AUDIT_STRICT", "0").strip().lower() in ("1", "true", "yes", "on")
+# 单次查询上限：必须 >= iter_calls 的批量，否则导出会在第一批提前终止。
+QUERY_MAX_LIMIT = 1000
+ARCHIVE_BATCH = max(100, min(5000, int(os.environ.get("AUDIT_ARCHIVE_BATCH", "1000"))))
+# 客户端会话的令牌/空闲有效期（秒）
+SESSION_TTL = max(60, int(os.environ.get("MCP_SESSION_TTL", "3600")))
+# SQL 聚合不可用时的有界回退行数，避免把整表拉进内存
+AGGREGATION_FALLBACK_ROWS = 20_000
+# 纳入保留策略的历史表：(表名, 时间列, 主键)。admin_settings 是配置，不清理。
+ARCHIVE_TABLES = (
+    ("tool_calls", "timestamp_start", "id"),
+    ("audit_events", "ts", "id"),
+    ("background_tasks", "ts", "id"),
+    ("git_operations", "ts", "id"),
+    ("experiment_runs", "ts", "id"),
+    ("approval_events", "ts", "id"),
+    ("login_attempts", "ts", "id"),
+    ("export_jobs", "ts", "id"),
+    ("admin_sessions", "expires_at", "id"),
+    ("client_sessions", "last_seen", "id"),
+)
 
 # 需要严格审计的高风险工具（strict 模式下写库失败即拒绝）
 HIGH_RISK_TOOLS = frozenset({
@@ -143,6 +163,7 @@ class AuditStorage:
         self._buffer: deque[dict[str, Any]] = deque(maxlen=MAX_BUFFER)
         self._healthy = True
         self._last_error = ""
+        self._strict_violations = 0
         self._init_db()
 
     # ---------------------------------------------------------------- backend
@@ -187,23 +208,51 @@ class AuditStorage:
             "buffered": len(self._buffer),
             "last_error": self._last_error,
             "strict": STRICT,
+            "strict_violations": self._strict_violations,
         }
 
     def available(self) -> bool:
+        """是否仍能接收写入（含缓冲）；不代表已持久化。"""
         return self._healthy or len(self._buffer) < MAX_BUFFER
 
+    def persistence_state(self) -> dict[str, Any]:
+        """区分「数据库健康」「可缓冲写入」「已确认持久化」三态。"""
+        return {
+            "healthy": bool(self._healthy),
+            "buffered": len(self._buffer),
+            "bufferable": self.available(),
+            "persisted": bool(self._healthy and not self._buffer),
+        }
+
+    def confirm_persisted(self, request_id: str) -> bool:
+        """严格审计：数据库健康、缓冲已清空，且刚写入的调用确实可读回。"""
+        if not self._healthy or self._buffer:
+            return False
+        rows = self._query(
+            "SELECT request_id FROM tool_calls WHERE request_id=?", [request_id]
+        )
+        return bool(rows)
+
+    def note_strict_violation(self, request_id: str, tool_name: str,
+                              phase: str) -> None:
+        self._strict_violations += 1
+        self.add_event("audit_strict_violation", status="FAILED",
+                       request_id=request_id, tool_name=tool_name, source="audit",
+                       detail=f"{phase}写入失败；该调用可能缺少终态记录")
+
     def _execute(self, sql: str, params: Iterable[Any] = (), *, many: bool = False) -> bool:
-        """执行写操作；失败时进入有界缓冲并返回 False。"""
-        payload = {"sql": sql, "params": list(params), "many": many}
+        """唯一 SQL 写边界：所有字符串参数在此统一脱敏；失败时进入有界缓冲。"""
+        safe_params = redact_params(list(params))
+        payload = {"sql": sql, "params": safe_params, "many": many}
         try:
             with self._lock:
                 conn = self._connect()
                 try:
                     if self.pg:
                         with conn.cursor() as cur:
-                            cur.execute(_to_pg(sql), tuple(params))
+                            cur.execute(_to_pg(sql), tuple(safe_params))
                     else:
-                        conn.execute(sql, tuple(params))
+                        conn.execute(sql, tuple(safe_params))
                         conn.commit()
                     # 缓冲恢复：尽力补写之前失败的事件
                     while self._buffer:
@@ -227,7 +276,9 @@ class AuditStorage:
             self._buffer.append(payload)
             return False
 
-    def _query(self, sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
+    def _query_checked(self, sql: str,
+                       params: Iterable[Any] = ()) -> list[dict[str, Any]] | None:
+        """与 _query 相同，但用 None 区分「查询失败」与「查到 0 行」。"""
         try:
             with self._lock:
                 conn = self._connect()
@@ -245,7 +296,11 @@ class AuditStorage:
                     conn.close()
         except Exception as exc:  # noqa: BLE001
             self._last_error = repr(exc)
-            return []
+            return None
+
+    def _query(self, sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
+        rows = self._query_checked(sql, params)
+        return rows if rows is not None else []
 
     # ------------------------------------------------------------- tool calls
     def insert_call(self, record: ToolCallRecord) -> bool:
@@ -285,15 +340,18 @@ class AuditStorage:
             f"INSERT INTO {table} ({cols}) VALUES ({marks})", list(values.values())
         )
 
-    def upsert_session(self, session_id: str, client_id: str, declared: str = "") -> None:
+    def upsert_session(self, session_id: str, client_id: str, declared: str = "",
+                       token_expires: str = "") -> None:
         if not session_id:
             return
         self._execute(
-            "INSERT INTO client_sessions (session_id,client_id,declared_client,first_seen,last_seen,call_count,status) "
-            "VALUES (?,?,?,?,?,1,'active') ON CONFLICT(session_id) DO UPDATE SET "
-            "last_seen=excluded.last_seen, call_count=client_sessions.call_count+1, "
-            "declared_client=excluded.declared_client",
-            [session_id, client_id, declared, utcnow(), utcnow()],
+            "INSERT INTO client_sessions (session_id,client_id,declared_client,first_seen,"
+            "last_seen,call_count,status,token_expires) VALUES (?,?,?,?,?,1,'active',?) "
+            "ON CONFLICT(session_id) DO UPDATE SET last_seen=excluded.last_seen, "
+            "call_count=client_sessions.call_count+1, "
+            "declared_client=excluded.declared_client, status='active', "
+            "token_expires=excluded.token_expires",
+            [session_id, client_id, declared, utcnow(), utcnow(), token_expires],
         )
 
     def add_task(self, values: dict[str, Any]) -> None:
@@ -365,7 +423,7 @@ class AuditStorage:
         rows = self._query(
             f"SELECT * FROM tool_calls{where} ORDER BY {column} {direction}, id {direction} "
             "LIMIT ? OFFSET ?",
-            [*args, min(limit, 500), max(0, offset)],
+            [*args, min(limit, QUERY_MAX_LIMIT), max(0, offset)],
         )
         return rows, total
 
@@ -373,16 +431,26 @@ class AuditStorage:
         rows = self._query("SELECT * FROM tool_calls WHERE request_id=?", [request_id])
         return rows[0] if rows else None
 
-    def iter_calls(self, filters: dict[str, Any], batch: int = 1000) -> Any:
-        """分页迭代导出，避免一次性把全部历史读进内存。"""
-        offset = 0
+    def iter_calls(self, filters: dict[str, Any],
+                   batch: int = 1000) -> Iterator[dict[str, Any]]:
+        """按主键游标分批导出：固定时间上界 + keyset 分页，避免 OFFSET 漂移与截断。"""
+        effective = max(1, min(int(batch), QUERY_MAX_LIMIT))
+        frozen = dict(filters)
+        if not frozen.get("until"):
+            frozen["until"] = utcnow()
+        where, args = self._filters(frozen)
+        clause = f"{where} AND id > ?" if where else " WHERE id > ?"
+        last_id = 0
         while True:
-            rows, _ = self.query_calls(filters, limit=batch, offset=offset)
+            rows = self._query(
+                f"SELECT * FROM tool_calls{clause} ORDER BY id ASC LIMIT ?",
+                [*args, last_id, effective],
+            )
             if not rows:
                 break
             yield from rows
-            offset += len(rows)
-            if len(rows) < batch:
+            last_id = int(rows[-1]["id"])
+            if len(rows) < effective:
                 break
 
     def recent_errors(self, limit: int = 20) -> list[dict[str, Any]]:
@@ -465,59 +533,118 @@ class AuditStorage:
             ],
         }
 
-    def time_series(self, since: str, until: str = "", buckets: int = 24) -> dict[str, Any]:
-        """按时间桶返回调用 / 失败 / 超时 / 平均耗时趋势，SQL 聚合避免全表扫描。"""
-        end = until or utcnow()
-        rows = self._query(
-            "SELECT timestamp_start, status, duration_ms FROM tool_calls "
-            "WHERE timestamp_start >= ? AND timestamp_start <= ? ORDER BY timestamp_start",
-            [since, end],
-        )
+    @staticmethod
+    def _parse_ts(value: Any) -> datetime | None:
         try:
-            from datetime import datetime
-            start_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
-            end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
-            span = max(1.0, (end_dt - start_dt).total_seconds())
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
         except (ValueError, TypeError):
-            span, start_dt = 1.0, None
-        width = span / max(1, buckets)
-        labels = [f"T{i}" for i in range(buckets)]
-        calls = [0] * buckets
-        failed = [0] * buckets
-        timed_out = [0] * buckets
-        durations: list[list[int]] = [[] for _ in range(buckets)]
-        for row in rows:
-            try:
-                from datetime import datetime
-                ts = datetime.fromisoformat(str(row["timestamp_start"]).replace("Z", "+00:00"))
-                idx = min(buckets - 1, max(0, int((ts - start_dt).total_seconds() / width)))
-            except (ValueError, TypeError):
-                idx = 0
-            calls[idx] += 1
-            status = row["status"]
-            if status in ("FAILED", "DENIED", "INTERRUPTED"):
-                failed[idx] += 1
-            if status == "TIMEOUT":
-                timed_out[idx] += 1
-            durations[idx].append(int(row["duration_ms"] or 0))
-        avg_ms = [round(sum(d) / len(d), 1) if d else 0 for d in durations]
+            return None
+
+    @staticmethod
+    def _duration_bin(value: Any) -> int:
+        try:
+            ms = int(value or 0)
+        except (TypeError, ValueError):
+            return -1
+        for idx, (lo, hi) in enumerate(((0, 50), (50, 200), (200, 1000),
+                                        (1000, 5000), (5000, 10**12))):
+            if lo <= ms < hi:
+                return idx
+        return -1
+
+    def time_series(self, since: str, until: str = "", buckets: int = 24) -> dict[str, Any]:
+        """按方言 SQL 聚合时间桶；方言不支持时回退到有界 Python 聚合。"""
+        n = max(1, min(int(buckets), 168))
+        end = until or utcnow()
+        labels = [f"T{i}" for i in range(n)]
+        calls = [0] * n
+        failed = [0] * n
+        timed_out = [0] * n
+        sums = [0.0] * n
+
+        start_dt = self._parse_ts(since)
+        end_dt = self._parse_ts(end)
+        span = (max(1.0, (end_dt - start_dt).total_seconds())
+                if start_dt and end_dt else 1.0)
+        width = span / n
+
+        if self.pg:
+            bucket = ("CAST(FLOOR((EXTRACT(EPOCH FROM timestamp_start::timestamptz) "
+                      "- EXTRACT(EPOCH FROM ?::timestamptz)) / ?) AS INTEGER)")
+        else:
+            bucket = ("CAST((julianday(timestamp_start) - julianday(?)) "
+                      "* 86400.0 / ? AS INTEGER)")
+        sql = (
+            f"SELECT {bucket} AS bucket, COUNT(*) AS n, "
+            "SUM(CASE WHEN status IN ('FAILED','DENIED','INTERRUPTED') THEN 1 ELSE 0 END) AS failed, "
+            "SUM(CASE WHEN status='TIMEOUT' THEN 1 ELSE 0 END) AS timed_out, "
+            "COALESCE(AVG(COALESCE(duration_ms,0)),0) AS avg_ms "
+            "FROM tool_calls WHERE timestamp_start >= ? AND timestamp_start <= ? GROUP BY 1"
+        )
+        rows = self._query_checked(sql, [since, width, since, end])
+        if rows is None:
+            fallback = self._query_checked(
+                "SELECT timestamp_start, status, duration_ms FROM tool_calls "
+                "WHERE timestamp_start >= ? AND timestamp_start <= ? "
+                "ORDER BY timestamp_start LIMIT ?",
+                [since, end, AGGREGATION_FALLBACK_ROWS],
+            ) or []
+            for row in fallback:
+                ts = self._parse_ts(row.get("timestamp_start"))
+                idx = (min(n - 1, max(0, int((ts - start_dt).total_seconds() / width)))
+                       if ts and start_dt else 0)
+                calls[idx] += 1
+                if row["status"] in ("FAILED", "DENIED", "INTERRUPTED"):
+                    failed[idx] += 1
+                if row["status"] == "TIMEOUT":
+                    timed_out[idx] += 1
+                sums[idx] += int(row["duration_ms"] or 0)
+        else:
+            for row in rows:
+                try:
+                    idx = min(n - 1, max(0, int(row["bucket"] or 0)))
+                except (TypeError, ValueError):
+                    idx = 0
+                count = int(row["n"] or 0)
+                calls[idx] += count
+                failed[idx] += int(row["failed"] or 0)
+                timed_out[idx] += int(row["timed_out"] or 0)
+                sums[idx] += float(row["avg_ms"] or 0) * count
+        avg_ms = [round(sums[i] / calls[i], 1) if calls[i] else 0 for i in range(n)]
         return {"labels": labels, "calls": calls, "failed": failed,
                 "timeouts": timed_out, "avg_duration_ms": avg_ms}
 
     def duration_distribution(self, since: str) -> list[dict[str, Any]]:
-        rows = self._query(
-            "SELECT duration_ms FROM tool_calls WHERE timestamp_start >= ?", [since]
-        )
-        bins = [(0, 50), (50, 200), (200, 1000), (1000, 5000), (5000, 10**12)]
         labels = ["<50ms", "50-200ms", "0.2-1s", "1-5s", ">5s"]
-        counts = [0] * len(bins)
-        for row in rows:
-            value = int(row["duration_ms"] or 0)
-            for i, (lo, hi) in enumerate(bins):
-                if lo <= value < hi:
-                    counts[i] += 1
-                    break
-        return [{"label": labels[i], "count": counts[i]} for i in range(len(bins))]
+        counts = [0] * len(labels)
+        sql = (
+            "SELECT CASE WHEN duration_ms IS NULL THEN 0 "
+            "WHEN duration_ms < 0 THEN -1 "
+            "WHEN duration_ms < 50 THEN 0 WHEN duration_ms < 200 THEN 1 "
+            "WHEN duration_ms < 1000 THEN 2 WHEN duration_ms < 5000 THEN 3 "
+            "ELSE 4 END AS bin, COUNT(*) AS n "
+            "FROM tool_calls WHERE timestamp_start >= ? GROUP BY 1"
+        )
+        rows = self._query_checked(sql, [since])
+        if rows is None:
+            fallback = self._query_checked(
+                "SELECT duration_ms FROM tool_calls WHERE timestamp_start >= ? LIMIT ?",
+                [since, AGGREGATION_FALLBACK_ROWS],
+            ) or []
+            for row in fallback:
+                idx = self._duration_bin(row.get("duration_ms"))
+                if idx >= 0:
+                    counts[idx] += 1
+        else:
+            for row in rows:
+                try:
+                    idx = int(row["bin"])
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= idx < len(counts):
+                    counts[idx] += int(row["n"] or 0)
+        return [{"label": labels[i], "count": counts[i]} for i in range(len(labels))]
 
     def active_tasks(self) -> int:
         rows = self._query(
@@ -531,9 +658,32 @@ class AuditStorage:
         return int(rows[0]["n"]) if rows else 0
 
     def sessions(self, limit: int = 100) -> list[dict[str, Any]]:
-        return self._query(
+        """活跃状态按 last_seen / token_expires 实时判定，历史会话不再永远 active。"""
+        rows = self._query(
             "SELECT * FROM client_sessions ORDER BY last_seen DESC LIMIT ?", [limit]
         )
+        now = utcnow()
+        idle_cutoff = (datetime.now(timezone.utc)
+                       - timedelta(seconds=SESSION_TTL)).isoformat(timespec="milliseconds")
+        for row in rows:
+            last_seen = str(row.get("last_seen") or "")
+            token_expires = str(row.get("token_expires") or "")
+            active = bool(last_seen and last_seen >= idle_cutoff
+                          and (not token_expires or token_expires >= now))
+            row["status"] = "active" if active else "expired"
+            row["active"] = active
+            row["idle_ttl_seconds"] = SESSION_TTL
+        return rows
+
+    def active_session_count(self) -> int:
+        rows = self._query(
+            "SELECT COUNT(*) AS n FROM client_sessions "
+            "WHERE last_seen >= ? AND (token_expires IS NULL OR token_expires = '' "
+            "OR token_expires >= ?)",
+            [(datetime.now(timezone.utc)
+              - timedelta(seconds=SESSION_TTL)).isoformat(timespec="milliseconds"), utcnow()],
+        )
+        return int(rows[0]["n"]) if rows else 0
 
     def git_ops(self, repo: str = "", limit: int = 100) -> list[dict[str, Any]]:
         if repo:
@@ -582,45 +732,124 @@ class AuditStorage:
         rows = self._query("SELECT COUNT(*) AS n FROM tool_calls WHERE status='INTERRUPTED'")
         return int(rows[0]["n"]) if rows else 0
 
+    def _db_size_mb(self) -> float:
+        try:
+            return Path(self.db_path).stat().st_size / (1024 * 1024)
+        except OSError:
+            return 0.0
+
+    def _write_archive(self, rows: list[dict[str, Any]], directory: Path,
+                       label: str, seq: int) -> Path:
+        """0600 创建、fsync 落盘、回读核验行数；核验失败不留下误导性副本。"""
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+        path = directory / f"{label}-{stamp}-{seq}.jsonl"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                for row in rows:
+                    # 兼容修复前落库的历史行：归档文件也经过同一脱敏入口
+                    safe = redact_structure(row)
+                    fh.write(json.dumps(safe, ensure_ascii=False, default=str) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            with path.open("r", encoding="utf-8") as fh:
+                if sum(1 for _ in fh) != len(rows):
+                    raise OSError("归档文件行数校验失败")
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
+        return path
+
+    def _delete_ids(self, table: str, pk: str, ids: list[Any]) -> bool:
+        """只删除已成功归档的主键；分片避开 SQLite 的变量数量上限。"""
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            marks = ",".join("?" for _ in chunk)
+            if not self._execute(f"DELETE FROM {table} WHERE {pk} IN ({marks})", chunk):
+                return False
+        return True
+
+    def _vacuum(self) -> None:
+        if self.pg:
+            return
+        try:
+            with self._lock:
+                conn = self._connect()
+                try:
+                    conn.isolation_level = None
+                    conn.execute("VACUUM")
+                finally:
+                    conn.close()
+        except Exception as exc:  # noqa: BLE001
+            self._last_error = repr(exc)
+
     def archive_and_prune(self, retention_days: int, max_db_mb: int,
                           archive_dir: str = "") -> dict[str, Any]:
-        """按时间归档为 JSONL 后删除旧行；数据库超配额时继续淘汰最旧记录。"""
-        from datetime import datetime, timedelta, timezone
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, retention_days))).isoformat()
+        """先完整归档、再按主键精确删除；任一步失败都保留数据，绝不按时间整批删。"""
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(days=max(1, retention_days))).isoformat()
         directory = Path(archive_dir or str(Path(self.db_path).parent / "archive"))
-        rows = self._query(
-            "SELECT * FROM tool_calls WHERE timestamp_start < ? ORDER BY timestamp_start LIMIT 5000",
-            [cutoff],
-        )
-        archived = 0
-        if rows:
-            try:
-                directory.mkdir(parents=True, exist_ok=True)
-                path = directory / f"tool_calls-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}.jsonl"
-                with path.open("w", encoding="utf-8") as fh:
-                    for row in rows:
-                        fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
-                os.chmod(path, 0o600)
-                archived = len(rows)
-            except OSError:
-                archived = 0
-        if archived:
-            self._execute("DELETE FROM tool_calls WHERE timestamp_start < ?", [cutoff])
-        size_mb = 0.0
+        result: dict[str, Any] = {
+            "archived": 0, "archived_by_table": {}, "pruned": 0,
+            "size_mb": 0.0, "errors": [],
+        }
         try:
-            size_mb = Path(self.db_path).stat().st_size / (1024 * 1024)
-        except OSError:
-            pass
-        pruned = 0
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            result["errors"].append(f"归档目录不可用，未删除任何记录: {exc!r}")
+            return result
+
+        for table, time_col, pk in ARCHIVE_TABLES:
+            seq = 0
+            while True:
+                rows = self._query(
+                    f"SELECT * FROM {table} WHERE {time_col} < ? "
+                    f"ORDER BY {time_col}, {pk} LIMIT ?",
+                    [cutoff, ARCHIVE_BATCH],
+                )
+                if not rows:
+                    break
+                seq += 1
+                try:
+                    self._write_archive(rows, directory, table, seq)
+                except OSError as exc:
+                    result["errors"].append(f"{table} 归档失败，已保留原记录: {exc!r}")
+                    break
+                if not self._delete_ids(table, pk, [r[pk] for r in rows]):
+                    result["errors"].append(f"{table} 精确删除失败，归档副本仍在")
+                    break
+                result["archived"] += len(rows)
+                result["archived_by_table"][table] = (
+                    result["archived_by_table"].get(table, 0) + len(rows))
+                if len(rows) < ARCHIVE_BATCH:
+                    break
+
+        size_mb = self._db_size_mb()
         if size_mb > max_db_mb > 0:
-            old = self._query(
-                "SELECT request_id FROM tool_calls ORDER BY timestamp_start LIMIT 5000"
-            )
-            for row in old:
-                self._execute("DELETE FROM tool_calls WHERE request_id=?", [row["request_id"]])
-            pruned = len(old)
-            self._execute("VACUUM") if not self.pg else None
-        return {"archived": archived, "pruned": pruned, "size_mb": round(size_mb, 2)}
+            seq = 0
+            while size_mb > max_db_mb:
+                rows = self._query(
+                    "SELECT * FROM tool_calls ORDER BY timestamp_start, id LIMIT ?",
+                    [ARCHIVE_BATCH],
+                )
+                if not rows:
+                    break
+                seq += 1
+                try:
+                    self._write_archive(rows, directory, "tool_calls-quota", seq)
+                except OSError as exc:
+                    result["errors"].append(f"配额归档失败，已保留原记录: {exc!r}")
+                    break
+                if not self._delete_ids("tool_calls", "id", [r["id"] for r in rows]):
+                    result["errors"].append("配额精确删除失败，归档副本仍在")
+                    break
+                result["pruned"] += len(rows)
+                self._vacuum()
+                size_mb = self._db_size_mb()
+                if len(rows) < ARCHIVE_BATCH:
+                    break
+        result["size_mb"] = round(size_mb, 2)
+        return result
 
     def backup(self, target: str) -> str:
         from datetime import datetime, timezone

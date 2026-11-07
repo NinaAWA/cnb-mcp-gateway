@@ -88,6 +88,19 @@ def redact_json(value: Any) -> str:
         return redact_text(repr(value), limit=4096)
 
 
+def redact_params(params: Any) -> list[Any]:
+    """存储写入边界的单点脱敏：SQL 参数中的字符串统一过一遍规则。"""
+    out: list[Any] = []
+    for value in params:
+        if isinstance(value, str):
+            out.append(redact_text(value))
+        elif isinstance(value, (bytes, bytearray)):
+            out.append(redact_text(bytes(value).decode("utf-8", "replace")).encode("utf-8"))
+        else:
+            out.append(value)
+    return out
+
+
 def fingerprint(secret: str) -> str:
     """把已验证令牌转成不可逆短指纹，作为 client_id / actor_id。"""
     return "tok_" + hashlib.sha256(secret.encode("utf-8")).hexdigest()[:16]

@@ -39,7 +39,16 @@ services:
       - AUDIT_DB_DSN=${AUDIT_DB_DSN:-}
       - AUDIT_STRICT=${AUDIT_STRICT:-0}
       - AUDIT_MAX_FIELD_CHARS=${AUDIT_MAX_FIELD_CHARS:-32768}
+      - AUDIT_BUFFER_MAX=${AUDIT_BUFFER_MAX:-1000}
+      - MCP_SESSION_TTL=${MCP_SESSION_TTL:-3600}
       - MCP_TASK_LOG_DIR=/data/audit/task-logs
+      # OAuth 兼容开关默认关闭；开启会放宽回调精确匹配 / PKCE 强制要求
+      - OAUTH_ALLOW_ANY_REDIRECT=${OAUTH_ALLOW_ANY_REDIRECT:-0}
+      - OAUTH_ALLOW_NO_PKCE=${OAUTH_ALLOW_NO_PKCE:-0}
+      - MCP_OAUTH_TOKEN_TTL=${MCP_OAUTH_TOKEN_TTL:-2592000}
+      # 内部只读指标令牌由网关写入共享卷；留空时自动生成（0600）
+      - GATEWAY_METRICS_TOKEN=${GATEWAY_METRICS_TOKEN:-}
+      - GATEWAY_METRICS_TOKEN_FILE=/data/audit/.metrics_token
     volumes:
       - ./workspace:/workspace
       - audit-data:/data/audit
@@ -72,6 +81,9 @@ services:
       # 通过 HTTPS 域名访问后台时必须设为 1。
       - ADMIN_COOKIE_SECURE=${ADMIN_COOKIE_SECURE:-0}
       - GATEWAY_URL=http://mcp-gateway:8765
+      - GATEWAY_METRICS_TOKEN=${GATEWAY_METRICS_TOKEN:-}
+      - GATEWAY_METRICS_TOKEN_FILE=/data/audit/.metrics_token
+      - MCP_SESSION_TTL=${MCP_SESSION_TTL:-3600}
       - AUDIT_DB_PATH=/data/audit/audit.db
       - AUDIT_DB_DSN=${AUDIT_DB_DSN:-}
       - AUDIT_EXPORT_DIR=/data/audit/exports
@@ -99,6 +111,7 @@ services:
       - AUDIT_DB_DSN=${AUDIT_DB_DSN:-}
       - AUDIT_RETENTION_DAYS=${AUDIT_RETENTION_DAYS:-90}
       - AUDIT_MAX_DB_MB=${AUDIT_MAX_DB_MB:-512}
+      - AUDIT_ARCHIVE_BATCH=${AUDIT_ARCHIVE_BATCH:-1000}
       - AUDIT_BACKUP_KEEP=${AUDIT_BACKUP_KEEP:-7}
       - AUDIT_BACKUP_ENABLED=${AUDIT_BACKUP_ENABLED:-1}
       - AUDIT_MAINTENANCE_INTERVAL=${AUDIT_MAINTENANCE_INTERVAL:-300}

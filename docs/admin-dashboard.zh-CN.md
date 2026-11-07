@@ -55,6 +55,19 @@ docker logs cnb-mcp-admin-web | grep -A4 "自动生成"   # 未设置 ADMIN_PASS
   `ADMIN_BIND_HOST=0.0.0.0` 并重启后台服务（默认值仍为 `127.0.0.1`）。这会让后台随预览 URL 可达，
   因此务必先设置强口令、开启 MFA，看完后恢复默认绑定。
 - 通过公网访问后台时建议再加一层来源 IP 限制 / SSO；后台的`/api/config` 不返回任何敏感值明文。
+- **健康接口拆分**：网关公开 `/health` 只返回 `status`、`service`、`uptime_seconds`
+  与 `audit.healthy`；工具数、审计健康详情和进程 / 磁盘 / 容器指标移到 `/health/details`，
+  必须携带有效 Bearer 或内部只读指标令牌。Compose healthcheck 仍用 `/health`。
+- **内部指标令牌**：网关入口在共享卷幂等生成 `/data/audit/.metrics_token`（权限 `600`，
+  重启不变），也可通过 `GATEWAY_METRICS_TOKEN` 显式指定。后台用它请求 `/health/details`，
+  失败自动降级到最小 `/health`；该令牌**只允许访问详情接口**，不是 `MCP_TOKEN`，
+  不能用于任何业务路径，也绝不交给 agent。
+- **OAuth 加固**：`redirect_uri` 与 DCR 注册值精确匹配（拒绝片段 / 通配符 / 内嵌凭据），
+  默认强制 PKCE `S256` 并核对 `code_verifier`；令牌按 `MCP_OAUTH_TOKEN_TTL` 过期并清理。
+  `OAUTH_ALLOW_ANY_REDIRECT=1` / `OAUTH_ALLOW_NO_PKCE=1` 是仅供旧客户端的显式降级开关，
+  默认 `0`，开启会降低安全性。
+- **REST `confirm` 严格解析**：只接受布尔真或 `true/1/yes/on`；`"false"`、`"0"` 等字符串
+  不再被误判为「已确认」而放行破坏性命令。
 
 ## 4. 审计数据模型
 
@@ -64,17 +77,34 @@ docker logs cnb-mcp-admin-web | grep -A4 "自动生成"   # 未设置 ADMIN_PASS
 
 - **身份边界**：`client_id` / `actor_id` 来自已验证 Bearer Token 的 SHA-256 指纹；
   `declared_client`（`X-MCP-Client`、User-Agent、clientInfo）只是自报名称，**仅用于展示，绝不用于鉴权**。
-- **默认脱敏**：令牌、密码、API Key、私钥 PEM、Bearer、URL basic auth、环境变量转储统一替换为
-  `***REDACTED***`，覆盖参数、输出、错误信息与导出文件。
+- **单一脱敏入口**：所有 SQL 写参数在 `AuditStorage._execute()` 统一过 `redact_params()`
+  （`redact_text`）；派生 Git / 实验字段、旧式 `audit.log`、任务日志回读、事件详情、
+  归档 JSONL、三种导出与后台读取接口都复用同一规则。令牌、密码、API Key、私钥 PEM、
+  Bearer、URL basic auth、环境变量转储统一替换为 `***REDACTED***`；修复前落库的存量明文行
+  在读取 / 归档 / 导出时同样被脱敏。
 - **大输出保护**：超过 `AUDIT_MAX_FIELD_CHARS`（默认 32KB）的文本写入权限 `600` 的 artifact 文件，
   数据库只保存 `result_ref`、大小、SHA-256 与预览；详情接口可从引用读回完整内容。
 - **后台任务独立生命周期**：`run_command_background` 的工具调用成功与训练任务真实运行结果分开记录；
-  自然结束由 `_task_reaper()` 补写 `done`，超时/停止分别记录 `killed-timeout` / `killed`。
+  `_task_reaper()` 与 `get_task_status()` 按退出码补写 `done`（0）或 `failed`（非 0），
+  超时/停止分别记录 `killed-timeout` / `killed`。
 - **Git / 实验**：由统一采集层解析 `run_command` 中的 git 命令与后台任务，不侵入工具实现。
-- **降级不中断任务**：写库失败时进入有界内存缓冲并标记降级，恢复后自动补写；
-  `AUDIT_STRICT=1` 时才对高风险工具（如 `run_command`、`write_file`）拒绝执行。
-- **保留策略**：`audit-storage` 每 300 秒归档超过 90 天的记录为 JSONL、按 512MB 配额裁剪、保留 7 份
-  `VACUUM INTO` 备份并写心跳文件 `/data/audit/.maintenance.ok`。
+- **严格审计三态**：`available()` 只表示「还能缓冲写入」；`persistence_state()` 给出
+  healthy / bufferable / persisted，`confirm_persisted(request_id)` 还要求数据库健康、
+  缓冲为空且能回读刚写入的 `RECEIVED` 行。`AUDIT_STRICT=1` 时高风险工具（如
+  `run_command`、`write_file`）用它决定放行；终态写入失败会记录 `audit_strict_violation`
+  并体现在 `health()["strict_violations"]`。默认 `AUDIT_STRICT=0` 仍是降级缓冲不中断任务。
+- **完整归档与导出**：归档以 `AUDIT_ARCHIVE_BATCH`（默认 1000，上限 5000）分批查询，
+  写 JSONL（权限 600）→ flush / fsync → 回读核验行数 → 只按该批主键精确删除 → 循环至无残留；
+  任一步失败都保留原记录并写 `audit_storage_warning`，绝不按时间范围整批删除。配额裁剪同样先归档。
+  导出用主键游标分页并固定时间上界，`/api/export/stream` 为流式生成器，内存 O(批)。
+- **保留策略**：覆盖 `tool_calls`、`audit_events`、`background_tasks`、`git_operations`、
+  `experiment_runs`、`approval_events`、`login_attempts`、`export_jobs`、过期管理员会话与
+  过期客户端会话；`admin_settings` 是配置，不清理。`audit-storage` 每 300 秒按
+  `AUDIT_RETENTION_DAYS`（90 天）归档、按 512MB 配额裁剪、保留 7 份 `VACUUM INTO` 备份
+  并写心跳文件 `/data/audit/.maintenance.ok`。
+- **统计准确性**：活跃客户端按 `last_seen` / `token_expires` 与 `MCP_SESSION_TTL` 实时判定；
+  趋势与耗时分布走 SQLite 时间函数或 PostgreSQL `EXTRACT` 的 SQL 聚合，失败时回退到
+  有界（2 万行）Python 聚合。
 
 ## 5. 后台功能
 
@@ -129,6 +159,7 @@ task-logs/                               后台任务日志
 exports/                                 导出文件（权限 600）
 archive/  backup/                        归档与备份
 .admin_password                          自动生成的管理员口令（权限 600）
+.metrics_token                           内部只读指标令牌（权限 600，重启不变）
 .maintenance.ok                          维护心跳
 ```
 
@@ -169,6 +200,25 @@ python -m venv .venv
 - [ ] 停止后台容器不影响正在运行的实验；网关 `/health` 不可达时后台仍显示历史与「离线」状态。
 - [ ] 监控页面明确区分两个容器来源，不冒充宿主机指标。
 
+本轮修复新增的必验项：
+
+- [ ] **空 `MCP_TOKEN` 启动**：入口表达式可执行，自动生成 48 位字母数字口令，
+  `bash -n docker/entrypoint.sh` 通过，`/health` 返回 200。
+- [ ] **>5000 条归档不丢数据**：造 6000 条过期记录，归档文件行数 = 6000、
+  库中过期行 = 0、未过期记录保留、`errors` 为空；归档目录失败时 1200 条原记录全部保留。
+- [ ] **>500 条导出完整**：`/api/export/stream` 与后台导出任务都返回全部 1200 行，
+  CSV / JSON / JSONL 均为单一合法文档，不出现重复表头或截断。
+- [ ] **严格审计持久化确认**：`AUDIT_STRICT=1` 下模拟写库失败，高风险工具被拒绝；
+  终态写入失败产生 `audit_strict_violation` 与健康状态计数。
+- [ ] **脱敏全链路**：所有子表、事件详情、旧式 `audit.log`、归档 JSONL 与三种导出
+  都不含明文凭据（含修复前落库的存量行）。
+- [ ] **健康接口隔离**：公开 `/health` 不含工具数 / 进程 / 磁盘 / 审计路径；
+  `/health/details` 匿名 401，Bearer 与内部只读令牌 200，且内部令牌不能访问业务路径。
+- [ ] **OAuth 加固**：`redirect_uri` 精确匹配、强制 PKCE S256、令牌过期被拒并清理；
+  两个兼容开关默认关闭时旧流程被拒。
+- [ ] **重启持久化**：重建容器后历史记录、管理员口令与内部指标令牌均不变；
+  原有 21 个工具与 `/run_command` 行为不变。
+
 ## 9. 故障排查
 
 | 现象 | 检查 |
@@ -178,6 +228,9 @@ python -m venv .venv
 | 忘记密码 | `docker compose exec mcp-admin-web cat /data/audit/.admin_password` |
 | 登录被锁 | 等待 `ADMIN_LOGIN_LOCK_MINUTES`，或审查 `login_attempts` 事件 |
 | 仪表盘显示网关离线 | 检查 `GATEWAY_URL=http://mcp-gateway:8765` 与网关 `MCP_BIND=0.0.0.0`；后台仍可查历史 |
+| 监控页缺少网关容器指标 | 后台已降级到公开 `/health`；检查共享卷 `/data/audit/.metrics_token` 是否存在且权限 600，两个服务的 `GATEWAY_METRICS_TOKEN_FILE` 是否一致 |
+| `/health/details` 返回 401 | 该接口需有效 Bearer 或内部只读指标令牌；匿名访问属预期行为，存活检查请用 `/health` |
+| 归档告警但记录未减少 | 归档失败会刻意保留全部数据；查看 `audit_storage_warning` 事件与归档目录权限 / 磁盘空间，修复后维护任务会重试 |
 | 审计状态「降级」 | 检查卷权限与磁盘；恢复后缓冲会自动补写；查看 `audit_storage_warning` 事件 |
 | SSE 无新事件 | 确认调用确实发生；SSE 只推送 `tool_call` / `task_lifecycle` / `admin_auth` 三类已落库事件 |
 | 看不到 GPU / 容器列表 | 未透传 `nvidia-smi` 或未挂载 `docker.sock`（默认如此） |
@@ -194,3 +247,21 @@ python -m venv .venv
   后台容器停机期间 MCP 调用仍成功，恢复后台后可查到该记录。
 - 自动测试：`.venv/bin/python -m pytest tests -q` → 21 passed。
 - 镜像补装 `git`，使 Git 命令与对应审计在容器内可用。
+
+### 本轮修复记录（基线 `6c712870`，分支 `fix/audit-integrity-6c71287`）
+
+- 启动：修正空 `MCP_TOKEN` 随机口令表达式的 `string.digits` 错误；网关角色幂等生成
+  `/data/audit/.metrics_token`（600），角色分流与 `MCP_TUNNEL_DISABLED` 行为不变。
+- 完整性：归档改为「分批写盘核验 → 按主键精确删除 → 循环至无残留」，覆盖所有历史表；
+  导出改为主键游标 + 固定时间上界，`/api/export/stream` 流式写出。
+- 严格审计：新增 `persistence_state()` / `confirm_persisted()` / `note_strict_violation()`，
+  区分可缓冲与已确认持久化；`AUDIT_STRICT` 默认仍为 0。
+- 脱敏：写库参数统一走 `redact_params()`；派生字段、旧式日志、任务日志回读、
+  归档、导出与后台读取接口都复用同一规则。
+- 鉴权：`/health` 最小化，新增需鉴权的 `/health/details`；OAuth 令牌带过期并清理，
+  `redirect_uri` 精确匹配、默认强制 PKCE S256；REST `confirm` 严格解析。
+- 统计：会话按 TTL 判活，后台任务按退出码区分 `done` / `failed`，
+  趋势与耗时分布改为 SQL 聚合（失败回退有界 Python 聚合）。
+- 回归：新增 `tests/test_oauth.py`、`tests/test_startup.py`，并扩充 3 个既有测试文件；
+  `.venv/bin/python -m pytest tests -q` → 44 passed（原有 21 个全部保留）。
+- 部署验收与双远端同步见本节上方清单与 README 的「本轮修复的验证命令」。

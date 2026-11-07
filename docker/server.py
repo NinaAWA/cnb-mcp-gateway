@@ -16,7 +16,8 @@ CNB Command MCP Gateway（OAuth 版，通用 MCP）
   - OAuth 端点（/authorize /token /register /.well-known/*）免 Bearer，
     但 /authorize 的同意页要求输入 MCP_TOKEN 作为口令，签发授权码后换取 token。
   - 支持 PKCE S256、动态客户端注册（DCR）、authorization_code。
-  - redirect_uri 接受任意合法绝对 URI（https/http/自定义 scheme），兼容各 agent。
+  - redirect_uri 必须与 DCR 注册值精确匹配；签发的 token 按 TOKEN_TTL 过期。
+  - /health 只暴露最小化存活信息；/health/details 需 Bearer 或内部只读指标令牌。
   - 命令前缀白名单 MCP_ALLOWED_PREFIXES；全程审计日志 audit.log。
   - 只监听 127.0.0.1，由 cloudflared 隧道负责 TLS 与公网暴露。
 
@@ -40,6 +41,7 @@ import logging
 import datetime
 import secrets
 import hashlib
+import hmac
 import base64
 import html
 import time
@@ -183,6 +185,12 @@ AUDIT = logging.getLogger("audit")
 
 
 def audit(msg: str):
+    """旧式文件日志同样经过统一脱敏入口，避免命令里的凭据落到 audit.log。"""
+    try:
+        from gateway.audit.redaction import redact_text
+        msg = redact_text(msg)
+    except Exception:  # noqa: BLE001 - 日志不能拖垮命令执行
+        pass
     AUDIT.info(f"{datetime.datetime.now(datetime.timezone.utc).isoformat()} {msg}")
 
 
@@ -194,11 +202,79 @@ if not TOKEN:
 # OAuth 最小实现（authorization_code + PKCE S256 + DCR）
 # ---------------------------------------------------------------------------
 
-AUTH_CODES: dict = {}   # code -> {expires, redirect_uri, challenge, method, fallback}
-ISSUED_TOKENS: set = set()
+AUTH_CODES: dict = {}   # code -> {expires, redirect_uri, challenge, method, client_id}
+ISSUED_TOKENS: dict = {}  # access_token -> 过期时间戳（epoch）；中间件按此判活并清理
 CLIENTS: dict = {}      # client_id -> {"redirect_uris": [...]}（DCR 注册信息）
+_OAUTH_LOCK = threading.Lock()
 CODE_TTL = 600
-TOKEN_TTL = 60 * 60 * 24 * 30
+TOKEN_TTL = _env_int("MCP_OAUTH_TOKEN_TTL", 60 * 60 * 24 * 30, 60, 60 * 60 * 24 * 365)
+# 兼容旧客户端的显式降级开关，默认关闭；开启会放宽回调匹配与 PKCE 要求。
+OAUTH_ALLOW_ANY_REDIRECT = _env_bool("OAUTH_ALLOW_ANY_REDIRECT", False)
+OAUTH_ALLOW_NO_PKCE = _env_bool("OAUTH_ALLOW_NO_PKCE", False)
+METRICS_TOKEN_FILE = Path(
+    os.environ.get("GATEWAY_METRICS_TOKEN_FILE", "/data/audit/.metrics_token"))
+
+
+def _metrics_token() -> str:
+    """内部只读指标令牌：优先环境变量，其次网关在共享卷生成的 0600 文件。"""
+    configured = os.environ.get("GATEWAY_METRICS_TOKEN", "").strip()
+    if configured:
+        return configured
+    try:
+        return METRICS_TOKEN_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _token_is_authorized(presented: str) -> bool:
+    """校验静态口令或已签发的 OAuth 令牌，并顺带清理过期令牌。"""
+    if not presented:
+        return False
+    if hmac.compare_digest(presented, TOKEN):
+        return True
+    now = time.time()
+    with _OAUTH_LOCK:
+        for key, expires in list(ISSUED_TOKENS.items()):
+            if expires <= now:
+                ISSUED_TOKENS.pop(key, None)
+        expires = ISSUED_TOKENS.get(presented)
+        return bool(expires and expires > now)
+
+
+def _normalize_redirect(uri) -> str:
+    """规范化回调地址：拒绝片段、通配符、凭据与非绝对 URI。"""
+    text = str(uri or "").strip()
+    if not text or len(text) > 2048 or any(ch.isspace() for ch in text):
+        return ""
+    if "#" in text or "*" in text or "://" not in text:
+        return ""
+    parts = urllib.parse.urlsplit(text)
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*", parts.scheme or ""):
+        return ""
+    if not parts.netloc or "@" in parts.netloc:
+        return ""
+    return urllib.parse.urlunsplit(
+        (parts.scheme.lower(), parts.netloc.lower(), parts.path, parts.query, "")
+    )
+
+
+def _resolve_redirect(client_id: str, redirect_uri) -> tuple[str, str]:
+    """返回 (规范化回调地址, 错误原因)；严格模式要求与 DCR 注册值精确匹配。"""
+    normalized = _normalize_redirect(redirect_uri)
+    if not normalized:
+        return "", "redirect_uri 格式不合法（必须是无片段、无通配符的绝对 URI）"
+    if not OAUTH_ALLOW_ANY_REDIRECT:
+        with _OAUTH_LOCK:
+            registered = tuple(CLIENTS.get(client_id, {}).get("redirect_uris", []))
+        if not registered or normalized not in registered:
+            return "", "redirect_uri 与已注册客户端的回调地址不匹配"
+    return normalized, ""
+
+
+def _pkce_valid(challenge: str, method: str) -> bool:
+    return (method.strip().upper() == "S256" and 43 <= len(challenge) <= 128
+            and re.fullmatch(r"[A-Za-z0-9._~-]+", challenge) is not None)
+
 
 OAUTH_PATHS = {
     "/authorize",
@@ -261,9 +337,28 @@ async def register_endpoint(request):
         body = await request.json()
     except Exception:  # noqa: BLE001
         body = {}
+    raw_uris = body.get("redirect_uris") or []
+    if not isinstance(raw_uris, list):
+        return JSONResponse({"error": "invalid_redirect_uri"}, status_code=400)
+    uris: list[str] = []
+    for raw in raw_uris:
+        normalized = _normalize_redirect(raw)
+        if not normalized:
+            return JSONResponse(
+                {"error": "invalid_redirect_uri",
+                 "error_description": "回调地址必须是不含片段/通配符的绝对 URI"},
+                status_code=400,
+            )
+        if normalized not in uris:
+            uris.append(normalized)
+    if not uris and not OAUTH_ALLOW_ANY_REDIRECT:
+        return JSONResponse(
+            {"error": "invalid_redirect_uri", "error_description": "至少注册一个回调地址"},
+            status_code=400,
+        )
     client_id = "cnb-" + secrets.token_urlsafe(16)
-    uris = [str(u) for u in (body.get("redirect_uris") or [])]
-    CLIENTS[client_id] = {"redirect_uris": uris}
+    with _OAUTH_LOCK:
+        CLIENTS[client_id] = {"redirect_uris": uris}
     audit(f"DCR client_id={client_id} uris={uris}")
     return JSONResponse(
         {
@@ -297,17 +392,31 @@ async def authorize_endpoint(request):
         qp = request.query_params
         if qp.get("response_type") != "code":
             return PlainTextResponse("response_type must be 'code'", 400)
+        client_id = str(qp.get("client_id", ""))
+        requested = str(qp.get("redirect_uri", ""))
+        if not requested:
+            with _OAUTH_LOCK:
+                registered = tuple(CLIENTS.get(client_id, {}).get("redirect_uris", []))
+            if len(registered) == 1:
+                requested = registered[0]
+        redirect_uri, error = _resolve_redirect(client_id, requested)
+        if error:
+            audit(f"AUTHORIZE DENIED redirect client_id={client_id} reason={error}")
+            return PlainTextResponse(error, 400)
+        challenge = str(qp.get("code_challenge", ""))
+        method = str(qp.get("code_challenge_method", ""))
+        if not OAUTH_ALLOW_NO_PKCE and not _pkce_valid(challenge, method):
+            return PlainTextResponse("必须使用 PKCE S256 校验码", 400)
+        fields = dict(qp.multi_items())
+        fields["redirect_uri"] = redirect_uri
         hidden = "".join(
             f'<input type="hidden" name="{html.escape(k, quote=True)}" '
-            f'value="{html.escape(v, quote=True)}"/>'
-            for k, v in qp.multi_items()
+            f'value="{html.escape(str(v), quote=True)}"/>'
+            for k, v in fields.items()
         )
-        reg = CLIENTS.get(str(qp.get("client_id", "")), {}).get("redirect_uris", [])
-        shown = qp.get("redirect_uri", "") or (reg[0] if reg else "")
         return HTMLResponse(
             _AUTHORIZE_FORM.format(
-                redirect=html.escape(shown, quote=True),
-                hidden=hidden,
+                redirect=html.escape(redirect_uri, quote=True), hidden=hidden,
             )
         )
     form = await request.form()
@@ -315,24 +424,23 @@ async def authorize_endpoint(request):
         audit("AUTHORIZE DENIED (bad password)")
         return HTMLResponse("<h3>口令错误</h3>", status_code=401)
     client_id = str(form.get("client_id", ""))
-    redirect_uri = str(form.get("redirect_uri", ""))
-    registered = CLIENTS.get(client_id, {}).get("redirect_uris", [])
-    fallback = False
-    if not redirect_uri and registered:
-        redirect_uri = registered[0]
-        fallback = True
-    # 接受任意合法绝对 URI（https/http/自定义 scheme），兼容所有 agent 的回调
-    if not redirect_uri or "://" not in redirect_uri:
-        audit(f"AUTHORIZE DENIED redirect={redirect_uri!r} registered={registered}")
-        return PlainTextResponse(f"redirect_uri 不被允许: {redirect_uri!r}", 400)
+    redirect_uri, error = _resolve_redirect(client_id, form.get("redirect_uri", ""))
+    if error:
+        audit(f"AUTHORIZE DENIED redirect client_id={client_id} reason={error}")
+        return PlainTextResponse(error, 400)
+    challenge = str(form.get("code_challenge", ""))
+    method = str(form.get("code_challenge_method", ""))
+    if not OAUTH_ALLOW_NO_PKCE and not _pkce_valid(challenge, method):
+        return PlainTextResponse("必须使用 PKCE S256 校验码", 400)
     code = secrets.token_urlsafe(32)
-    AUTH_CODES[code] = {
-        "expires": time.time() + CODE_TTL,
-        "redirect_uri": redirect_uri,
-        "challenge": str(form.get("code_challenge", "")),
-        "method": str(form.get("code_challenge_method", "")),
-        "fallback": fallback,
-    }
+    with _OAUTH_LOCK:
+        AUTH_CODES[code] = {
+            "expires": time.time() + CODE_TTL,
+            "redirect_uri": redirect_uri,
+            "client_id": client_id,
+            "challenge": challenge,
+            "method": method,
+        }
     audit(f"AUTHORIZE OK code_issued redirect={redirect_uri}")
     state = str(form.get("state", ""))
     sep = "&" if "?" in redirect_uri else "?"
@@ -347,18 +455,33 @@ async def token_endpoint(request):
     if form.get("grant_type") != "authorization_code":
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
     code = str(form.get("code", ""))
-    rec = AUTH_CODES.pop(code, None)
-    if not rec or rec["expires"] < time.time():
+    with _OAUTH_LOCK:
+        now = time.time()
+        for key, item in list(AUTH_CODES.items()):
+            if item["expires"] <= now:
+                AUTH_CODES.pop(key, None)
+        # 校验通过后才消费授权码；客户端输错 verifier 不必重新走一遍授权。
+        rec = AUTH_CODES.get(code)
+    if not rec or rec["expires"] < now:
         return JSONResponse({"error": "invalid_grant"}, status_code=400)
-    provided = str(form.get("redirect_uri", ""))
-    if provided != rec["redirect_uri"] and not (provided == "" and rec.get("fallback")):
+    client_id = str(form.get("client_id", ""))
+    if client_id and client_id != rec["client_id"]:
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
+    provided = _normalize_redirect(form.get("redirect_uri", ""))
+    if not provided and OAUTH_ALLOW_ANY_REDIRECT:
+        provided = rec["redirect_uri"]  # 仅在显式开启旧客户端兼容开关时放宽
+    if provided != rec["redirect_uri"]:
         return JSONResponse({"error": "invalid_grant"}, status_code=400)
     if rec["challenge"]:
-        calc = _pkce_s256(str(form.get("code_verifier", "")))
-        if calc != rec["challenge"]:
+        verifier = str(form.get("code_verifier", ""))
+        if not verifier or not hmac.compare_digest(_pkce_s256(verifier), rec["challenge"]):
             return JSONResponse({"error": "invalid_grant"}, status_code=400)
+    elif not OAUTH_ALLOW_NO_PKCE:
+        return JSONResponse({"error": "invalid_grant"}, status_code=400)
     tok = secrets.token_urlsafe(32)
-    ISSUED_TOKENS.add(tok)
+    with _OAUTH_LOCK:
+        AUTH_CODES.pop(code, None)
+        ISSUED_TOKENS[tok] = now + TOKEN_TTL
     audit("TOKEN ISSUED")
     return JSONResponse(
         {"access_token": tok, "token_type": "Bearer", "expires_in": TOKEN_TTL}
@@ -541,20 +664,22 @@ def _task_watchdog(task_id: str, timeout: int):
 
 
 def _task_reaper():
-    """统一收割已自然结束的后台任务，补写终态；纯观测，不干预任务进程。"""
+    """收割已自然结束的后台任务，按退出码补写 done / failed 终态。"""
     while True:
         time.sleep(2)
-        finished: list[tuple[str, dict]] = []
+        finished: list[tuple[str, dict, int, str]] = []
         try:
             with _TASK_LOCK:
                 for task_id, rec in list(_TASKS.items()):
-                    if rec.get("status") == "running" and rec["proc"].poll() is not None:
-                        rec["status"] = "done"
-                        finished.append((task_id, dict(rec)))
+                    rc = rec["proc"].poll()
+                    if rec.get("status") == "running" and rc is not None:
+                        status = "done" if rc == 0 else "failed"
+                        rec["status"] = status
+                        finished.append((task_id, dict(rec), rc, status))
         except Exception:  # noqa: BLE001
             continue
-        for task_id, rec in finished:
-            _task_event(task_id, "done", rec, detail=f"exit_code={rec['proc'].poll()}")
+        for task_id, rec, rc, status in finished:
+            _task_event(task_id, status, rec, detail=f"exit_code={rc}")
 
 
 if AUDIT_ENABLED:
@@ -589,6 +714,10 @@ def run_command_background(command: str, cwd: str = WORKDIR, confirm: bool = Fal
         task_id = secrets.token_hex(8)
         log_path = _TASK_DIR / f"{task_id}.log"
         logf = open(log_path, "wb")
+        try:
+            os.chmod(log_path, 0o600)
+        except OSError:
+            pass
         proc = subprocess.Popen(
             command, shell=True, cwd=cwd, stdout=logf, stderr=subprocess.STDOUT,
         )
@@ -629,12 +758,17 @@ def _read_log(log_path: Path, tail: int, offset: int) -> str:
         lines = lines[offset:]
     if tail:
         lines = lines[-tail:]
-    return "\n".join(lines) if lines else "(暂无任何输出)"
+    text = "\n".join(lines) if lines else "(暂无任何输出)"
+    try:
+        from gateway.audit.redaction import redact_text
+        return redact_text(text)
+    except Exception:  # noqa: BLE001
+        return text
 
 
 @mcp.tool()
 def get_task_status(task_id: str) -> str:
-    """查询后台任务状态（running / done / killed-timeout / killed / not-found）。"""
+    """查询后台任务状态（running / done / failed / killed-timeout / killed / not-found）。"""
     with _TASK_LOCK:
         rec = _TASKS.get(task_id)
         if not rec:
@@ -647,11 +781,11 @@ def get_task_status(task_id: str) -> str:
         else:
             status = rec.get("status", "done")
             if status == "running":
-                status = "done"
-                rec["status"] = "done"
+                status = "done" if rc == 0 else "failed"
+                rec["status"] = status
                 newly_finished = True
     if newly_finished:
-        _task_event(task_id, "done", rec, detail=f"exit_code={rc}")
+        _task_event(task_id, status, rec, detail=f"exit_code={rc}")
     audit(f"TASK_STATUS task_id={task_id} status={status}")
     return (f"task_id={task_id}\nstatus={status}\n"
             f"exit_code={rc}\ncmd={rec['cmd']}\nlog={rec['log']}")
@@ -2153,6 +2287,17 @@ def _base(request) -> str:
     return f"https://{host}"
 
 
+def _strict_confirm(value) -> bool:
+    """只接受真正的确认：bool("false") / bool("0") 曾把任意字符串误判为已确认。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return False
+
+
 async def run_command_rest(request):
     try:
         body = await request.json()
@@ -2160,7 +2305,7 @@ async def run_command_rest(request):
         return JSONResponse({"output": "ERROR: 请求体必须是 JSON"}, status_code=400)
     command = str(body.get("command", ""))
     cwd = str(body.get("cwd", WORKDIR))
-    confirm = bool(body.get("confirm", False))
+    confirm = _strict_confirm(body.get("confirm", False))
     try:
         timeout = int(body.get("timeout", 60))
     except Exception:  # noqa: BLE001
@@ -2178,7 +2323,23 @@ SERVER_STARTED = time.time()
 
 
 async def health_endpoint(request):
-    """容器 healthcheck：只读、免 Bearer，报告审计健康度与实际执行后端指标。"""
+    """公开存活检查：只返回最小字段，绝不泄露进程、磁盘、审计路径等运行细节。"""
+    healthy = False
+    if AUDIT_ENABLED:
+        try:
+            healthy = bool(_get_audit_storage().health().get("healthy"))
+        except Exception:  # noqa: BLE001
+            healthy = False
+    return JSONResponse({
+        "status": "ok",
+        "service": "mcp-gateway",
+        "uptime_seconds": int(time.time() - SERVER_STARTED),
+        "audit": {"healthy": healthy},
+    })
+
+
+async def health_details_endpoint(request):
+    """鉴权后的完整运行信息：Bearer 或内部只读指标令牌可访问。"""
     payload = {
         "status": "ok", "service": "mcp-gateway", "source": "mcp-gateway",
         "started_at": datetime.datetime.fromtimestamp(
@@ -2194,6 +2355,8 @@ async def health_endpoint(request):
             payload["audit"] = _get_audit_storage().health()
         except Exception as exc:  # noqa: BLE001
             payload["audit"] = {"healthy": False, "last_error": repr(exc)}
+    else:
+        payload["audit"] = {"healthy": False, "last_error": "审计采集层不可用"}
     try:
         from gateway.monitoring.system import collect
         payload["metrics"] = collect("mcp-gateway")
@@ -2248,10 +2411,14 @@ class BearerAuthMiddleware:
                     k.decode().lower(): v.decode() for k, v in scope.get("headers", [])
                 }
                 raw = headers.get("authorization", "")
-                ok = raw.startswith("Bearer ") and (
-                    raw[len("Bearer "):].strip() == TOKEN
-                    or raw[len("Bearer "):].strip() in ISSUED_TOKENS
-                )
+                presented = (raw[len("Bearer "):].strip()
+                             if raw[:7].lower() == "bearer " else "")
+                # 内部只读指标令牌只允许访问 /health/details，绝不用于业务路径。
+                metrics_ok = False
+                if path == "/health/details" and scope.get("method") == "GET" and presented:
+                    internal = _metrics_token()
+                    metrics_ok = bool(internal) and hmac.compare_digest(presented, internal)
+                ok = metrics_ok or _token_is_authorized(presented)
                 if not ok:
                     await send(
                         {
@@ -2301,6 +2468,7 @@ app.router.routes.append(
 app.router.routes.append(Route("/openapi.yaml", openapi_spec, methods=["GET"]))
 app.router.routes.append(Route("/logo.png", logo_png, methods=["GET"]))
 app.router.routes.append(Route("/health", health_endpoint, methods=["GET"]))
+app.router.routes.append(Route("/health/details", health_details_endpoint, methods=["GET"]))
 
 if AUDIT_ENABLED:
     try:
