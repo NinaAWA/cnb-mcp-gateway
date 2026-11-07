@@ -1,6 +1,59 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 同一镜像按角色启动：MCP 网关 / 管理后台 / 审计维护 / 可选隧道。
+ROLE="${MCP_SERVICE_ROLE:-gateway}"
+cd /app
+
+case "$ROLE" in
+  admin-web)
+    mkdir -p /data/audit
+    PASS_FILE="${ADMIN_PASSWORD_FILE:-/data/audit/.admin_password}"
+    ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
+    if [ -z "${ADMIN_PASSWORD:-}" ]; then
+      if [ -f "$PASS_FILE" ]; then
+        ADMIN_PASSWORD="$(cat "$PASS_FILE")"
+        echo "[entrypoint] 使用数据卷中保存的管理员口令: $PASS_FILE"
+      else
+        ADMIN_PASSWORD="$(python -c 'import secrets;print(secrets.token_urlsafe(24))')"
+        (umask 077; printf '%s\n' "$ADMIN_PASSWORD" > "$PASS_FILE")
+      fi
+      echo "==================================================================="
+      echo " [自动生成] Admin Web 管理员口令（已保存到 $PASS_FILE，重启不变）"
+      echo "   账号: $ADMIN_USERNAME"
+      echo "   密码: $ADMIN_PASSWORD"
+      echo "==================================================================="
+    fi
+    export ADMIN_PASSWORD ADMIN_USERNAME
+    echo "[entrypoint] 启动 Admin Web @ ${ADMIN_BIND:-0.0.0.0}:${ADMIN_PORT:-8788}"
+    exec uvicorn gateway.admin.api:app \
+      --host "${ADMIN_BIND:-0.0.0.0}" --port "${ADMIN_PORT:-8788}" --log-level info
+    ;;
+
+  maintenance)
+    echo "[entrypoint] 启动 audit-storage 维护服务"
+    exec python -m gateway.maintenance
+    ;;
+
+  cloudflared)
+    UPSTREAM="${MCP_UPSTREAM_URL:-http://localhost:8765}"
+    if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
+      echo "[entrypoint] 命名隧道模式（固定 HTTPS 域名）"
+      exec cloudflared tunnel run --token "$CF_TUNNEL_TOKEN"
+    fi
+    echo "[entrypoint] quick tunnel 模式（随机 HTTPS 域名），上游 $UPSTREAM"
+    exec cloudflared tunnel --url "$UPSTREAM" --no-autoupdate
+    ;;
+
+  gateway)
+    ;;
+
+  *)
+    echo "[entrypoint] 未知 MCP_SERVICE_ROLE=$ROLE" >&2
+    exit 1
+    ;;
+esac
+
 PORT="${MCP_PORT:-8765}"
 BIND="${MCP_BIND:-127.0.0.1}"
 WORKDIR="${MCP_WORKDIR:-/workspace}"
@@ -37,7 +90,7 @@ mkdir -p "$WORKDIR"
 
 # 密钥：未提供则随机生成（容器重建会变化，请从 docker logs 记录）
 if [ -z "${MCP_TOKEN:-}" ]; then
-  MCP_TOKEN="$(python3 -c 'import secrets,string;print("".join(secrets.choice(string.ascii_letters+string.digits) for _ in range(48)))')"
+  MCP_TOKEN="$(python -c 'import secrets,string;print("".join(secrets.choice(string.ascii_letters+digits) for _ in range(48)))')"
   echo "==================================================================="
   echo " [自动生成] MCP_TOKEN（重开容器会变化，请妥善保存）:"
   echo "   $MCP_TOKEN"
@@ -65,9 +118,15 @@ EOF
 chmod 600 /app/.env
 
 echo "[entrypoint] 启动 MCP server @ $BIND:$PORT"
-cd /app
 uvicorn server:app --host "$BIND" --port "$PORT" --log-level info &
 SERVER_PID=$!
+
+if [ "${MCP_TUNNEL_DISABLED:-0}" = "1" ]; then
+  echo "[entrypoint] 已禁用内置 cloudflared；公网入口由独立 tunnel 服务提供"
+  trap 'kill -TERM "$SERVER_PID" 2>/dev/null; wait' TERM INT
+  wait "$SERVER_PID"
+  exit 0
+fi
 
 if [ -n "${CF_TUNNEL_TOKEN:-}" ]; then
   echo "[entrypoint] 命名隧道模式（固定 URL；需在 Cloudflare 把 ingress 指向 http://localhost:$PORT）"
@@ -105,5 +164,5 @@ else
   fi
 fi
 
-trap 'kill -TERM $SERVER_PID $TUNNEL_PID 2>/dev/null; wait' TERM INT
+trap 'kill -TERM "$SERVER_PID" "$TUNNEL_PID" 2>/dev/null; wait' TERM INT
 wait

@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>管理员登录 · CNB MCP Admin</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="login-body">
+  <main class="login-card">
+    <div class="brand">
+      <span class="brand-mark">MCP</span>
+      <div>
+        <h1>管理后台登录</h1>
+        <p>独立认证 · 与 MCP_TOKEN 分离</p>
+      </div>
+    </div>
+    <form id="login-form" autocomplete="off">
+      <label>管理员账号
+        <input name="username" value="{{ username }}" autocomplete="username" required>
+      </label>
+      <label>口令
+        <input name="password" type="password" autocomplete="current-password" required>
+      </label>
+      {% if mfa_enabled %}
+      <label>动态口令（TOTP）
+        <input name="otp" inputmode="numeric" autocomplete="one-time-code" placeholder="6 位数字">
+      </label>
+      {% endif %}
+      <p class="error" id="login-error" role="alert">{{ error }}</p>
+      <button type="submit" class="btn primary">登录</button>
+    </form>
+    <p class="hint">首次启动若未设置 <code>ADMIN_PASSWORD</code>，随机口令会打印在容器日志中，
+      并保存在共享数据卷的受保护文件里（重启后不变）。后台与 MCP API 使用完全独立的访问控制，
+      未登录不能查看任何调用记录。</p>
+    <button class="theme-toggle" type="button" onclick="toggleTheme()" aria-label="切换主题">◐</button>
+  </main>
+  <script src="/static/app.js"></script>
+  <script>
+    document.getElementById('login-form').addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      const form = new FormData(ev.target);
+      const body = Object.fromEntries(form.entries());
+      const btn = ev.target.querySelector('button[type=submit]');
+      const err = document.getElementById('login-error');
+      btn.disabled = true; btn.textContent = '登录中…'; err.textContent = '';
+      try {
+        const res = await fetch('/api/login', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const data = await res.json();
+        if (data.ok) { location.href = '/'; return; }
+        err.textContent = data.message || '登录失败';
+      } catch (e) {
+        err.textContent = '网络错误：' + e;
+      }
+      btn.disabled = false; btn.textContent = '登录';
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CNB MCP Admin · 调用审计后台</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">MCP</span>
+        <div><h1>管理后台</h1><p>调用审计与服务器监控</p></div>
+      </div>
+      <nav>
+        <a href="#dashboard" data-view="dashboard">首页仪表盘</a>
+        <a href="#realtime" data-view="realtime">实时调用监控</a>
+        <a href="#calls" data-view="calls">完整调用记录</a>
+        <a href="#git" data-view="git">Git 操作审计</a>
+        <a href="#experiments" data-view="experiments">科研实验监控</a>
+        <a href="#server" data-view="server">服务器状态</a>
+        <a href="#clients" data-view="clients">客户端与会话</a>
+        <a href="#config" data-view="config">服务配置</a>
+        <a href="#exports" data-view="exports">日志导出</a>
+      </nav>
+      <div class="sidebar-foot">
+        <span id="audit-health" class="badge">审计状态检查中</span>
+        <button class="theme-toggle" type="button" onclick="toggleTheme()" aria-label="切换主题">◐ 主题</button>
+        <button class="btn ghost" id="logout-btn" type="button">安全退出</button>
+      </div>
+    </aside>
+    <main class="content">
+      <header class="topbar">
+        <div><h2 id="page-title">首页仪表盘</h2><p id="page-sub"></p></div>
+        <div class="topbar-right"><span id="user-label"></span><span id="clock"></span></div>
+      </header>
+      <section id="app-root" class="view-root"><div class="loading">正在加载…</div></section>
+    </main>
+  </div>
+  <div id="toast" class="toast" role="status"></div>
+  <script>
+    window.APP = {
+      username: {{ username | tojson }},
+      mfaEnabled: {{ mfa_enabled | tojson }}
+    };
+  </script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

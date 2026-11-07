@@ -60,6 +60,10 @@ audit log.
 - **Zero config ingress**: cloudflared quick tunnel gives you a public HTTPS URL
   automatically (URL rotates each restart; set `CF_TUNNEL_TOKEN` for a fixed URL).
 - **Self-contained Docker image**: server + tunnel in one container.
+- **MCP Admin Dashboard (four-service Compose deployment)**: separate admin login,
+  live call monitoring, complete call audit, Git/experiment views, per-container metrics,
+  charts and exports. SQLite WAL storage with redaction by default; large outputs are stored
+  as protected references. See the [Chinese deployment guide](./docs/admin-dashboard.zh-CN.md).
 
 ## Quick start (Docker)
 
@@ -81,7 +85,22 @@ Or use the bundled helper (env-overridable):
 ./run.sh
 ```
 
-The startup banner prints everything you need:
+### Four-service deployment with the audit dashboard (recommended for server management)
+
+```bash
+cp docker/.env.template .env
+# Pin MCP_TOKEN and ADMIN_PASSWORD in .env for production
+docker compose up -d --build
+docker logs cnb-mcp-admin-web       # prints the generated admin password if unset
+```
+
+The dashboard listens on `http://127.0.0.1:8788` only and uses a **separate admin account**
+(unrelated to `MCP_TOKEN`); the MCP API is still reached through the tunnel URL printed by the
+gateway container. The two entry points have independent access control. Configuration, optional
+HTTPS ingress, PostgreSQL, backup and the acceptance checklist are in the
+[deployment guide](./docs/admin-dashboard.zh-CN.md).
+
+For single-container mode, the startup banner prints everything you need:
 
 ```
  公网根地址 (BASE_URL):   https://xxxx.trycloudflare.com
@@ -149,6 +168,25 @@ Example `claude_desktop_config.json`:
 | `MCP_SEARCH_FETCH_MAX_CHARS` | `8000` | Max extracted page text length. |
 | `MCP_SEARCH_FETCH_ALLOW_HOSTS` | (empty) | Optional comma-separated host allow-list for page fetching. |
 
+### Admin dashboard & audit variables (Compose reads the root `.env`)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / generated | Separate admin account; the generated password is persisted in the `audit-data` volume. |
+| `ADMIN_SESSION_SECRET` | (empty → sessions drop on restart) | HMAC key for session cookies. |
+| `ADMIN_SESSION_TTL` | `28800` | Session lifetime in seconds. |
+| `ADMIN_LOGIN_MAX_FAILURES` / `ADMIN_LOGIN_LOCK_MINUTES` | `5` / `15` | Failed-login lockout. |
+| `ADMIN_TOTP_SECRET` | (empty = off) | Optional TOTP MFA secret (Base32). |
+| `ADMIN_COOKIE_SECURE` | `0` | Set to `1` when the dashboard is served over HTTPS. |
+| `ADMIN_HOST_PORT` / `ADMIN_BIND_HOST` | `8788` / `127.0.0.1` | Dashboard port and bind address; use `0.0.0.0` for platform port-preview (set a strong password and MFA first). |
+| `AUDIT_DB_DSN` | (empty = SQLite WAL) | Optional PostgreSQL DSN for the `postgres` profile. |
+| `AUDIT_STRICT` | `0` | `1` rejects high-risk tools when audit storage is unavailable; default is graceful degradation. |
+| `AUDIT_RETENTION_DAYS` / `AUDIT_MAX_DB_MB` | `90` / `512` | Archive retention and DB quota. |
+| `MCP_TUNNEL_DISABLED` | `0` | Set to `1` when using the standalone `cloudflared` service. |
+
+Full list: [`docker/.env.template`](./docker/.env.template) and the
+[deployment guide](./docs/admin-dashboard.zh-CN.md).
+
 ## Tools reference
 
 | Tool | Purpose | Notes |
@@ -187,8 +225,10 @@ Every result is labelled as untrusted external content in the tool output.
 - `MCP_TOKEN` is effectively a **remote shell key**. Treat it like a password,
   and only share it with agents you trust. By default the gateway is **open**
   (no allow-list); use `MCP_ALLOWED_PREFIXES` to tighten if you prefer.
-- The container only listens on `127.0.0.1`; Cloudflare terminates TLS and
-  exposes the public endpoint. No host port is published.
+- Single-container mode listens on `127.0.0.1`; in Compose mode the gateway listens
+  on `0.0.0.0` **inside the container network only** (no host port published).
+  Cloudflare terminates TLS. The admin dashboard is published to `127.0.0.1:8788`
+  and always requires its own admin login.
 - Search tools only call a fixed domain allow-list, cap response size and enforce
   per-source rate limits. `read_web_page` is off by default and blocks non-HTTPS,
   IP literals and private-network targets (including redirects).
@@ -197,17 +237,26 @@ Every result is labelled as untrusted external content in the tool output.
 - Executed commands and search activity (query, source, duration, result count)
   are written to `/app/audit.log` inside the container; keys and response bodies
   are never logged.
+- With the four-service deployment, full call records also go to a SQLite WAL audit DB
+  on the shared volume: arguments, outputs and errors are redacted, and large outputs
+  are kept as protected references. Admin login is fully independent from the MCP API;
+  unauthenticated users cannot read any call record. See the
+  [deployment guide](./docs/admin-dashboard.zh-CN.md).
 
 ## Build from source
 
 ```bash
 git clone https://github.com/NinaAWA/cnb-mcp-gateway.git
 cd cnb-mcp-gateway
-docker build -t cnb-mcp-gateway:local ./docker
+docker build -f docker/Dockerfile -t cnb-mcp-gateway:local .
 docker run -d --name cnb-mcp-gateway --restart unless-stopped \
   -v "$PWD:/workspace" cnb-mcp-gateway:local
 docker logs -f cnb-mcp-gateway
 ```
+
+> The build context is now the repository root because the image also contains the
+> `gateway/` audit layer and Admin Web. Use `docker compose up -d --build` for the
+> four-service deployment; run tests with `.venv/bin/python -m pytest tests -q`.
 
 ## License
 

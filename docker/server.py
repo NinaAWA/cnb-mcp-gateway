@@ -48,7 +48,9 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
+import sys
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -66,6 +68,37 @@ from starlette.responses import (
     Response,
 )
 from starlette.routing import Route
+
+# 统一审计采集层：容器里 gateway/ 与 server.py 同在 /app；本地开发时在仓库根，
+# 这里把仓库根加入 sys.path，保证两种启动方式都能导入。
+_AUDIT_ROOT = Path(__file__).resolve().parent.parent
+if (_AUDIT_ROOT / "gateway").is_dir() and str(_AUDIT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_AUDIT_ROOT))
+
+try:
+    from gateway.audit.middleware import (
+        AuditMiddleware, bind_http_context, record_event, task_lifecycle, trace_call,
+    )
+    from gateway.audit.storage import get_storage as _get_audit_storage
+    AUDIT_ENABLED = True
+except Exception as _audit_import_error:  # noqa: BLE001 - 采集层不可用不能拖垮网关
+    AUDIT_ENABLED = False
+    AuditMiddleware = None
+    print(f"[audit] 采集层不可用，网关以无审计模式运行: {_audit_import_error!r}",
+          file=sys.stderr)
+
+    class _NullRecorder:
+        def set(self, **_kw): pass
+        def ok(self, *_a, **_kw): pass
+        def fail(self, *_a, **_kw): pass
+
+    def bind_http_context(_scope): return None
+    def record_event(*_a, **_kw): pass
+    def task_lifecycle(*_a, **_kw): pass
+
+    @contextmanager
+    def trace_call(*_a, **_kw):
+        yield _NullRecorder()
 
 CONFIG_DIR = Path(__file__).parent
 
@@ -179,6 +212,8 @@ OAUTH_PATHS = {
     "/.well-known/ai-plugin.json",
     "/openapi.yaml",
     "/logo.png",
+    # 健康检查由容器 healthcheck 调用，无需 Bearer
+    "/health",
 }
 
 
@@ -336,6 +371,16 @@ async def token_endpoint(request):
 
 mcp = FastMCP("cnb-command-gateway")
 
+# 统一工具分发层拦截：一处注册覆盖全部工具（含以后新增的工具），
+# 不需要在每个工具函数内部零散添加日志。
+if AUDIT_ENABLED and AuditMiddleware is not None:
+    mcp.add_middleware(AuditMiddleware())
+    try:
+        # 服务异常中断后，把残留的 RECEIVED/RUNNING 收敛为可追踪终态
+        _get_audit_storage().mark_interrupted()
+    except Exception:  # noqa: BLE001
+        pass
+
 
 # ---------------------------------------------------------------------------
 # 命令分类与权限（默认全开放 + 破坏性确认门 + 危险黑名单安全网）
@@ -458,18 +503,62 @@ def run_command(command: str, cwd: str = WORKDIR, timeout: int = 60, confirm: bo
 
 _TASKS: dict = {}
 _TASK_LOCK = threading.Lock()
-_TASK_DIR = Path("/tmp/mcp_tasks")
+_TASK_DIR = Path(os.environ.get("MCP_TASK_LOG_DIR", "/tmp/mcp_tasks"))
 _TASK_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _task_event(task_id: str, status: str, rec: dict | None = None, **extra) -> None:
+    """后台任务独立生命周期事件。采集层故障绝不影响任务本身。"""
+    if not AUDIT_ENABLED:
+        return
+    try:
+        from gateway.audit.events import current_trace
+        trace = current_trace()
+        rec = rec or {}
+        request_id = rec.get("request_id") or (trace.request_id if trace else "")
+        task_lifecycle(
+            task_id, status, request_id=request_id,
+            command=rec.get("cmd", ""), cwd=rec.get("cwd", ""),
+            pid=rec.get("pid"), log_path=str(rec.get("log", "")), **extra,
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _task_watchdog(task_id: str, timeout: int):
     time.sleep(timeout)
+    rec = None
     with _TASK_LOCK:
         rec = _TASKS.get(task_id)
         if rec and rec["proc"].poll() is None:
             rec["proc"].terminate()
             rec["status"] = "killed-timeout"
             audit(f"TASK_TIMEOUT task_id={task_id}")
+        else:
+            rec = None
+    if rec:
+        _task_event(task_id, "killed-timeout", rec, detail="任务超时被终止")
+
+
+def _task_reaper():
+    """统一收割已自然结束的后台任务，补写终态；纯观测，不干预任务进程。"""
+    while True:
+        time.sleep(2)
+        finished: list[tuple[str, dict]] = []
+        try:
+            with _TASK_LOCK:
+                for task_id, rec in list(_TASKS.items()):
+                    if rec.get("status") == "running" and rec["proc"].poll() is not None:
+                        rec["status"] = "done"
+                        finished.append((task_id, dict(rec)))
+        except Exception:  # noqa: BLE001
+            continue
+        for task_id, rec in finished:
+            _task_event(task_id, "done", rec, detail=f"exit_code={rec['proc'].poll()}")
+
+
+if AUDIT_ENABLED:
+    threading.Thread(target=_task_reaper, daemon=True).start()
 
 
 @mcp.tool()
@@ -503,15 +592,25 @@ def run_command_background(command: str, cwd: str = WORKDIR, confirm: bool = Fal
         proc = subprocess.Popen(
             command, shell=True, cwd=cwd, stdout=logf, stderr=subprocess.STDOUT,
         )
+        _trace = None
+        if AUDIT_ENABLED:
+            try:
+                from gateway.audit.events import current_trace
+                _trace = current_trace()
+            except Exception:  # noqa: BLE001
+                _trace = None
+        rec = {
+            "proc": proc, "log": log_path, "cwd": cwd,
+            "cmd": command, "start": time.time(), "timeout": timeout,
+            "status": "running", "pid": proc.pid,
+            "request_id": _trace.request_id if _trace else "",
+        }
         with _TASK_LOCK:
-            _TASKS[task_id] = {
-                "proc": proc, "log": log_path, "cwd": cwd,
-                "cmd": command, "start": time.time(), "timeout": timeout,
-                "status": "running",
-            }
+            _TASKS[task_id] = rec
         if timeout and timeout > 0:
             threading.Thread(target=_task_watchdog, args=(task_id, timeout), daemon=True).start()
         audit(f"BG START task_id={task_id} cmd={command!r}")
+        _task_event(task_id, "running", rec, detail="后台任务已启动；结果另行记录")
         return (f"OK: 后台任务已启动。\n  task_id={task_id}\n"
                 f"  查询状态: get_task_status(task_id=\"{task_id}\")\n"
                 f"  取输出: get_task_output(task_id=\"{task_id}\")\n"
@@ -542,12 +641,17 @@ def get_task_status(task_id: str) -> str:
             return f"ERROR: 找不到任务 {task_id}（可能已过期或容器重启过）。"
         proc = rec["proc"]
         rc = proc.poll()
+        newly_finished = False
         if rc is None:
             status = "running"
         else:
             status = rec.get("status", "done")
             if status == "running":
                 status = "done"
+                rec["status"] = "done"
+                newly_finished = True
+    if newly_finished:
+        _task_event(task_id, "done", rec, detail=f"exit_code={rc}")
     audit(f"TASK_STATUS task_id={task_id} status={status}")
     return (f"task_id={task_id}\nstatus={status}\n"
             f"exit_code={rc}\ncmd={rec['cmd']}\nlog={rec['log']}")
@@ -593,7 +697,12 @@ def stop_task(task_id: str) -> str:
             proc.terminate()
             rec["status"] = "killed"
             audit(f"TASK STOP task_id={task_id}")
-            return f"OK: 已发送 TERM 信号终止任务 {task_id}。"
+            stopped = True
+        else:
+            stopped = False
+    if stopped:
+        _task_event(task_id, "killed", rec, detail="管理员/agent 主动终止")
+        return f"OK: 已发送 TERM 信号终止任务 {task_id}。"
     return f"任务 {task_id} 已结束（exit={proc.poll()}），无需停止。"
 
 
@@ -2056,7 +2165,41 @@ async def run_command_rest(request):
         timeout = int(body.get("timeout", 60))
     except Exception:  # noqa: BLE001
         timeout = 60
-    return JSONResponse({"output": _exec(command, cwd, timeout, confirm)})
+    # REST 绕过 MCP tools/call，使用同一采集层补齐，保证不漏审计
+    with trace_call("run_command",
+                    {"command": command, "cwd": cwd, "confirm": confirm, "timeout": timeout},
+                    source="rest") as rec:
+        output = _exec(command, cwd, timeout, confirm)
+        rec.ok(output)
+    return JSONResponse({"output": output})
+
+
+SERVER_STARTED = time.time()
+
+
+async def health_endpoint(request):
+    """容器 healthcheck：只读、免 Bearer，报告审计健康度与实际执行后端指标。"""
+    payload = {
+        "status": "ok", "service": "mcp-gateway", "source": "mcp-gateway",
+        "started_at": datetime.datetime.fromtimestamp(
+            SERVER_STARTED, datetime.timezone.utc).isoformat(timespec="seconds"),
+        "uptime_seconds": int(time.time() - SERVER_STARTED),
+    }
+    try:
+        payload["tools_registered"] = len(await mcp.list_tools())
+    except Exception:  # noqa: BLE001
+        payload["tools_registered"] = None
+    if AUDIT_ENABLED:
+        try:
+            payload["audit"] = _get_audit_storage().health()
+        except Exception as exc:  # noqa: BLE001
+            payload["audit"] = {"healthy": False, "last_error": repr(exc)}
+    try:
+        from gateway.monitoring.system import collect
+        payload["metrics"] = collect("mcp-gateway")
+    except Exception as exc:  # noqa: BLE001
+        payload["metrics"] = {"source": "mcp-gateway", "available": False, "error": repr(exc)}
+    return JSONResponse(payload)
 
 
 async def plugin_manifest(request):
@@ -2121,6 +2264,12 @@ class BearerAuthMiddleware:
                         {"type": "http.response.body", "body": b'{"error":"unauthorized"}'}
                     )
                     return
+        if AUDIT_ENABLED:
+            try:
+                # 注入已验证令牌指纹与客户端自报名称（后者不参与鉴权）
+                bind_http_context(scope)
+            except Exception:  # noqa: BLE001
+                pass
         await self.app(scope, receive, send)
 
 
@@ -2151,6 +2300,14 @@ app.router.routes.append(
 )
 app.router.routes.append(Route("/openapi.yaml", openapi_spec, methods=["GET"]))
 app.router.routes.append(Route("/logo.png", logo_png, methods=["GET"]))
+app.router.routes.append(Route("/health", health_endpoint, methods=["GET"]))
+
+if AUDIT_ENABLED:
+    try:
+        record_event("service_start", status="UP", source="system",
+                     detail=f"bind={BIND} port={PORT} tools=registered")
+    except Exception:  # noqa: BLE001
+        pass
 
 if __name__ == "__main__":
     import uvicorn

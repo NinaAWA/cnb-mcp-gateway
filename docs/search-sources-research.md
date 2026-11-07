@@ -9,7 +9,7 @@
 - **论文检索**：存在一批完全开放、零 API Key、无需自建服务的官方 API，且在本机与容器内**全部实测可达**。直接调用即可，这是本次默认落地的能力。
 - **通用网页搜索**：这台服务器是**白名单式出网**。DuckDuckGo / Google / Wikipedia / Brave / Jina Reader / 公共 SearXNG 实例均连接超时，Mojeek 对自动化查询返回 403，Bing RSS 返回空结果且版权声明限定「仅个人非商业用途在 RSS 聚合器中呈现」。因此不存在「零 Key + 开源 + 通用网页搜索」三者同时成立、且在本机可用的方案。
 - **默认取舍**：论文侧走官方开放 API；网页侧默认启用本机实测可达的**垂直开放检索源**（HN Algolia、StackExchange、GitHub 仓库等），并把「自建 SearXNG」和「免费额度 Key 源」做成可选 provider，未配置时优雅降级。
-- **不引入新依赖**：全部用 Python 标准库 `urllib.request` / `json` / `xml.etree.ElementTree` 实现，`docker/requirements.txt` 与 `docker/Dockerfile` 保持不变。
+- **检索功能本身不引入新依赖**：全部用 Python 标准库 `urllib.request` / `json` / `xml.etree.ElementTree` 实现；本轮未改 `docker/requirements.txt` 与 `docker/Dockerfile`（后续 Admin Dashboard 阶段另行新增依赖并调整构建上下文，见 `docs/admin-dashboard.zh-CN.md`）。
 
 ## 2. 论文 / 学术数据源（零 Key、开放）
 
@@ -136,7 +136,7 @@
 
 ## 7. 实现落地记录（本轮）
 
-- **零新增依赖**：网络、Atom、HTML 与并发全部用标准库（`urllib.request`、`xml.etree.ElementTree`、`html.parser`、`concurrent.futures`），`docker/requirements.txt` 与 `Dockerfile` 未改。
+- **检索实现零新增依赖**：网络、Atom、HTML 与并发全部用标准库（`urllib.request`、`xml.etree.ElementTree`、`html.parser`、`concurrent.futures`）；本轮未改 `docker/requirements.txt` 与 `Dockerfile`。
 - **统一网络层** `_http_request`：固定域名白名单、私网/回环/链路本地拦截、跳转目标复检、超时、429/5xx 退避重试、响应体积上限、内存 GET 缓存；`_json_get` / `_xml_get` 共用。
 - **本环境 DNS 特点**：`eutils.ncbi.nlm.nih.gov`、`api.github.com` 等合法域名被解析到 `198.18.x.x` 透明代理段。因此固定白名单来源豁免私网检查（主机名由代码拼接、跳转仍受白名单约束）；`read_web_page` 保留严格检查：仅 HTTPS、禁止 IP 字面量、禁止非标准端口、拦截 RFC1918 / 回环 / 链路本地 / IPv6 ULA，跳转目标同样校验。
 - **论文检索**：8 个一源一解析函数 + 注册表，默认 5 源（OpenAlex / arXiv / CrossRef / PubMed / Europe PMC）；`ThreadPoolExecutor` 最多 4 并发，总耗时约等于最慢来源；结果按来源轮流交错（最多 30 条），单源失败只追加错误说明。

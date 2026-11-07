@@ -1,16 +1,23 @@
+# 四服务部署：MCP API、Admin Web（独立认证）、审计维护、可选 HTTPS 隧道。
+# 构建：docker compose --profile tunnel up -d --build
+# 本地构建使用仓库根作为 context，包含 gateway/ 统一采集层。
 services:
   mcp-gateway:
-    # 把 <your-github-username> 换成你的 GitHub 用户名（或改成本地 build 的镜像名）
-    image: ghcr.io/ninaawa/cnb-mcp-gateway:latest
+    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway:latest}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
     container_name: cnb-mcp-gateway
     restart: unless-stopped
     environment:
+      # 只监听容器网络：宿主端口不发布，公网入口由 cloudflared 提供。
+      - MCP_BIND=0.0.0.0
+      - MCP_PORT=8765
+      - MCP_WORKDIR=/workspace
       - MCP_TOKEN=${MCP_TOKEN:-}
       - MCP_ALLOWED_PREFIXES=${MCP_ALLOWED_PREFIXES:-}
       - MCP_DENY_PREFIXES=${MCP_DENY_PREFIXES:-}
       - MCP_REQUIRE_CONFIRM=${MCP_REQUIRE_CONFIRM:-}
-      - CF_TUNNEL_TOKEN=${CF_TUNNEL_TOKEN:-}
-      - MCP_WORKDIR=/workspace
       - MCP_SEARCH_TIMEOUT=${MCP_SEARCH_TIMEOUT:-}
       - MCP_SEARCH_MAX_RESULTS=${MCP_SEARCH_MAX_RESULTS:-}
       - MCP_SEARCH_MAX_BYTES=${MCP_SEARCH_MAX_BYTES:-}
@@ -24,7 +31,121 @@ services:
       - MCP_SEARCH_FETCH_ENABLED=${MCP_SEARCH_FETCH_ENABLED:-}
       - MCP_SEARCH_FETCH_MAX_CHARS=${MCP_SEARCH_FETCH_MAX_CHARS:-}
       - MCP_SEARCH_FETCH_ALLOW_HOSTS=${MCP_SEARCH_FETCH_ALLOW_HOSTS:-}
+      - CF_TUNNEL_TOKEN=${CF_TUNNEL_TOKEN:-}
+      # 启用独立 cloudflared profile 时设为 1，避免两个公网入口并存。
+      - MCP_TUNNEL_DISABLED=${MCP_TUNNEL_DISABLED:-0}
+      # 审计：SQLite WAL 落在共享卷；切换到 postgres profile 时设置 AUDIT_DB_DSN。
+      - AUDIT_DB_PATH=/data/audit/audit.db
+      - AUDIT_DB_DSN=${AUDIT_DB_DSN:-}
+      - AUDIT_STRICT=${AUDIT_STRICT:-0}
+      - AUDIT_MAX_FIELD_CHARS=${AUDIT_MAX_FIELD_CHARS:-32768}
+      - MCP_TASK_LOG_DIR=/data/audit/task-logs
     volumes:
-      # 把当前目录挂进容器的 /workspace，run_command 就能在你的代码目录里执行
       - ./workspace:/workspace
-    # 无需暴露宿主机端口：cloudflared 隧道负责公网入口
+      - audit-data:/data/audit
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8765/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  mcp-admin-web:
+    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway:latest}
+    container_name: cnb-mcp-admin-web
+    restart: unless-stopped
+    depends_on:
+      mcp-gateway:
+        condition: service_started
+    environment:
+      - MCP_SERVICE_ROLE=admin-web
+      - ADMIN_BIND=0.0.0.0
+      - ADMIN_PORT=8788
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      # 留空时首次启动自动生成并持久化到 audit-data 卷，密码打印在容器日志。
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      - ADMIN_SESSION_SECRET=${ADMIN_SESSION_SECRET:-}
+      - ADMIN_SESSION_TTL=${ADMIN_SESSION_TTL:-28800}
+      - ADMIN_LOGIN_MAX_FAILURES=${ADMIN_LOGIN_MAX_FAILURES:-5}
+      - ADMIN_LOGIN_LOCK_MINUTES=${ADMIN_LOGIN_LOCK_MINUTES:-15}
+      - ADMIN_TOTP_SECRET=${ADMIN_TOTP_SECRET:-}
+      # 通过 HTTPS 域名访问后台时必须设为 1。
+      - ADMIN_COOKIE_SECURE=${ADMIN_COOKIE_SECURE:-0}
+      - GATEWAY_URL=http://mcp-gateway:8765
+      - AUDIT_DB_PATH=/data/audit/audit.db
+      - AUDIT_DB_DSN=${AUDIT_DB_DSN:-}
+      - AUDIT_EXPORT_DIR=/data/audit/exports
+      - MCP_TASK_LOG_DIR=/data/audit/task-logs
+    # 默认只允许宿主机本机访问后台；CNB / 云平台端口预览需要设置 ADMIN_BIND_HOST=0.0.0.0，
+    # 此时后台有独立登录鉴权，务必配合强口令、ADMIN_COOKIE_SECURE 与可选 MFA。
+    ports:
+      - "${ADMIN_BIND_HOST:-127.0.0.1}:${ADMIN_HOST_PORT:-8788}:8788"
+    volumes:
+      - audit-data:/data/audit
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8788/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  audit-storage:
+    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway:latest}
+    container_name: cnb-audit-storage
+    restart: unless-stopped
+    environment:
+      - MCP_SERVICE_ROLE=maintenance
+      - AUDIT_DB_PATH=/data/audit/audit.db
+      - AUDIT_DB_DSN=${AUDIT_DB_DSN:-}
+      - AUDIT_RETENTION_DAYS=${AUDIT_RETENTION_DAYS:-90}
+      - AUDIT_MAX_DB_MB=${AUDIT_MAX_DB_MB:-512}
+      - AUDIT_BACKUP_KEEP=${AUDIT_BACKUP_KEEP:-7}
+      - AUDIT_BACKUP_ENABLED=${AUDIT_BACKUP_ENABLED:-1}
+      - AUDIT_MAINTENANCE_INTERVAL=${AUDIT_MAINTENANCE_INTERVAL:-300}
+    volumes:
+      - audit-data:/data/audit
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /data/audit/.maintenance.ok"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # 可选 HTTPS 入口：docker compose --profile tunnel up -d
+  # 同时在 .env 设置 MCP_TUNNEL_DISABLED=1，避免网关内置 quick tunnel 重复暴露。
+  cloudflared:
+    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway:latest}
+    profiles: ["tunnel"]
+    container_name: cnb-mcp-cloudflared
+    restart: unless-stopped
+    depends_on:
+      mcp-gateway:
+        condition: service_started
+    environment:
+      - MCP_SERVICE_ROLE=cloudflared
+      - MCP_UPSTREAM_URL=http://mcp-gateway:8765
+      - CF_TUNNEL_TOKEN=${CF_TUNNEL_TOKEN:-}
+    command: ["/app/entrypoint.sh"]
+
+  # 可选 PostgreSQL 审计后端：docker compose --profile postgres up -d
+  # 同时在 .env 设置 AUDIT_DB_DSN=postgresql://user:pass@postgres:5432/db
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    container_name: cnb-mcp-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${AUDIT_PG_USER:-mcp_audit}
+      - POSTGRES_PASSWORD=${AUDIT_PG_PASSWORD:-change-me}
+      - POSTGRES_DB=${AUDIT_PG_DB:-mcp_audit}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AUDIT_PG_USER:-mcp_audit} -d ${AUDIT_PG_DB:-mcp_audit}"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  audit-data:
+  pg-data:

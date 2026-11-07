@@ -1,0 +1,15 @@
+.git
+.gitignore
+.codebuddy
+.venv
+.Trash-0
+workspace
+**/__pycache__
+**/*.pyc
+docker/.env
+docker/audit.log
+docs
+*.md
+LICENSE
+run.sh
+docker-compose.yml

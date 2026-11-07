@@ -37,6 +37,9 @@
 - **可调旋钮（Sandbox knobs）**：可选的 `MCP_ALLOWED_PREFIXES` 白名单、`MCP_DENY_PREFIXES`、`MCP_REQUIRE_CONFIRM`、工作目录、审计日志。
 - **零配置入口**：cloudflared 快速隧道自动给你一个公网 HTTPS 地址（每次重启地址会变；设置 `CF_TUNNEL_TOKEN` 可固定地址）。
 - **自包含镜像**：服务器 + 隧道在同一个容器里。
+- **MCP Admin Dashboard（四服务 Compose 部署）**：独立管理员登录、实时调用监控、完整调用审计、
+  Git/实验监控、容器状态、图表与日志导出；SQLite WAL 持久化，默认脱敏、大输出只存引用。
+  详见 [中文部署与运维文档](./docs/admin-dashboard.zh-CN.md)。
 
 ## 快速开始（Docker）
 
@@ -58,7 +61,21 @@ docker logs -f cnb-mcp-gateway   # 会打印 BASE_URL、/mcp、openapi、MCP_TOK
 ./run.sh
 ```
 
-启动横幅会打印你需要的一切：
+### 带审计后台的四服务部署（推荐用于服务器管理与完整调用审计）
+
+```bash
+cp docker/.env.template .env
+# 建议在 .env 中固定 MCP_TOKEN 与 ADMIN_PASSWORD
+docker compose up -d --build
+docker logs cnb-mcp-admin-web       # 未设置 ADMIN_PASSWORD 时这里打印初始口令
+```
+
+后台默认只在宿主机 `http://127.0.0.1:8788` 可达，使用**独立管理员账号**登录（与 `MCP_TOKEN` 无关）；
+MCP API 仍通过网关容器日志里的隧道地址访问，两者访问控制互相独立。
+配置、可选 HTTPS 入口、PostgreSQL、备份与验收清单见
+[部署与运维文档](./docs/admin-dashboard.zh-CN.md)。
+
+单容器模式的启动横幅会打印你需要的一切：
 
 ```
  公网根地址 (BASE_URL):   https://xxxx.trycloudflare.com
@@ -124,6 +141,26 @@ Authorization: Bearer <MCP_TOKEN>
 | `MCP_SEARCH_FETCH_ENABLED` | `0` | 设为 `1` 才启用 `read_web_page`。 |
 | `MCP_SEARCH_FETCH_MAX_CHARS` | `8000` | 抓取正文最大字符数。 |
 | `MCP_SEARCH_FETCH_ALLOW_HOSTS` | （空） | 页面抓取主机白名单（逗号分隔），留空允许任意公网 HTTPS 主机。 |
+
+### Admin Dashboard 与审计变量（Compose 读取项目根目录 `.env`）
+
+| 变量 | 默认值 | 含义 |
+|---|---|---|
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / 随机生成 | 后台独立管理员账号；随机口令持久化在 `audit-data` 卷，重启不变。 |
+| `ADMIN_SESSION_SECRET` | （空 = 重启后旧会话失效） | 会话 Cookie 的 HMAC 签名密钥。 |
+| `ADMIN_SESSION_TTL` | `28800` | 会话有效期（秒）。 |
+| `ADMIN_LOGIN_MAX_FAILURES` / `ADMIN_LOGIN_LOCK_MINUTES` | `5` / `15` | 失败次数上限与锁定窗口。 |
+| `ADMIN_TOTP_SECRET` | （空 = 关闭） | 可选 TOTP 双因素密钥（Base32）。 |
+| `ADMIN_COOKIE_SECURE` | `0` | 通过 HTTPS 访问后台时设为 `1`。 |
+| `ADMIN_HOST_PORT` / `ADMIN_BIND_HOST` | `8788` / `127.0.0.1` | 后台监听端口与绑定地址；CNB 等端口预览需设为 `0.0.0.0`，开放前请配置强口令与 MFA。 |
+| `AUDIT_DB_DSN` | （空 = SQLite WAL） | 可选 PostgreSQL DSN，配合 `postgres` profile。 |
+| `AUDIT_STRICT` | `0` | `1` = 审计存储不可用时拒绝高风险工具；默认降级放行，不中断实验。 |
+| `AUDIT_RETENTION_DAYS` / `AUDIT_MAX_DB_MB` | `90` / `512` | 归档保留天数与数据库配额。 |
+| `AUDIT_BACKUP_KEEP` / `AUDIT_MAINTENANCE_INTERVAL` | `7` / `300` | 备份保留数量与维护间隔（秒）。 |
+| `MCP_TUNNEL_DISABLED` | `0` | 启用独立 `cloudflared` 服务时设为 `1`。 |
+
+完整变量见 [`docker/.env.template`](./docker/.env.template)，部署细节见
+[部署与运维文档](./docs/admin-dashboard.zh-CN.md)。
 
 ## 权限模型：开放 + 确认门 + 黑名单
 
@@ -200,10 +237,15 @@ read_image(path="/workspace/results/loss_curve.png", max_dim=1024)
 ## 安全说明
 
 - `MCP_TOKEN` 本质上是一把**远程 shell 钥匙**。像密码一样对待它，只分享给你信任的 agent。默认网关是**开放**的（无白名单）；如果你更保守，可以用 `MCP_ALLOWED_PREFIXES` 收紧。
-- 容器只监听 `127.0.0.1`；由 Cloudflare 终结 TLS 并暴露公网端点。不会发布任何宿主机端口。
+- 单容器模式只监听 `127.0.0.1`；Compose 模式下网关监听容器网络 `0.0.0.0` 但**不发布宿主端口**，
+  由 Cloudflare 终结 TLS 并暴露公网端点。管理后台默认只发布到宿主 `127.0.0.1:8788`，
+  且始终要求独立管理员登录。
 - 检索工具只访问固定域名白名单，限制响应体积并按来源限速；`read_web_page` 默认关闭，开启后也会拦截非 HTTPS、IP 字面量与私网地址（含跳转目标）。
 - 外部数据源返回的标题、摘要与正文都是**不可信数据**，工具输出会明确标注，避免提示注入；不要把它们当作指令执行。
 - 被执行过的命令，以及检索活动（查询词、来源、耗时、结果条数）都会写入容器内的 `/app/audit.log`；密钥与响应体不会写入日志。
+- 四服务部署还会把完整调用记录写入共享卷的 SQLite WAL 审计库：参数、输出与错误统一脱敏，
+  大输出只保存受保护引用；后台与 MCP API 的认证相互独立，未登录不能查询任何调用记录，
+  也不能用 `MCP_TOKEN` 登录后台。详见 [部署与运维文档](./docs/admin-dashboard.zh-CN.md)。
 - ⚠️ **密钥提醒**：如果你用的是共享/明文出现的 PAT 或令牌，建议用完后立即在对应平台撤销并轮换。
 
 ## 从源码构建
@@ -211,11 +253,14 @@ read_image(path="/workspace/results/loss_curve.png", max_dim=1024)
 ```bash
 git clone https://github.com/NinaAWA/cnb-mcp-gateway.git
 cd cnb-mcp-gateway
-docker build -t cnb-mcp-gateway:local ./docker
+docker build -f docker/Dockerfile -t cnb-mcp-gateway:local .
 docker run -d --name cnb-mcp-gateway --restart unless-stopped \
   -v "$PWD:/workspace" cnb-mcp-gateway:local
 docker logs -f cnb-mcp-gateway
 ```
+
+> 构建上下文已改为仓库根目录，因为镜像现在还包含 `gateway/` 统一采集层与 Admin Web。
+> 四服务部署用 `docker compose up -d --build`；测试用 `.venv/bin/python -m pytest tests -q`。
 
 ## 许可证
 
