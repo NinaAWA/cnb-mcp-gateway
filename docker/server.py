@@ -1609,6 +1609,54 @@ _SECRET_KEYS = (
 
 
 @mcp.tool()
+def get_capabilities() -> str:
+    """Read-only server capability inventory for remote AI clients.
+
+    Reports *observed* executable availability and access boundaries without
+    leaking environment values or assuming container root is host root.
+    A present executable is not proof that the backing service is working.
+    """
+    import shutil
+    import platform
+
+    tools = ("bash", "git", "git-lfs", "docker", "python3", "pip",
+             "uv", "conda", "apt-get", "dpkg", "gcc", "g++",
+             "cmake", "nvidia-smi", "curl")
+    binaries = {name: shutil.which(name) for name in tools}
+    root = os.geteuid() == 0 if hasattr(os, "geteuid") else False
+    in_container = (Path("/.dockerenv").exists() or
+                    os.environ.get("container", "").lower() in
+                    ("docker", "podman"))
+    socket = Path("/var/run/docker.sock")
+    try:
+        import importlib.util
+        packages = {name: importlib.util.find_spec(name) is not None
+                    for name in ("numpy", "scipy", "mujoco", "toppra", "fcl")}
+    except (ImportError, ValueError):
+        packages = {}
+    result = {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "uid": os.geteuid() if hasattr(os, "geteuid") else None,
+        "root_in_current_namespace": root,
+        "in_container": in_container,
+        "host_root_claimed": False,
+        "commands_unrestricted_by_prefix": not bool(ALLOWED_PREFIXES),
+        "commands_allowlist": ALLOWED_PREFIXES,
+        "workdir": WORKDIR,
+        "file_root": str(file_service.ROOT) if hasattr(file_service, "ROOT") else os.environ.get("MCP_FILE_ROOT", ""),
+        "task_logs": str(_TASK_DIR),
+        "docker_socket_present": socket.exists(),
+        "docker_socket_admin_opt_in": os.environ.get("MCP_DOCKER_SOCKET") == "1",
+        "binaries": binaries,
+        "scientific_imports_in_gateway_python": packages,
+        "note": "Executable presence is not functional verification. Container root is not host root. Scientific dependencies should normally be installed into a separate environment.",
+    }
+    audit("CAPABILITIES read-only")
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 def get_environment_variables() -> str:
     """返回当前进程的环境变量（密钥类值会被隐藏）。"""
     lines = []
