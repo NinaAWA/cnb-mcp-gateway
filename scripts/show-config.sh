@@ -10,6 +10,7 @@
 #   MCP_ENV_FILE          原生部署配置文件（默认 /etc/mcp-gateway/env）
 #   MCP_CONTAINER         网关容器名（默认 cnb-mcp-gateway）
 #   MCP_ADMIN_CONTAINER   后台容器名（默认 cnb-mcp-admin-web）
+#   MCP_ADMIN_TUNNEL_CONTAINER 后台隧道容器名（默认 cnb-mcp-admin-tunnel）
 #   MCP_PUBLIC_BASE_URL   固定公网 HTTPS 基址，如 https://mcp.example.com
 #   ADMIN_PUBLIC_BASE_URL 管理网站固定公网基址
 #
@@ -21,10 +22,11 @@ MODE="auto"
 MCP_ENV_FILE="${MCP_ENV_FILE:-/etc/mcp-gateway/env}"
 MCP_CONTAINER="${MCP_CONTAINER:-cnb-mcp-gateway}"
 MCP_ADMIN_CONTAINER="${MCP_ADMIN_CONTAINER:-cnb-mcp-admin-web}"
+MCP_ADMIN_TUNNEL_CONTAINER="${MCP_ADMIN_TUNNEL_CONTAINER:-cnb-mcp-admin-tunnel}"
 DOTENV_FILE="$ROOT/.env"
 
 usage() {
-  sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 die() {
@@ -218,9 +220,21 @@ MCP_URL="${BASE}/mcp"
 if [ -n "$ADMIN_PUBLIC" ]; then
   ADMIN_URL="${ADMIN_PUBLIC%/}/"
   ADMIN_NOTE="管理网站固定公网入口（来自 ADMIN_PUBLIC_BASE_URL）"
+elif [ "$MODE_RESOLVED" = "docker" ] && command -v timeout >/dev/null 2>&1 \
+     && container_running "$MCP_ADMIN_TUNNEL_CONTAINER"; then
+  # 独立后台隧道的随机域名只写在容器日志里；有界读取一次，绝不伪造公网地址。
+  ADMIN_TUNNEL_URL="$(timeout 5 docker logs --tail 200 "$MCP_ADMIN_TUNNEL_CONTAINER" 2>&1 \
+    | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -n 1 || true)"
+  if [ -n "$ADMIN_TUNNEL_URL" ]; then
+    ADMIN_URL="${ADMIN_TUNNEL_URL%/}/"
+    ADMIN_NOTE="管理网站随机公网隧道（可远程打开；域名在隧道容器重建后会变化，可用 ADMIN_PUBLIC_BASE_URL 固定）"
+  else
+    ADMIN_URL="http://$(display_host "$ADMIN_BIND_VAL"):${ADMIN_PORT_NUM}/"
+    ADMIN_NOTE="后台隧道容器已运行但未解析到公网域名；请查看 docker logs $MCP_ADMIN_TUNNEL_CONTAINER"
+  fi
 else
   ADMIN_URL="http://$(display_host "$ADMIN_BIND_VAL"):${ADMIN_PORT_NUM}/"
-  ADMIN_NOTE="只绑定 127.0.0.1；远程访问需按 deploy/reverse-proxy.example.conf 配置 admin 域名反代"
+  ADMIN_NOTE="只绑定 127.0.0.1；远程访问需按 deploy/reverse-proxy.example.conf 配置 admin 域名反代，或启用独立后台隧道"
 fi
 
 CLIENT_JSON="{
@@ -252,7 +266,7 @@ printf '%s\n' \
   "    说明          $ADMIN_NOTE" \
   "    管理员账号    $ADMIN_USER_VALUE" \
   "    管理员密码    $ADMIN_PASSWORD_VALUE" \
-  "    健康检查      http://127.0.0.1:${ADMIN_PORT_NUM}/healthz" \
+  "    健康检查      ${ADMIN_URL}healthz" \
   "" \
   "[5] 重新打印      $ROOT/scripts/show-config.sh" \
   "                  （--mode docker / --mode native 可强制指定部署形态）" \

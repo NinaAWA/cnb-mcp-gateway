@@ -13,6 +13,7 @@
 | `mcp-admin-web` | `admin-web` | 宿主机 `127.0.0.1:8788` | 独立管理员账号 + 会话 Cookie |
 | `audit-storage` | `maintenance` | 无端口，定时维护共享卷 | — |
 | `cloudflared` | `cloudflared`（profile `tunnel`） | 可选 HTTPS 入口 | 由 Cloudflare 终结 TLS |
+| `gateway-tunnel` / `admin-tunnel` | `cloudflared`（`docker-compose.runtime.yml`） | 两条独立随机 HTTPS 隧道，分别转发 `mcp-gateway:8765` 与 `mcp-admin-web:8788` | 由 Cloudflare 终结 TLS，后台仍需独立登录 |
 | `postgres` | profile `postgres` | 可选审计后端 | `AUDIT_DB_DSN` |
 
 ```
@@ -66,6 +67,24 @@ Compose 模式下网关还会把令牌同步到共享卷 `/data/audit/.mcp_token
 `deploy/reverse-proxy.example.conf` 配置 nginx 或 Cloudflare 命名隧道；脚本会改为打印固定公网地址。
 脚本按「固定 / 随机隧道 / 仅本机」如实标注，不伪造公网网址。管理网站默认只绑 `127.0.0.1`，
 需要远程访问请按示例配置 `admin.example.com` 反代。
+
+**后台独立公网入口（远程可打开）**：`mcp-admin-web` 默认只绑宿主回环，网关容器虽然
+`EXPOSE 8788` 却没有进程监听；平台端口预览代理的是另一台机器，因此直接打开
+`127.0.0.1:8788` 一定失败。叠加 `docker-compose.runtime.yml` 后，`admin-tunnel`
+容器经内部网络转发到 `mcp-admin-web:8788`，从其日志解析出的
+`https://<随机域名>.trycloudflare.com/` 即为远程可打开的后台地址。无需把
+`ADMIN_BIND_HOST` 改成 `0.0.0.0`，也不会把后台暴露到宿主所有网卡。把域名写进
+`.env` 的 `ADMIN_PUBLIC_BASE_URL` 可固定输出；未配置时 `show-config.sh` 会自动解析
+`MCP_ADMIN_TUNNEL_CONTAINER`（默认 `cnb-mcp-admin-tunnel`）日志并标注「随机公网隧道」。
+`ADMIN_COOKIE_SECURE` 保持 `0`：HTTPS 隧道下会话 cookie 仍正常回传，同时本机 HTTP 访问不受影响。
+
+**审计卷验证**：网关与后台共享同一个 `audit-data` 卷（`/data/audit`），用
+`docker inspect <容器> --format '{{range .Mounts}}{{.Name}} -> {{.Destination}}{{end}}'`
+可核对两端卷名一致。重建业务容器请用
+`docker compose -p <项目名> -f docker-compose.yml -f docker-compose.runtime.yml up -d --force-recreate`（**不带 `-v`**），
+重建后 `/healthz` 返回 `audit.healthy=true`，历史调用记录（`/api/calls`）与
+历史任务日志（`/api/experiments/<task_id>/logs`、`/data/audit/task-logs/`）仍可读取；
+`audit.db`、`task-logs/`、`.mcp_token`、`.admin_password` 都在卷内，不随容器销毁。
 
 单容器快速启动（`./run.sh` / `docker run`）仍保持原有行为：一个容器里运行 MCP 网关，
 但不会启动管理后台；如需审计后台请使用 Compose 部署。

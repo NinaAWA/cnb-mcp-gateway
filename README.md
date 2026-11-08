@@ -145,6 +145,44 @@ Both modes keep Bearer + OAuth 2.1 PKCE/DCR, built-in Git LFS, SQLite WAL audit
 and persistent volumes for files / task logs. Upgrade and rollback are below;
 optional host Docker control needs the explicit override file described below.
 
+### Runtime override: real host workspace, host Docker, two public tunnels
+
+The stock Compose file mounts `./workspace:/workspace` (a subdirectory of the
+deployment directory) and publishes only loopback ports. When the gateway must
+operate on the real host checkout, add `docker-compose.runtime.yml` explicitly:
+
+```bash
+# in .env (keep existing MCP_TOKEN / ADMIN_PASSWORD untouched)
+MCP_HOST_WORKSPACE=/workspace
+MCP_DOCKER_SOCKET=1
+MCP_PUBLIC_BASE_URL=https://<gateway-tunnel>.trycloudflare.com
+ADMIN_PUBLIC_BASE_URL=https://<admin-tunnel>.trycloudflare.com
+
+docker compose -p <project> -f docker-compose.yml -f docker-compose.runtime.yml \
+  up -d --force-recreate
+docker logs <gateway-tunnel-container>   # parse the two random HTTPS URLs from the logs
+```
+
+The override bind-mounts `MCP_HOST_WORKSPACE` to `/workspace` (so `MCP_WORKDIR`
+and the structured `git_*` tools see the real checkout) **and** to
+`/data/files/host-workspace` (so the file tools, whose root stays `/data/files`,
+reach the same files through `host-workspace/...`). `MCP_FILE_ROOT` is unchanged,
+so the existing `files-data` volume and the HMAC signing secret shared with the
+admin web keep working. The file tools still hard-deny `.git`, `.env`, key files
+and credential directories; `run_command` remains full administrator mode.
+
+It also mounts `/var/run/docker.sock` and the host's static `docker` CLI, which
+is equivalent to host root (see the permission section below). Two independent
+quick-tunnel containers forward to `mcp-gateway:8765` and `mcp-admin-web:8788`;
+keeping them separate means recreating the business containers does not change
+the published HTTPS URLs. `show-config.sh` prefers the two fixed base URLs, then
+parses the admin tunnel container's logs, and only then falls back to loopback.
+
+Random tunnel domains change when the tunnel containers themselves are recreated.
+Re-read both `docker logs` outputs and update the two `.env` entries before
+recreating the gateway. Recreate without `-v` so `audit-data` (the SQLite audit
+DB, `task-logs/`, generated credentials) and `files-data` are preserved.
+
 ### Upgrade and rollback
 
 - Native: `./scripts/install-native.sh --upgrade` backs up the previous code

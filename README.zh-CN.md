@@ -100,6 +100,30 @@ git clone https://github.com/NinaAWA/cnb-mcp-gateway.git && cd cnb-mcp-gateway &
 
 两种方式都保留 Bearer + OAuth 2.1 PKCE/DCR、内置 Git LFS、SQLite WAL 审计，以及文件与任务日志持久卷。升级/回滚见下节；宿主机 Docker 授权需按后文显式叠加 override 文件。
 
+### 运行态 override：真实宿主工作区、宿主 Docker、两条公网隧道
+
+主 compose 的 `./workspace:/workspace` 指向部署目录下的子目录，端口也只发布到回环地址。需要让网关操作真实宿主仓库时，显式叠加 `docker-compose.runtime.yml`：
+
+```bash
+# 在 .env 中设置（保留已有的 MCP_TOKEN / ADMIN_PASSWORD）
+MCP_HOST_WORKSPACE=/workspace
+MCP_DOCKER_SOCKET=1
+MCP_PUBLIC_BASE_URL=https://<网关隧道域名>.trycloudflare.com
+ADMIN_PUBLIC_BASE_URL=https://<后台隧道域名>.trycloudflare.com
+
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.runtime.yml \
+  up -d --force-recreate
+# 从两个隧道容器日志里解析随机 HTTPS 域名，再回写以上两项并重建业务容器
+docker logs <gateway-tunnel 容器名>
+docker logs <admin-tunnel 容器名>
+```
+
+override 把 `MCP_HOST_WORKSPACE` 同时挂到 `/workspace`（让 `MCP_WORKDIR` 与结构化 `git_*` 工具看到真实仓库）和 `/data/files/host-workspace`（文件工具根仍是 `/data/files`，经 `host-workspace/...` 访问同一批文件）。`MCP_FILE_ROOT` 不变，因此既有 `files-data` 卷与后台共用的 HMAC 签名密钥保持一致。文件工具仍硬禁 `.git`、`.env`、私钥与凭据目录；`run_command` 保持完整管理员权限。
+
+override 同时挂载 `/var/run/docker.sock` 与宿主静态 `docker` CLI，权限等价宿主 root（见后文）。两条独立 quick tunnel 分别转发 `mcp-gateway:8765` 与 `mcp-admin-web:8788`：把隧道拆成独立容器后，重建业务容器不会改变已分发的公网地址。`show-config.sh` 优先读取两个固定基址，其次解析 `admin-tunnel` 容器日志中的域名，最后才回落本机地址。
+
+随机域名只在隧道容器自身重建时变化：重新读取两条 `docker logs` 并回写 `.env` 的两项，再重建业务容器即可。重建务必不带 `-v`，以保留 `audit-data`（审计库、`task-logs/`、自动生成的凭据）与 `files-data`。
+
 ### 升级与回滚
 
 - 原生：`./scripts/install-native.sh --upgrade` 会把旧代码备份到 `/opt/mcp-gateway/app.previous`，`--rollback` 恢复备份并重启两个单元；数据与 `/etc/mcp-gateway/env` 从不动。
