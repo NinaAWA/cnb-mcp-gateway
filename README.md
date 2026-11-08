@@ -72,48 +72,9 @@ multi-tenancy, no Redis/Celery/Kubernetes.
 endpoints, then prints every value you need to copy:
 
 ```bash
-(
-set -e
-DEST=/workspace/mcp-gateway-v11
-
-# Remove any previous deployment first: container names are hardcoded in
-# docker-compose.yml, so an old instance from another Compose project conflicts.
-for name in cnb-mcp-gateway cnb-mcp-admin-web cnb-audit-storage cnb-mcp-cloudflared cnb-mcp-postgres; do
-  docker rm -f "$name" >/dev/null 2>&1 || true
-done
-
-if [ -d "$DEST/.git" ]; then git -C "$DEST" pull --ff-only; else git clone https://github.com/NinaAWA/cnb-mcp-gateway.git "$DEST"; fi
-cd "$DEST"
-for f in .env.example docker-compose.yml; do [ -f "$f" ] || { echo "缺少 $f：请确认代码来源包含 v1.1"; exit 1; }; done
-# PURGE_DATA=1 also deletes named volumes (audit records, files, generated credentials).
-if [ "${PURGE_DATA:-0}" = "1" ]; then docker compose down -v --remove-orphans; fi
-[ -f .env ] || cp .env.example .env && docker compose up -d --build
-for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8765/health >/dev/null 2>&1 && curl -fsS http://127.0.0.1:8788/healthz >/dev/null 2>&1 && break; sleep 2; done
-if [ -f scripts/show-config.sh ]; then
-  bash scripts/show-config.sh
-else
-  # A main without show-config.sh: print the same values inline (default ports).
-  TOKEN="$(docker exec cnb-mcp-gateway sed -n 's/^MCP_TOKEN=//p' /app/.env | head -1)"
-  PASS="$(docker exec cnb-mcp-admin-web cat /data/audit/.admin_password)"
-  printf 'MCP_URL    http://127.0.0.1:8765/mcp\nBearer     %s\nClient config:\n{\n  "mcpServers": {\n    "cnb-gateway": {\n      "url": "http://127.0.0.1:8765/mcp",\n      "headers": {\n        "Authorization": "Bearer %s"\n      }\n    }\n  }\n}\nAdmin Web  http://127.0.0.1:8788/\nUsername   admin\nPassword   %s\n' "$TOKEN" "$TOKEN" "$PASS"
-fi
-)
-```
-
-The printed block contains the **public** MCP URL (a random
-`https://<name>.trycloudflare.com/mcp` by default, reachable by remote agents),
-Bearer token, a formatted, indented `mcpServers` JSON block, the Admin Web URL, admin
-username and password, and both health checks. Re-running the block reuses the
-same directory and never overwrites `.env`.
-
-Re-running it **removes the previous deployment first** (containers with the
-fixed `cnb-*` names, regardless of which directory hosted them), so there is no
-container-name conflict. Named volumes are kept by default; run with
-`PURGE_DATA=1` to also wipe audit records, files and generated credentials.
-
-**Native Linux + systemd** (most complete: reuses host toolchain, GPU, drivers
-and Docker; needs a real systemd and root, not `sudo`):
-
+# 初次部署（已部署时从项目目录重新执行同一脚本即可）
+git clone https://github.com/NinaAWA/cnb-mcp-gateway.git /workspace/mcp-gateway-v11
+bash /workspace/mcp-gateway-v11/scripts/deploy-docker.sh
 ```bash
 git clone https://github.com/NinaAWA/cnb-mcp-gateway.git && cd cnb-mcp-gateway && ./scripts/install-native.sh
 ```
