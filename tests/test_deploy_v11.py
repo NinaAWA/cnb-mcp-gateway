@@ -31,7 +31,7 @@ def test_env_example_has_all_required_keys_and_no_secrets():
     assert "REPLACE_WITH_A_LONG_RANDOM_TOKEN" not in text
     assert "MCP_TOKEN=" in lines, "一键部署应允许留空自动生成令牌"
     assert "ADMIN_PASSWORD=" in lines, "一键部署应允许留空自动生成口令"
-    assert "MCP_TUNNEL_DISABLED=1" in lines, "默认不应暴露随机公网隧道"
+    assert "MCP_TUNNEL_DISABLED=0" in lines, "默认必须开启公网入口，否则远程客户端只能拿到 127.0.0.1"
 
 
 def test_selfcheck_waits_for_real_readiness_before_scoring():

@@ -53,8 +53,9 @@ fi
 )
 ```
 
-终端会直接打印：MCP 服务地址、Bearer Token、一行可直接复制的 `mcpServers` JSON、
-管理网站地址、管理员账号与口令、两个健康检查地址。重复执行会复用同一目录且不会覆盖 `.env`。
+终端会直接打印：**可远程连接的公网 MCP 地址**（默认随机 `https://<域名>.trycloudflare.com/mcp`）、
+Bearer Token、一行可直接复制的 `mcpServers` JSON、管理网站地址、管理员账号与口令、
+两个健康检查地址。重复执行会复用同一目录且不会覆盖 `.env`。
 
 **原生 Linux + systemd**（能力最完整：复用宿主机软件、GPU、驱动与 Docker；
 需要真实 systemd 与 root，不是 `sudo`）：
@@ -75,13 +76,15 @@ git clone https://github.com/NinaAWA/cnb-mcp-gateway.git && cd cnb-mcp-gateway &
 ./scripts/install-native.sh --show-config  # 原生部署
 ```
 
-在 `.env` 中设置 `MCP_PUBLIC_BASE_URL`（可选 `ADMIN_PUBLIC_BASE_URL`）即可打印固定公网 HTTPS 地址；
-未配置时脚本会明确标注「仅本机或内网可达」，**不会伪造公网网址**。
+默认开启内置 quick tunnel（`MCP_TUNNEL_DISABLED=0`），部署完成后 `./scripts/show-config.sh`
+会直接打印可远程连接的 `https://<随机域名>.trycloudflare.com/mcp` 与 Bearer 令牌，
+域名在容器重建后会变化。在 `.env` 设置 `MCP_PUBLIC_BASE_URL`（可选 `ADMIN_PUBLIC_BASE_URL`）
+可升级为固定公网 HTTPS 地址；脚本按「固定 / 随机隧道 / 仅本机」如实标注，**不伪造公网网址**。
 
 需要**固定公网 HTTPS 入口**时设置 `MCP_PUBLIC_BASE_URL=https://mcp.example.com`，
-并在前面放 nginx 或 Cloudflare 命名隧道（见 `deploy/reverse-proxy.example.conf`）；
-默认只把端口发布到 `127.0.0.1`。未配置时 `download_file` 仍返回真实可用的链接，
-但会标注 `link_scope=local`，不假装是公网地址。
+并在前面放 nginx 或 Cloudflare 命名隧道（见 `deploy/reverse-proxy.example.conf`），
+或填 `CF_TUNNEL_TOKEN` 并设 `MCP_TUNNEL_DISABLED=1` 后执行
+`docker compose --profile tunnel up -d`。网关端口默认只发布到 `127.0.0.1`，公网流量由隧道/反代进入。
 
 两种方式都保留 Bearer + OAuth 2.1 PKCE/DCR、内置 Git LFS、SQLite WAL 审计，以及文件与任务日志持久卷。升级/回滚见下节；宿主机 Docker 授权需按后文显式叠加 override 文件。
 
@@ -167,11 +170,12 @@ cp .env.example .env && docker compose up -d --build && ./scripts/show-config.sh
 两者访问控制互相独立。配置、可选 HTTPS 入口、PostgreSQL、备份与验收清单见
 [部署与运维文档](./docs/admin-dashboard.zh-CN.md)。
 
-v1.1 默认关闭内置 quick tunnel（`MCP_TUNNEL_DISABLED=1`），因此 `docker logs` 不再打印公网地址。
-需要固定公网 HTTPS 时按上文设置 `MCP_PUBLIC_BASE_URL` 并配置反代/命名隧道；
-未配置时 `show-config.sh` 明确标注「仅本机或内网可达」，不会伪造公网网址。
+默认开启内置 quick tunnel（`MCP_TUNNEL_DISABLED=0`）；`show-config.sh` 会等待隧道域名出现，
+然后直接打印可远程连接的 `https://<随机域名>.trycloudflare.com/mcp`。域名在容器重建后会变化；
+需要固定公网 HTTPS 时按上文设置 `MCP_PUBLIC_BASE_URL` 并配置反代/命名隧道，脚本改为打印固定地址。
 生成的凭据默认不进容器日志，统一用 `./scripts/show-config.sh` 读取
 （仅在隔离环境可设 `MCP_PRINT_SECRETS=1` 恢复日志打印）。
+设 `MCP_TUNNEL_DISABLED=1` 并重建容器即可关闭公网入口。
 
 ## 连接你的 agent
 
@@ -265,7 +269,7 @@ Authorization: Bearer <MCP_TOKEN>
 | `AUDIT_STRICT` | `0` | `1` = 审计存储不可用时拒绝高风险工具；默认降级放行，不中断实验。 |
 | `AUDIT_RETENTION_DAYS` / `AUDIT_MAX_DB_MB` | `90` / `512` | 归档保留天数与数据库配额。 |
 | `AUDIT_BACKUP_KEEP` / `AUDIT_MAINTENANCE_INTERVAL` | `7` / `300` | 备份保留数量与维护间隔（秒）。 |
-| `MCP_TUNNEL_DISABLED` | `1` | 内置随机 quick tunnel 默认关闭（域名每次变化、且会把默认管理员模式直接暴露公网）。固定入口请用 nginx 反代，或填 `CF_TUNNEL_TOKEN` 并 `docker compose --profile tunnel up -d`；仅确实需要随机临时域名时才设为 `0`。 |
+| `MCP_TUNNEL_DISABLED` | `0` | 内置随机 quick tunnel 默认开启，部署完即可用 `https://<随机域名>.trycloudflare.com/mcp` 远程连接（域名每次重建变化）。固定入口请用 nginx 反代并设 `MCP_PUBLIC_BASE_URL`，或填 `CF_TUNNEL_TOKEN` 并把本项设为 `1` 后 `docker compose --profile tunnel up -d`；完全关闭公网入口也设为 `1` 并重建。 |
 
 完整变量见 [`.env.example`](./.env.example)，部署细节见
 [部署与运维文档](./docs/admin-dashboard.zh-CN.md)。

@@ -172,7 +172,7 @@ setting() {
 ADMIN_USER_VALUE="$(setting ADMIN_USERNAME admin)"
 PUBLIC_BASE="$(setting MCP_PUBLIC_BASE_URL '')"
 ADMIN_PUBLIC="$(setting ADMIN_PUBLIC_BASE_URL '')"
-TUNNEL_DISABLED="$(setting MCP_TUNNEL_DISABLED 1)"
+TUNNEL_DISABLED="$(setting MCP_TUNNEL_DISABLED 0)"
 
 if [ "$MODE_RESOLVED" = "docker" ]; then
   MCP_PORT_NUM="$(setting MCP_HOST_PORT 8765)"
@@ -193,11 +193,16 @@ if [ -n "$PUBLIC_BASE" ]; then
   ENTRY_KIND="固定公网入口（来自 MCP_PUBLIC_BASE_URL）"
   ENTRY_NOTE="已配置固定 HTTPS 基址；请确保反向代理或命名隧道把该域名转发到本机 ${MCP_PORT_NUM} 端口。"
 elif [ "$TUNNEL_DISABLED" != "1" ] && [ "$MODE_RESOLVED" = "docker" ]; then
-  TUNNEL_URL="$(docker logs "$MCP_CONTAINER" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -n 1 || true)"
+  # 隧道域名由 cloudflared 异步写入容器日志；部署刚完成时轮询等待，避免打印 127.0.0.1。
+  for i in $(seq 1 30); do
+    TUNNEL_URL="$(docker logs "$MCP_CONTAINER" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -n 1 || true)"
+    [ -n "$TUNNEL_URL" ] && break
+    sleep 2
+  done
   if [ -n "$TUNNEL_URL" ]; then
     BASE="$TUNNEL_URL"
-    ENTRY_KIND="随机公网隧道（重启容器后会变化）"
-    ENTRY_NOTE="内置 quick tunnel 会把默认管理员模式网关暴露到公网，请确认强令牌并尽快改用固定 HTTPS 入口。"
+    ENTRY_KIND="随机公网隧道（可远程连接；域名在容器重建后会变化）"
+    ENTRY_NOTE="已把默认管理员模式网关暴露到公网；请确认使用强令牌，并尽快改用固定 HTTPS 入口。"
   else
     BASE="$LOCAL_BASE"
     ENTRY_KIND="仅本机或内网可达（已启用隧道但未解析到公网地址）"
@@ -215,7 +220,7 @@ if [ -n "$ADMIN_PUBLIC" ]; then
   ADMIN_NOTE="管理网站固定公网入口（来自 ADMIN_PUBLIC_BASE_URL）"
 else
   ADMIN_URL="http://$(display_host "$ADMIN_BIND_VAL"):${ADMIN_PORT_NUM}/"
-  ADMIN_NOTE="默认只绑定 127.0.0.1，仅本机或内网可达"
+  ADMIN_NOTE="只绑定 127.0.0.1；远程访问需按 deploy/reverse-proxy.example.conf 配置 admin 域名反代"
 fi
 
 CLIENT_JSON="{\"mcpServers\":{\"cnb-gateway\":{\"url\":\"$(json_escape "$MCP_URL")\",\"headers\":{\"Authorization\":\"Bearer $(json_escape "$TOKEN")\"}}}}"
@@ -243,13 +248,13 @@ printf '%s\n' \
   "[5] 重新打印      $ROOT/scripts/show-config.sh" \
   "                  （--mode docker / --mode native 可强制指定部署形态）" \
   "" \
-  "[6] 固定公网 HTTPS（可选，默认未启用）" \
+  "[6] 升级为固定公网 HTTPS（随机隧道域名每次重建会变）" \
   "    在 .env 设置 MCP_PUBLIC_BASE_URL=https://mcp.example.com，按" \
-  "    deploy/reverse-proxy.example.conf 配置 nginx 反代；或设置" \
-  "    CF_TUNNEL_TOKEN 并保持 MCP_TUNNEL_DISABLED=1，再执行" \
-  "    docker compose --profile tunnel up -d。管理网站可用" \
-  "    ADMIN_PUBLIC_BASE_URL 单独指定。启用随机 quick tunnel 会把默认" \
-  "    管理员模式网关暴露到公网，请务必使用强令牌并控制暴露面。" \
+  "    deploy/reverse-proxy.example.conf 配置 nginx 反代；或填" \
+  "    CF_TUNNEL_TOKEN 并设 MCP_TUNNEL_DISABLED=1，再执行" \
+  "    docker compose --profile tunnel up -d。管理网站用" \
+  "    ADMIN_PUBLIC_BASE_URL 单独指定。关闭公网入口请设" \
+  "    MCP_TUNNEL_DISABLED=1 并重建；网关是默认管理员模式，务必用强令牌。" \
   "----------------------------------------------------------------------" \
   "  警告：本块含明文 Bearer Token 与管理员口令，请勿粘贴到公开工单、日志或聊天。" \
   "======================================================================"

@@ -60,12 +60,15 @@ docker compose up -d --build
 Compose 模式下网关还会把令牌同步到共享卷 `/data/audit/.mcp_token`（权限 600），供后台读取需 Bearer 的
 `/internal/metrics`；该文件等同 `MCP_TOKEN`，请控制共享卷的访问权限。`.env` 含密钥，不要提交到仓库。
 
-固定公网 HTTPS 入口：在 `.env` 设置 `MCP_PUBLIC_BASE_URL`（可选 `ADMIN_PUBLIC_BASE_URL`），
-并按 `deploy/reverse-proxy.example.conf` 配置 nginx 或 Cloudflare 命名隧道；
-`show-config.sh` 会据此打印固定公网地址，否则明确标注「仅本机或内网可达」，不会伪造公网网址。
+固定公网 HTTPS 入口：默认已开启内置 quick tunnel，`show-config.sh` 会打印
+`https://<随机域名>.trycloudflare.com/mcp`（域名在容器重建后变化）。要固定地址，在
+`.env` 设置 `MCP_PUBLIC_BASE_URL`（可选 `ADMIN_PUBLIC_BASE_URL`），并按
+`deploy/reverse-proxy.example.conf` 配置 nginx 或 Cloudflare 命名隧道；脚本会改为打印固定公网地址。
+脚本按「固定 / 随机隧道 / 仅本机」如实标注，不伪造公网网址。管理网站默认只绑 `127.0.0.1`，
+需要远程访问请按示例配置 `admin.example.com` 反代。
 
 单容器快速启动（`./run.sh` / `docker run`）仍保持原有行为：一个容器里运行 MCP 网关，
-但不会启动管理后台；v1.1 默认关闭内置 quick tunnel，如需审计后台请使用 Compose 部署。
+但不会启动管理后台；如需审计后台请使用 Compose 部署。
 
 ## 3. 认证与安全边界
 

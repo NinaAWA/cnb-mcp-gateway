@@ -103,6 +103,8 @@ def test_script_exposes_required_contract():
         "仅本机或内网可达，未配置公网入口", "警告",
     ):
         assert marker in text, marker
+    assert "setting MCP_TUNNEL_DISABLED 0" in text, "默认必须开启公网入口，否则远程拿不到 /mcp"
+    assert "seq 1 30" in text, "隧道域名异步出现，必须轮询等待后再打印"
 
 
 def test_native_mode_prints_local_only_credentials_and_client_json(tmp_path):

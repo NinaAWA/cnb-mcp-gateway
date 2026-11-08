@@ -91,9 +91,11 @@ fi
 )
 ```
 
-The printed block contains the MCP URL, Bearer token, a one-line `mcpServers`
-JSON config, the Admin Web URL, admin username and password, and both health
-checks. Re-running the block reuses the same directory and never overwrites `.env`.
+The printed block contains the **public** MCP URL (a random
+`https://<name>.trycloudflare.com/mcp` by default, reachable by remote agents),
+Bearer token, a one-line `mcpServers` JSON config, the Admin Web URL, admin
+username and password, and both health checks. Re-running the block reuses the
+same directory and never overwrites `.env`.
 
 **Native Linux + systemd** (most complete: reuses host toolchain, GPU, drivers
 and Docker; needs a real systemd and root, not `sudo`):
@@ -260,12 +262,16 @@ independent access control. Configuration, optional HTTPS ingress, PostgreSQL,
 backup and the acceptance checklist are in the
 [deployment guide](./docs/admin-dashboard.zh-CN.md).
 
-The built-in quick tunnel is **off by default** (`MCP_TUNNEL_DISABLED=1`), so
-`docker logs` no longer prints a public URL. For a fixed public HTTPS address,
-set `MCP_PUBLIC_BASE_URL` plus a reverse proxy / named tunnel (see above); the
-script then prints that address and labels it as a fixed public entry. Generated
-credentials never appear in container logs — use `./scripts/show-config.sh` (or
-`set MCP_PRINT_SECRETS=1` only in isolated environments).
+The built-in quick tunnel is **on by default** (`MCP_TUNNEL_DISABLED=0`), so the
+one-command deploy already yields a public `https://<random>.trycloudflare.com/mcp`
+URL that a remote agent can reach; `./scripts/show-config.sh` prints that URL,
+the Bearer token and the client JSON. The random domain changes whenever the
+container is recreated. For a **fixed** public HTTPS address, set
+`MCP_PUBLIC_BASE_URL` plus a reverse proxy / named tunnel (see above) — the
+script then labels the entry as fixed. Generated credentials never appear in
+container logs; use `./scripts/show-config.sh` (or `set MCP_PRINT_SECRETS=1`
+only in isolated environments). Set `MCP_TUNNEL_DISABLED=1` and recreate to
+close public ingress.
 
 ## Connect your agent
 
@@ -352,7 +358,7 @@ Example `claude_desktop_config.json`:
 | `AUDIT_DB_DSN` | (empty = SQLite WAL) | Optional PostgreSQL DSN for the `postgres` profile. |
 | `AUDIT_STRICT` | `0` | `1` rejects high-risk tools when audit storage is unavailable; default is graceful degradation. |
 | `AUDIT_RETENTION_DAYS` / `AUDIT_MAX_DB_MB` | `90` / `512` | Archive retention and DB quota. |
-| `MCP_TUNNEL_DISABLED` | `1` | Built-in random quick tunnel is off by default (not a fixed ingress, and it would expose admin mode publicly). Use an nginx reverse proxy, or set `CF_TUNNEL_TOKEN` and run `docker compose --profile tunnel up -d` for a fixed URL. Set to `0` only if you explicitly want the random quick tunnel. |
+| `MCP_TUNNEL_DISABLED` | `0` | Built-in random quick tunnel is on by default, so a remote agent gets a public `https://<random>.trycloudflare.com/mcp` URL right after deploy; the domain changes on recreate. For a fixed URL use an nginx reverse proxy (+ `MCP_PUBLIC_BASE_URL`), or set `CF_TUNNEL_TOKEN` and run `docker compose --profile tunnel up -d` with this set to `1`. Set to `1` to disable public ingress entirely. |
 | `MCP_OAUTH_REQUIRE_PKCE` | `1` | Require OAuth S256 PKCE; set `0` only for legacy clients without a challenge. |
 | `MCP_TRUST_PROXY` / `ADMIN_TRUST_PROXY` | `0` | Trust `X-Forwarded-For` only behind a trusted reverse proxy. |
 | `MCP_GIT_EXTRA_SUBCOMMANDS` | (empty) | Extra allowed git subcommands; unknown ones are refused to block aliases. |
