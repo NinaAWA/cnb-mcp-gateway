@@ -75,6 +75,12 @@ endpoints, then prints every value you need to copy:
 # 初次部署（已部署时从项目目录重新执行同一脚本即可）
 git clone https://github.com/NinaAWA/cnb-mcp-gateway.git /workspace/mcp-gateway-v11
 bash /workspace/mcp-gateway-v11/scripts/deploy-docker.sh
+```
+
+Re-run `bash /workspace/mcp-gateway-v11/scripts/deploy-docker.sh` to upgrade. The script refuses container-name collisions with another Compose project and never deletes data volumes.
+
+**Native Linux + systemd** (uses the host's toolchain, GPU and Docker; requires root and systemd):
+
 ```bash
 git clone https://github.com/NinaAWA/cnb-mcp-gateway.git && cd cnb-mcp-gateway && ./scripts/install-native.sh
 ```
