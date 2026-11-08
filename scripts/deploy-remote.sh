@@ -56,12 +56,22 @@ done
 [ "$ready" = 1 ] || fail '本地健康检查失败；查看 docker compose logs'
 
 get_tunnel() {
-  local name="$1" url=''
+  local name="$1" url='' status=''
   for _ in $(seq 1 60); do
-    url="$(docker logs --tail 200 "$name" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -n 1 || true)"
+    # cloudflared prints its quick-tunnel URL only once. --tail 200 loses the
+    # URL after verbose reconnect/precheck logs; inspect the complete log.
+    url="$(docker logs "$name" 2>&1 | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -n 1 || true)"
     if [ -n "$url" ]; then printf '%s' "$url"; return 0; fi
+    status="$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || true)"
+    if [ "$status" != running ]; then
+      printf '隧道容器 %s 状态=%s；最近日志：\n' "$name" "${status:-unknown}" >&2
+      docker logs --tail 30 "$name" >&2 || true
+      return 1
+    fi
     sleep 2
   done
+  printf '隧道容器 %s 仍在运行，但未发现 trycloudflare.com 地址；最近日志：\n' "$name" >&2
+  docker logs --tail 30 "$name" >&2 || true
   return 1
 }
 MCP_PUBLIC="$(get_tunnel cnb-mcp-gateway-tunnel)" || fail 'MCP 公网隧道没有生成 HTTPS 地址'
