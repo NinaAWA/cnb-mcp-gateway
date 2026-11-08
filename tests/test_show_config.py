@@ -74,10 +74,12 @@ def _native_env(tmp_path: Path, **values: str) -> Path:
 
 
 def _json_config(output: str) -> dict:
-    for line in output.splitlines():
-        if line.startswith('{"mcpServers"'):
-            return json.loads(line)
-    raise AssertionError("输出里没有可直接复制的一行 mcpServers JSON 配置")
+    """从格式化输出里取出分行的 mcpServers 配置块并解析。"""
+    start = output.find('{\n  "mcpServers"')
+    if start == -1:
+        raise AssertionError("输出里没有可直接复制的分行 mcpServers JSON 配置")
+    obj, _ = json.JSONDecoder().raw_decode(output[start:])
+    return obj
 
 
 def test_script_is_executable_and_shell_syntax_is_valid():

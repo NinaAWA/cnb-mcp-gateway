@@ -223,7 +223,16 @@ else
   ADMIN_NOTE="只绑定 127.0.0.1；远程访问需按 deploy/reverse-proxy.example.conf 配置 admin 域名反代"
 fi
 
-CLIENT_JSON="{\"mcpServers\":{\"cnb-gateway\":{\"url\":\"$(json_escape "$MCP_URL")\",\"headers\":{\"Authorization\":\"Bearer $(json_escape "$TOKEN")\"}}}}"
+CLIENT_JSON="{
+  \"mcpServers\": {
+    \"cnb-gateway\": {
+      \"url\": \"$(json_escape "$MCP_URL")\",
+      \"headers\": {
+        \"Authorization\": \"Bearer $(json_escape "$TOKEN")\"
+      }
+    }
+  }
+}"
 
 printf '%s\n' \
   "======================================================================" \
@@ -236,7 +245,7 @@ printf '%s\n' \
   "    Bearer Token  $TOKEN" \
   "    健康检查      http://127.0.0.1:${MCP_PORT_NUM}/health" \
   "" \
-  "[3] MCP 客户端配置（一行，可直接复制）" \
+  "[3] MCP 客户端配置（可直接复制）" \
   "$CLIENT_JSON" \
   "" \
   "[4] 管理网站      $ADMIN_URL" \

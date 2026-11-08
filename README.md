@@ -86,14 +86,14 @@ else
   # A main without show-config.sh: print the same values inline (default ports).
   TOKEN="$(docker exec cnb-mcp-gateway sed -n 's/^MCP_TOKEN=//p' /app/.env | head -1)"
   PASS="$(docker exec cnb-mcp-admin-web cat /data/audit/.admin_password)"
-  printf 'MCP_URL    http://127.0.0.1:8765/mcp\nBearer     %s\nClient     {"mcpServers":{"cnb-gateway":{"url":"http://127.0.0.1:8765/mcp","headers":{"Authorization":"Bearer %s"}}}}\nAdmin Web  http://127.0.0.1:8788/\nUsername   admin\nPassword   %s\n' "$TOKEN" "$TOKEN" "$PASS"
+  printf 'MCP_URL    http://127.0.0.1:8765/mcp\nBearer     %s\nClient config:\n{\n  "mcpServers": {\n    "cnb-gateway": {\n      "url": "http://127.0.0.1:8765/mcp",\n      "headers": {\n        "Authorization": "Bearer %s"\n      }\n    }\n  }\n}\nAdmin Web  http://127.0.0.1:8788/\nUsername   admin\nPassword   %s\n' "$TOKEN" "$TOKEN" "$PASS"
 fi
 )
 ```
 
 The printed block contains the **public** MCP URL (a random
 `https://<name>.trycloudflare.com/mcp` by default, reachable by remote agents),
-Bearer token, a one-line `mcpServers` JSON config, the Admin Web URL, admin
+Bearer token, a formatted, indented `mcpServers` JSON block, the Admin Web URL, admin
 username and password, and both health checks. Re-running the block reuses the
 same directory and never overwrites `.env`.
 

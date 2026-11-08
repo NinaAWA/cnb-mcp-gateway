@@ -48,13 +48,13 @@ else
   # 该 main 尚未合并 show-config.sh 时，用最小内联方式打印同一批信息（默认端口）
   TOKEN="$(docker exec cnb-mcp-gateway sed -n 's/^MCP_TOKEN=//p' /app/.env | head -1)"
   PASS="$(docker exec cnb-mcp-admin-web cat /data/audit/.admin_password)"
-  printf 'MCP_URL    http://127.0.0.1:8765/mcp\nBearer     %s\n客户端配置 {"mcpServers":{"cnb-gateway":{"url":"http://127.0.0.1:8765/mcp","headers":{"Authorization":"Bearer %s"}}}}\nAdmin Web  http://127.0.0.1:8788/\n账号       admin\n口令       %s\n' "$TOKEN" "$TOKEN" "$PASS"
+  printf 'MCP_URL    http://127.0.0.1:8765/mcp\nBearer     %s\n客户端配置:\n{\n  "mcpServers": {\n    "cnb-gateway": {\n      "url": "http://127.0.0.1:8765/mcp",\n      "headers": {\n        "Authorization": "Bearer %s"\n      }\n    }\n  }\n}\nAdmin Web  http://127.0.0.1:8788/\n账号       admin\n口令       %s\n' "$TOKEN" "$TOKEN" "$PASS"
 fi
 )
 ```
 
 终端会直接打印：**可远程连接的公网 MCP 地址**（默认随机 `https://<域名>.trycloudflare.com/mcp`）、
-Bearer Token、一行可直接复制的 `mcpServers` JSON、管理网站地址、管理员账号与口令、
+Bearer Token、分行缩进、可直接复制的 `mcpServers` JSON、管理网站地址、管理员账号与口令、
 两个健康检查地址。重复执行会复用同一目录且不会覆盖 `.env`。
 
 **原生 Linux + systemd**（能力最完整：复用宿主机软件、GPU、驱动与 Docker；
@@ -165,7 +165,7 @@ cp .env.example .env && docker compose up -d --build && ./scripts/show-config.sh
 ```
 
 `./scripts/show-config.sh` 是唯一汇总入口：自动读取首次启动生成的 `MCP_TOKEN` 与管理员口令，
-打印 MCP 地址、一行 `mcpServers` JSON 配置、后台地址与账号口令。后台默认只在宿主机
+打印 MCP 地址、分行缩进的 `mcpServers` JSON 配置、后台地址与账号口令。后台默认只在宿主机
 `http://127.0.0.1:8788` 可达，使用**独立管理员账号**登录（与 `MCP_TOKEN` 无关），
 两者访问控制互相独立。配置、可选 HTTPS 入口、PostgreSQL、备份与验收清单见
 [部署与运维文档](./docs/admin-dashboard.zh-CN.md)。
