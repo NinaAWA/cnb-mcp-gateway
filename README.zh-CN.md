@@ -37,9 +37,17 @@
 (
 set -e
 DEST=/workspace/mcp-gateway-v11
+
+# 先删除之前的部署：compose 里容器名写死，来自其他项目目录的旧实例也会冲突
+for name in cnb-mcp-gateway cnb-mcp-admin-web cnb-audit-storage cnb-mcp-cloudflared cnb-mcp-postgres; do
+  docker rm -f "$name" >/dev/null 2>&1 || true
+done
+
 if [ -d "$DEST/.git" ]; then git -C "$DEST" pull --ff-only; else git clone https://github.com/NinaAWA/cnb-mcp-gateway.git "$DEST"; fi
 cd "$DEST"
 for f in .env.example docker-compose.yml; do [ -f "$f" ] || { echo "缺少 $f：请确认代码来源包含 v1.1"; exit 1; }; done
+# 需要连数据卷一起清空时加 PURGE_DATA=1（会丢失审计记录、文件与自动生成的凭据）
+if [ "${PURGE_DATA:-0}" = "1" ]; then docker compose down -v --remove-orphans; fi
 [ -f .env ] || cp .env.example .env && docker compose up -d --build
 for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8765/health >/dev/null 2>&1 && curl -fsS http://127.0.0.1:8788/healthz >/dev/null 2>&1 && break; sleep 2; done
 if [ -f scripts/show-config.sh ]; then
@@ -56,6 +64,10 @@ fi
 终端会直接打印：**可远程连接的公网 MCP 地址**（默认随机 `https://<域名>.trycloudflare.com/mcp`）、
 Bearer Token、分行缩进、可直接复制的 `mcpServers` JSON、管理网站地址、管理员账号与口令、
 两个健康检查地址。重复执行会复用同一目录且不会覆盖 `.env`。
+
+重复执行会**先删除之前的部署**（按固定的 `cnb-*` 容器名清理，不论旧实例在哪个目录），
+再重新部署，因此不会再出现容器名冲突。默认保留命名卷；需要连审计记录、文件与
+自动生成的凭据一起清空时，在命令前加 `PURGE_DATA=1`。
 
 **原生 Linux + systemd**（能力最完整：复用宿主机软件、GPU、驱动与 Docker；
 需要真实 systemd 与 root，不是 `sudo`）：
@@ -87,6 +99,37 @@ git clone https://github.com/NinaAWA/cnb-mcp-gateway.git && cd cnb-mcp-gateway &
 `docker compose --profile tunnel up -d`。网关端口默认只发布到 `127.0.0.1`，公网流量由隧道/反代进入。
 
 两种方式都保留 Bearer + OAuth 2.1 PKCE/DCR、内置 Git LFS、SQLite WAL 审计，以及文件与任务日志持久卷。升级/回滚见下节；宿主机 Docker 授权需按后文显式叠加 override 文件。
+
+### 运行态 override：真实宿主工作区、宿主 Docker、两条公网隧道
+
+主 compose 的 `./workspace:/workspace` 指向部署目录下的子目录，端口也只发布到回环地址。需要让网关操作真实宿主仓库时，显式叠加 `docker-compose.runtime.yml`：
+
+```bash
+# 在 .env 中设置（保留已有的 MCP_TOKEN / ADMIN_PASSWORD）
+# 两个公网基址先留空，等隧道容器报出域名后再回写
+MCP_HOST_WORKSPACE=/workspace
+MCP_DOCKER_SOCKET=1
+MCP_PUBLIC_BASE_URL=
+ADMIN_PUBLIC_BASE_URL=
+
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.runtime.yml \
+  up -d --force-recreate
+# 两条隧道各自打印自己的随机 HTTPS 域名
+docker logs <gateway-tunnel 容器名>
+docker logs <admin-tunnel 容器名>
+# 把两个域名回写 .env 后，只重建业务容器，避免隧道容器被重建导致域名变化
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.runtime.yml \
+  up -d --force-recreate --no-deps mcp-gateway mcp-admin-web
+```
+
+override 把 `MCP_HOST_WORKSPACE` 同时挂到 `/workspace`（让 `MCP_WORKDIR` 与结构化 `git_*` 工具看到真实仓库）和 `/data/files/host-workspace`（文件工具根仍是 `/data/files`，经 `host-workspace/...` 访问同一批文件）。`MCP_FILE_ROOT` 不变，因此既有 `files-data` 卷与后台共用的 HMAC 签名密钥保持一致。文件工具仍硬禁 `.git`、`.env`、私钥与凭据目录；`run_command` 保持完整管理员权限。
+
+override 同时挂载 `/var/run/docker.sock` 与宿主静态 `docker` CLI，权限等价宿主 root（见后文）。两条独立 quick tunnel 分别转发 `mcp-gateway:8765` 与 `mcp-admin-web:8788`：把隧道拆成独立容器后，重建业务容器不会改变已分发的公网地址。后台地址方面，`show-config.sh` 优先读取 `ADMIN_PUBLIC_BASE_URL`，其次解析 `admin-tunnel` 容器日志中的域名，最后才回落本机地址；MCP 地址则由 `MCP_PUBLIC_BASE_URL` 决定，该项留空期间只打印本机地址，因此网关隧道域名需按上面的步骤回写 `.env`。
+
+随机域名只在隧道容器自身重建时变化。验证卷持久化时请按上面的 `--no-deps` 命令只重建
+`mcp-gateway` 与 `mcp-admin-web`；不带服务名的 `up -d --force-recreate` 会连两条隧道容器一起重建，
+已分发的两个公网地址随即失效。隧道容器确实被重建时，重新读取两条 `docker logs` 并回写 `.env` 的两项即可。
+重建务必不带 `-v`，以保留 `audit-data`（审计库、`task-logs/`、自动生成的凭据）与 `files-data`。
 
 ### 升级与回滚
 

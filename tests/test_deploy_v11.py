@@ -100,6 +100,8 @@ def test_one_command_deploy_uses_github_main_and_show_config():
         assert "/health" in text and "/healthz" in text, "一键命令必须等待两个服务就绪"
         assert "9266f9f" in text, "必须说明 CNB main 仍是旧提交"
         assert "sudo ./scripts/install-native.sh" not in text
+        assert "docker rm -f" in text, "重复执行必须先清理旧容器，否则跨项目部署会撞固定容器名"
+        assert "PURGE_DATA" in text, "必须提供清空数据卷的显式选项"
     example = _text(".env.example")
     assert "https://github.com/NinaAWA/cnb-mcp-gateway.git" in example
     assert "scripts/show-config.sh" in example

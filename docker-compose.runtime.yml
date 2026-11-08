@@ -1,0 +1,66 @@
+# 运行态覆盖：让 MCP 访问真实宿主机工作区、显式授权宿主机 Docker，
+# 并为网关与管理后台各提供一条独立的 quick tunnel。
+#
+# 为什么拆独立隧道：网关内置的 quick tunnel 与 uvicorn 同进程，重建网关必然
+# 换域名；而 MCP_PUBLIC_BASE_URL 只在进程启动时读取，写回 .env 后还要重建一次
+# 网关才生效，域名会再次变化。把隧道拆成独立容器后，域名只在重建隧道时变化，
+# 重建业务容器不会影响已分发的公网地址。
+#
+# 首次启动（项目名必须保持 mcp-gateway-v11，否则 audit-data/files-data 卷会换前缀）：
+#   docker compose -p mcp-gateway-v11 \
+#     -f docker-compose.yml -f docker-compose.runtime.yml up -d --force-recreate
+# 之后只重建业务容器、保持隧道域名不变（不带 -v，卷数据不丢）：
+#   docker compose -p mcp-gateway-v11 \
+#     -f docker-compose.yml -f docker-compose.runtime.yml \
+#     up -d --force-recreate --no-deps mcp-gateway mcp-admin-web
+#
+# 只读校验：
+#   docker compose -p mcp-gateway-v11 \
+#     -f docker-compose.yml -f docker-compose.runtime.yml config -q
+#
+# 撤销：去掉 -f docker-compose.runtime.yml，用
+#   docker compose -p mcp-gateway-v11 -f docker-compose.yml up -d --remove-orphans
+# 重建并清掉两个隧道容器；单独 up -d 不会移除它们。切勿使用 down -v，
+# 卷内的审计库、任务日志、上传文件与自动生成的凭据都会随卷删除。
+services:
+  mcp-gateway:
+    environment:
+      # 与下方 socket 挂载配套；等价于宿主机 root，默认 compose 是关闭的。
+      - MCP_DOCKER_SOCKET=1
+      # 公网入口改由独立的 gateway-tunnel 提供，避免两个入口并存。
+      - MCP_TUNNEL_DISABLED=1
+    volumes:
+      # 按 target 覆盖主 compose 的 ./workspace:/workspace（指向部署目录里的空子目录）。
+      # 绝对路径使 MCP_WORKDIR=/workspace 与结构化 Git 工具看到真实宿主工作区。
+      - ${MCP_HOST_WORKSPACE:-/workspace}:/workspace
+      # MCP_FILE_ROOT 保持 /data/files 不变，既有 files-data 卷内容完整保留；
+      # 文件工具经 host-workspace/... 访问同一批宿主文件。
+      - ${MCP_HOST_WORKSPACE:-/workspace}:/data/files/host-workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${MCP_HOST_DOCKER_CLI:-/usr/local/bin/docker}:/usr/local/bin/docker:ro
+
+  gateway-tunnel:
+    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway-plus:v1.1.0}
+    container_name: cnb-mcp-gateway-tunnel
+    restart: unless-stopped
+    depends_on:
+      - mcp-gateway
+    environment:
+      - MCP_SERVICE_ROLE=cloudflared
+      # compose 主文件里的同名变量是硬编码的，必须在这里显式声明。
+      - MCP_UPSTREAM_URL=http://mcp-gateway:8765
+      # 必须为空，否则 entrypoint 走命名隧道分支并忽略上游地址。
+      - CF_TUNNEL_TOKEN=
+    command: ["/app/entrypoint.sh"]
+
+  admin-tunnel:
+    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway-plus:v1.1.0}
+    container_name: cnb-mcp-admin-tunnel
+    restart: unless-stopped
+    depends_on:
+      - mcp-admin-web
+    environment:
+      - MCP_SERVICE_ROLE=cloudflared
+      - MCP_UPSTREAM_URL=http://mcp-admin-web:8788
+      - CF_TUNNEL_TOKEN=
+    command: ["/app/entrypoint.sh"]

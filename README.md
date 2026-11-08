@@ -75,9 +75,18 @@ endpoints, then prints every value you need to copy:
 (
 set -e
 DEST=/workspace/mcp-gateway-v11
+
+# Remove any previous deployment first: container names are hardcoded in
+# docker-compose.yml, so an old instance from another Compose project conflicts.
+for name in cnb-mcp-gateway cnb-mcp-admin-web cnb-audit-storage cnb-mcp-cloudflared cnb-mcp-postgres; do
+  docker rm -f "$name" >/dev/null 2>&1 || true
+done
+
 if [ -d "$DEST/.git" ]; then git -C "$DEST" pull --ff-only; else git clone https://github.com/NinaAWA/cnb-mcp-gateway.git "$DEST"; fi
 cd "$DEST"
 for f in .env.example docker-compose.yml; do [ -f "$f" ] || { echo "缺少 $f：请确认代码来源包含 v1.1"; exit 1; }; done
+# PURGE_DATA=1 also deletes named volumes (audit records, files, generated credentials).
+if [ "${PURGE_DATA:-0}" = "1" ]; then docker compose down -v --remove-orphans; fi
 [ -f .env ] || cp .env.example .env && docker compose up -d --build
 for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8765/health >/dev/null 2>&1 && curl -fsS http://127.0.0.1:8788/healthz >/dev/null 2>&1 && break; sleep 2; done
 if [ -f scripts/show-config.sh ]; then
@@ -96,6 +105,11 @@ The printed block contains the **public** MCP URL (a random
 Bearer token, a formatted, indented `mcpServers` JSON block, the Admin Web URL, admin
 username and password, and both health checks. Re-running the block reuses the
 same directory and never overwrites `.env`.
+
+Re-running it **removes the previous deployment first** (containers with the
+fixed `cnb-*` names, regardless of which directory hosted them), so there is no
+container-name conflict. Named volumes are kept by default; run with
+`PURGE_DATA=1` to also wipe audit records, files and generated credentials.
 
 **Native Linux + systemd** (most complete: reuses host toolchain, GPU, drivers
 and Docker; needs a real systemd and root, not `sudo`):
@@ -130,6 +144,58 @@ Without it, `download_file` still returns a working link but marks it
 Both modes keep Bearer + OAuth 2.1 PKCE/DCR, built-in Git LFS, SQLite WAL audit
 and persistent volumes for files / task logs. Upgrade and rollback are below;
 optional host Docker control needs the explicit override file described below.
+
+### Runtime override: real host workspace, host Docker, two public tunnels
+
+The stock Compose file mounts `./workspace:/workspace` (a subdirectory of the
+deployment directory) and publishes only loopback ports. When the gateway must
+operate on the real host checkout, add `docker-compose.runtime.yml` explicitly:
+
+```bash
+# in .env (keep existing MCP_TOKEN / ADMIN_PASSWORD untouched; leave the two
+# public base URLs empty until the tunnel containers have reported their domains)
+MCP_HOST_WORKSPACE=/workspace
+MCP_DOCKER_SOCKET=1
+MCP_PUBLIC_BASE_URL=
+ADMIN_PUBLIC_BASE_URL=
+
+docker compose -p <project> -f docker-compose.yml -f docker-compose.runtime.yml \
+  up -d --force-recreate
+# each tunnel logs its own random HTTPS domain
+docker logs <gateway-tunnel-container>
+docker logs <admin-tunnel-container>
+# write the two domains back into .env, then recreate ONLY the business containers
+# so the tunnel containers (and their already-distributed domains) stay untouched
+docker compose -p <project> -f docker-compose.yml -f docker-compose.runtime.yml \
+  up -d --force-recreate --no-deps mcp-gateway mcp-admin-web
+```
+
+The override bind-mounts `MCP_HOST_WORKSPACE` to `/workspace` (so `MCP_WORKDIR`
+and the structured `git_*` tools see the real checkout) **and** to
+`/data/files/host-workspace` (so the file tools, whose root stays `/data/files`,
+reach the same files through `host-workspace/...`). `MCP_FILE_ROOT` is unchanged,
+so the existing `files-data` volume and the HMAC signing secret shared with the
+admin web keep working. The file tools still hard-deny `.git`, `.env`, key files
+and credential directories; `run_command` remains full administrator mode.
+
+It also mounts `/var/run/docker.sock` and the host's static `docker` CLI, which
+is equivalent to host root (see the permission section below). Two independent
+quick-tunnel containers forward to `mcp-gateway:8765` and `mcp-admin-web:8788`;
+keeping them separate means recreating the business containers does not change
+the published HTTPS URLs. For the Admin Web URL, `show-config.sh` prefers
+`ADMIN_PUBLIC_BASE_URL`, then parses the admin tunnel container's logs, and only
+then falls back to loopback. The MCP URL is printed from `MCP_PUBLIC_BASE_URL`
+(or the local address while it is empty), so the gateway tunnel domain must be
+written back into `.env` as shown above.
+
+Random tunnel domains change only when the tunnel containers themselves are
+recreated. To verify volume persistence, recreate just `mcp-gateway` and
+`mcp-admin-web` with `--no-deps` (as above); a bare `up -d --force-recreate`
+also recreates both tunnel containers and therefore invalidates the two URLs
+you already distributed. Re-read both `docker logs` outputs and update the two
+`.env` entries whenever a tunnel container really is recreated. Never pass
+`-v`, so `audit-data` (the SQLite audit DB, `task-logs/`, generated credentials)
+and `files-data` are preserved.
 
 ### Upgrade and rollback
 

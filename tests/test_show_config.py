@@ -17,7 +17,8 @@ SCRIPT = ROOT / "scripts" / "show-config.sh"
 
 _SENSITIVE_ENV = (
     "MCP_ENV_FILE", "MCP_CONTAINER", "MCP_ADMIN_CONTAINER",
-    "MCP_PUBLIC_BASE_URL", "ADMIN_PUBLIC_BASE_URL", "MCP_TUNNEL_DISABLED",
+    "MCP_ADMIN_TUNNEL_CONTAINER", "MCP_PUBLIC_BASE_URL",
+    "ADMIN_PUBLIC_BASE_URL", "MCP_TUNNEL_DISABLED",
     "ADMIN_USERNAME", "MCP_HOST_PORT", "ADMIN_HOST_PORT",
     "MCP_PORT", "ADMIN_PORT", "MCP_BIND", "ADMIN_BIND",
     "MCP_BIND_HOST", "ADMIN_BIND_HOST", "MCP_TOKEN", "ADMIN_PASSWORD",
@@ -101,6 +102,7 @@ def test_script_exposes_required_contract():
     for marker in (
         "--mode", "--help", "MCP_ENV_FILE", "MCP_CONTAINER", "MCP_ADMIN_CONTAINER",
         "MCP_PUBLIC_BASE_URL", "ADMIN_PUBLIC_BASE_URL", "mcpServers", "Bearer Token",
+        "MCP_ADMIN_TUNNEL_CONTAINER", "cnb-mcp-admin-tunnel", "随机公网隧道",
         "入口类型", "管理网站", "管理员账号", "管理员密码",
         "仅本机或内网可达，未配置公网入口", "警告",
     ):
@@ -183,3 +185,59 @@ def test_help_and_invalid_mode():
     bad = _run(SCRIPT, "--mode", "bogus")
     assert bad.returncode != 0
     assert "native|docker|auto" in bad.stderr
+
+
+def _fake_docker(tmp_path: Path) -> dict[str, str]:
+    """只读的 docker 替身：inspect 返回运行中，logs 返回带隧道域名的行。"""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    docker = bin_dir / "docker"
+    docker.write_text(
+        "#!/usr/bin/env bash\n"
+        "case \"$1\" in\n"
+        "  inspect) printf 'true\\n' ;;\n"
+        "  exec)\n"
+        "    case \"$4\" in\n"
+        "      /app/.env) printf 'MCP_TOKEN=token-abc123\\nADMIN_PASSWORD=pass-xyz789\\n' ;;\n"
+        "      /data/audit/.mcp_token) printf 'token-abc123\\n' ;;\n"
+        "      /data/audit/.admin_password) printf 'pass-xyz789\\n' ;;\n"
+        "    esac ;;\n"
+        "  logs)\n"
+        "    case \"$*\" in\n"
+        "      *cnb-mcp-admin-tunnel*) "
+        "printf 'INF | https://admin-random-fixture.trycloudflare.com | quick tunnel\\n' ;;\n"
+        "      *) printf 'INF | https://gateway-random-fixture.trycloudflare.com | quick tunnel\\n' ;;\n"
+        "    esac ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+    return {
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        "MCP_TUNNEL_DISABLED": "1",
+    }
+
+
+def test_admin_tunnel_url_is_parsed_from_container_logs(tmp_path):
+    script = _isolated_script(tmp_path)
+    result = _run(script, "--mode", "docker", extra_env=_fake_docker(tmp_path))
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+    assert "[4] 管理网站      https://admin-random-fixture.trycloudflare.com/" in out
+    assert "管理网站随机公网隧道" in out
+    assert "健康检查      https://admin-random-fixture.trycloudflare.com/healthz" in out
+    assert "127.0.0.1:8788" not in out
+    assert "https://gateway-random-fixture.trycloudflare.com/" not in out.split("[4]")[1]
+
+
+def test_admin_public_base_takes_priority_over_tunnel_logs(tmp_path):
+    script = _isolated_script(tmp_path)
+    env = _fake_docker(tmp_path)
+    env["ADMIN_PUBLIC_BASE_URL"] = "https://admin.example.com"
+    result = _run(script, "--mode", "docker", extra_env=env)
+    assert result.returncode == 0, result.stderr
+    out = result.stdout
+    assert "[4] 管理网站      https://admin.example.com/" in out
+    assert "管理网站固定公网入口" in out
+    assert "健康检查      https://admin.example.com/healthz" in out
+    assert "admin-random-fixture" not in out
