@@ -14,7 +14,7 @@ def test_one_command_deploy_exists_in_both_readmes():
     for name in ("README.md", "README.zh-CN.md"):
         text = _text(name)
         assert "install-native.sh" in text
-        assert "cp .env.example .env && docker compose up -d --build" in text
+        assert "scripts/deploy-docker.sh" in text
         assert "scripts/selfcheck_v11.py" in text
         assert "git clone" in text
 
@@ -95,13 +95,13 @@ def test_one_command_deploy_uses_github_main_and_show_config():
     for name in ("README.md", "README.zh-CN.md"):
         text = _text(name)
         assert "https://github.com/NinaAWA/cnb-mcp-gateway.git" in text
-        assert "cp .env.example .env && docker compose up -d --build" in text
+        assert "scripts/deploy-docker.sh" in text
         assert "scripts/show-config.sh" in text
         assert "/health" in text and "/healthz" in text, "一键命令必须等待两个服务就绪"
         assert "9266f9f" in text, "必须说明 CNB main 仍是旧提交"
         assert "sudo ./scripts/install-native.sh" not in text
-        assert "docker rm -f" in text, "重复执行必须先清理旧容器，否则跨项目部署会撞固定容器名"
-        assert "PURGE_DATA" in text, "必须提供清空数据卷的显式选项"
+        assert 'docker rm -f "$name"' not in text, "安装文档不能无条件删除同名容器"
+        assert "docker compose down -v" in text, "删除数据卷只能作为独立警告，不得混入安装命令"
     example = _text(".env.example")
     assert "https://github.com/NinaAWA/cnb-mcp-gateway.git" in example
     assert "scripts/show-config.sh" in example
@@ -115,3 +115,13 @@ def test_native_installer_prints_config_without_sudo():
     assert "--show-config" in text
     assert "sudo ./scripts/install-native.sh" not in text
     assert "请用 sudo 运行" not in text
+
+def test_safe_deploy_refuses_foreign_container_and_never_deletes():
+    text = _text("scripts/deploy-docker.sh")
+    assert 'com.docker.compose.project' in text
+    assert 'Refusing to stop/remove it' in text
+    assert 'docker compose config --quiet' in text
+    assert 'docker compose up -d --build' in text
+    assert 'scripts/show-config.sh --mode docker' in text
+    for forbidden in ("docker rm -f", "docker compose down -v", "docker container rm", "docker compose down --remove-orphans"):
+        assert forbidden not in text, f"Installer must not delete existing assets: {forbidden}"
