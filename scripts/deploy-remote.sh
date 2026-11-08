@@ -54,13 +54,32 @@ export MCP_HOST_DOCKER_CLI="$(command -v docker)"
 COMPOSE=(docker compose -p "$PROJECT" -f docker-compose.yml -f docker-compose.runtime.yml)
 "${COMPOSE[@]}" config --quiet
 
-# 全量重建服务容器：先停止并移除旧版，然后从最新源码重新构建。
-# 不使用 -v：保留审计库、上传文件、任务日志、Token 与管理员口令。
-# 不删除 Git 仓库、科研工作区、镜像缓存或其他 Compose 项目。
-printf '\n[部署] 停止并移除旧版 %s 服务容器（保留数据卷）...\n' "$PROJECT"
+# Fail before stopping the old deployment if registry/network/build is broken.
+# The previous curl -sSL could silently store a GitHub 504 HTML page as the
+# cloudflared executable; now we require a real Cloudflare registry image.
+printf '\n[部署] 预检：拉取 Cloudflare 官方镜像（失败不会删除旧服务）...\n'
+tunnel_image='cloudflare/cloudflared:2026.10.7'
+image_ready=0
+for attempt in 1 2 3; do
+  if docker pull "$tunnel_image"; then image_ready=1; break; fi
+  printf '[部署] 官方镜像拉取失败：尝试 %s/3\n' "$attempt" >&2
+  [ "$attempt" = 3 ] || sleep 3
+done
+[ "$image_ready" = 1 ] || fail '无法拉取 cloudflared 官方镜像；旧服务未清理'
+docker run --rm --network none --entrypoint /usr/local/bin/cloudflared \
+  "$tunnel_image" version >/dev/null \
+  || fail 'Cloudflare 镜像无法运行有效 cloudflared 二进制；旧服务未清理'
+
+printf '[部署] 预检：构建并校验新版 MCP 镜像（失败不会删除旧服务）...\n'
+"${COMPOSE[@]}" build mcp-gateway \
+  || fail '新版 MCP 镜像构建失败；旧服务未清理'
+
+# Full container replacement without -v preserves credentials, task logs,
+# uploaded files and audit database. Never touch the research workspace.
+printf '\n[部署] 预检通过；停止并移除旧版 %s 服务容器（保留数据卷）...\n' "$PROJECT"
 "${COMPOSE[@]}" down --remove-orphans
-printf '[部署] 基于 GitHub main 重新构建并启动服务...\n'
-"${COMPOSE[@]}" up -d --build --force-recreate
+printf '[部署] 使用已校验镜像重新启动全部服务...\n'
+"${COMPOSE[@]}" up -d --no-build --force-recreate
 
 # 先确认本地两个服务都确实启动，再读取 Cloudflare 分配的真实域名。
 ready=0
