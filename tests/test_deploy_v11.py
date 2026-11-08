@@ -127,3 +127,28 @@ def test_safe_deploy_refuses_foreign_container_and_never_deletes():
     assert 'scripts/show-config.sh --mode docker' in text
     for forbidden in ("docker rm -f", "docker compose down -v", "docker container rm", "docker compose down --remove-orphans"):
         assert forbidden not in text, f"Installer must not delete existing assets: {forbidden}"
+
+
+def test_cloudflared_uses_official_image_and_rejects_html_payloads():
+    dockerfile = _text("docker/Dockerfile")
+    runtime = _text("docker-compose.runtime.yml")
+    assert "FROM cloudflare/cloudflared:2026.10.7 AS cloudflared-bin" in dockerfile
+    assert "COPY --from=cloudflared-bin /usr/local/bin/cloudflared" in dockerfile
+    assert "7f454c46" in dockerfile, "必须校验 ELF 文件头"
+    assert "/usr/local/bin/cloudflared --version" in dockerfile
+    assert "curl -sSL -o /usr/local/bin/cloudflared" not in dockerfile
+    assert runtime.count("image: cloudflare/cloudflared:2026.10.7") == 2
+    assert 'command: ["tunnel", "--url", "http://mcp-gateway:8765"]' in runtime
+    assert 'command: ["tunnel", "--url", "http://mcp-admin-web:8788"]' in runtime
+
+
+def test_remote_deploy_preflight_happens_before_removing_old_containers():
+    script = _text("scripts/deploy-remote.sh")
+    pull = script.index('docker pull "$tunnel_image"')
+    check = script.index("docker run --rm --network none")
+    build = script.index('"${COMPOSE[@]}" build mcp-gateway')
+    stop = script.index('"${COMPOSE[@]}" down --remove-orphans')
+    restart = script.index('"${COMPOSE[@]}" up -d --no-build --force-recreate')
+    assert pull < check < build < stop < restart
+    assert "down -v" not in script, "重建不能删除历史审计与文件数据卷"
+    assert "docker rm -f" not in script, "不得跨项目直接删除同名容器"
