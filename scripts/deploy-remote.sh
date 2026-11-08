@@ -14,7 +14,7 @@ docker compose version >/dev/null 2>&1 || fail '需要 Docker Compose v2'
 [ -S /var/run/docker.sock ] || fail '未发现 /var/run/docker.sock；当前模式需要访问宿主机 Docker'
 case "$ROOT" in /*) ;; *) fail 'MCP_DEPLOY_DIR 必须是绝对路径' ;; esac
 
-# 固定容器名不能接管其他 Compose 项目；绝不自动删除旧容器或数据卷。
+# 仅清理当前部署所属的旧容器；同名但属于其他项目的容器一律不删除。
 for name in cnb-mcp-gateway cnb-mcp-admin-web cnb-audit-storage \
             cnb-mcp-cloudflared cnb-mcp-postgres \
             cnb-mcp-gateway-tunnel cnb-mcp-admin-tunnel; do
@@ -23,6 +23,17 @@ for name in cnb-mcp-gateway cnb-mcp-admin-web cnb-audit-storage \
     [ "$owner" = "$PROJECT" ] || fail "容器 $name 属于项目 ${owner:-未知}；拒绝自动接管或删除"
   fi
 done
+
+# --remove-orphans 也会影响该 Compose 项目的历史服务；逐个核对工作目录。
+managed_containers="$(docker ps -a --filter "label=com.docker.compose.project=$PROJECT" --format '{{.Names}}')" \
+  || fail '无法列出旧 Compose 容器；中止以避免误删除'
+while IFS= read -r container_name; do
+  [ -n "$container_name" ] || continue
+  deployed_from="$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' "$container_name")" \
+    || fail "无法核验容器 $container_name 的项目工作目录"
+  [ "$deployed_from" = "$ROOT" ] \
+    || fail "容器 $container_name 的部署目录为 ${deployed_from:-未知}，与 $ROOT 不同；拒绝清理"
+done <<< "$managed_containers"
 
 if [ -d "$ROOT/.git" ]; then
   [ "$(git -C "$ROOT" branch --show-current)" = main ] || fail '现有部署目录不在 main 分支'
@@ -42,7 +53,14 @@ export MCP_HOST_DOCKER_CLI="$(command -v docker)"
 [ -d "$MCP_HOST_WORKSPACE" ] || fail "宿主工作区不存在：$MCP_HOST_WORKSPACE"
 COMPOSE=(docker compose -p "$PROJECT" -f docker-compose.yml -f docker-compose.runtime.yml)
 "${COMPOSE[@]}" config --quiet
-"${COMPOSE[@]}" up -d --build
+
+# 全量重建服务容器：先停止并移除旧版，然后从最新源码重新构建。
+# 不使用 -v：保留审计库、上传文件、任务日志、Token 与管理员口令。
+# 不删除 Git 仓库、科研工作区、镜像缓存或其他 Compose 项目。
+printf '\n[部署] 停止并移除旧版 %s 服务容器（保留数据卷）...\n' "$PROJECT"
+"${COMPOSE[@]}" down --remove-orphans
+printf '[部署] 基于 GitHub main 重新构建并启动服务...\n'
+"${COMPOSE[@]}" up -d --build --force-recreate
 
 # 先确认本地两个服务都确实启动，再读取 Cloudflare 分配的真实域名。
 ready=0
