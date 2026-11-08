@@ -11,6 +11,22 @@ tunnel.out
 __pycache__/
 *.pyc
 
+# v1.1 真实自检产生的临时 bare 仓库夹具（含嵌套 .git，切勿提交）
+.mcp-v11-selfcheck/
+
+# Compose 默认挂载到容器 /workspace 的宿主工作目录（运行期数据，不入库）
+workspace/
+
+# v1.1 运行期产物：未完成分片、上传票据、文件与任务日志目录
+*.part
+.mcp-uploads/
+files-data/
+task-logs/
+var/lib/mcp-gateway/
+*.db
+*.db-wal
+*.db-shm
+
 # 本地开发虚拟环境
 .venv/
 

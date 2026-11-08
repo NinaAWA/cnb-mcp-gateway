@@ -14,6 +14,116 @@ the public internet via a Cloudflare quick tunnel.
    └─ cloudflared quick tunnel (random https URL) ◄── auth: Bearer token / OAuth2 PKCE
 ```
 
+## v1.1 — generic self-hosted Linux remote control
+
+Two deployment modes, one tool surface. Nothing is bound to a particular research
+project, directory, repository or dependency stack; no task orchestration, no
+multi-tenancy, no Redis/Celery/Kubernetes.
+
+- **Default administrator mode.** `MCP_ALLOWED_PREFIXES` is now only an *optional*
+  tightening switch — leaving it empty allows all everyday admin commands
+  (`apt`/`dpkg`, `pip`/`uv`/`conda`, `bash`, Python, `gcc`/`cmake`, Git/Git LFS,
+  Docker/Compose). Permanently retained: Bearer/OAuth authentication, full audit,
+  hard-blocked Git branch/repository deletion (including shell, Python and encoded
+  bypasses), catastrophic blacklist, and the `confirm=true` gate for destructive
+  commands. `run_command`, `run_command_background` and REST `/run_command` all
+  share one `_authorize()` gate, so rules cannot drift between entry points.
+- **Honest command results.** `run_command` returns `exit_code`, `duration_ms`,
+  `timed_out`, `stdout`, `stderr`, and accepts `env` + `stdin`. Output is capped by
+  `MCP_MAX_OUTPUT_BYTES`. A timeout returns convention code `124` and explicitly
+  states that it is not the process's real exit code. `env` values, `stdin` and
+  chunk payloads are never written to the audit log.
+- **Binary file transfer.** `upload_file` / `download_file` / `file_info` /
+  `file_checksum`: base64 chunks (1 MiB default), `.part` staging, streaming
+  SHA-256, atomic `os.replace()`, overwrite detection and failure rollback that
+  keeps the original file. `download_file` also returns an absolute HMAC-signed,
+  short-lived link (`GET /files/download`) that works in a browser or `curl` and
+  supports HTTP `Range`. All paths are confined to `MCP_FILE_ROOT`; `.git`,
+  `.ssh`, `.env`, private keys and token files are refused.
+- **Git.** 19 structured, `shell=False` tools. `git_add` takes an explicit path
+  array (`.` and wildcards are refused). `git_push` verifies with `git rev-parse
+  HEAD` + `git ls-remote` before reporting success. New: `git_merge`,
+  `git_rebase` (safe forms), `git_stash`, `git_show`, `git_cherry_pick`,
+  `git_checkout`. Deleting a local/remote branch, forced refspec rewriting and
+  `git lfs prune`/`uninstall`/`migrate` are always denied. The `.git` URL false
+  positive that broke `sh -c 'git lfs pre-push ... repo.git'` is fixed.
+- **Long tasks.** Metadata lives in SQLite WAL (`mcp_tasks`) and logs in
+  `MCP_TASK_LOG_DIR`, so logs stay readable after a restart. A `running` task
+  whose process cannot be confirmed (pid + `/proc` start time) is marked
+  `unknown` with a NULL exit code — **never** `done` or success. Cancellation
+  uses the same pid identity check to avoid signalling a reused pid.
+- **Docker.** Normal Docker operations are covered by `run_command`; an optional
+  lightweight `docker_status` gives a status view. In container deployments the
+  host Docker socket is **not** mounted by default.
+- **Admin Web.** Home dashboard, full call log, background tasks, Git records and
+  file transfer records; disk metrics for the managed file root. All views read
+  the same redacted audit store: no passwords, private keys, full tokens, `env`
+  values, `stdin`, base64 chunks or signature material.
+
+### Deploy v1.1 — one command, nothing to pre-fill
+
+```bash
+# A. Native Linux + systemd (recommended: reuses host toolchain, GPU, drivers, Docker)
+git clone https://cnb.cool/webgamer-2026/cnb-mcp-gateway.git && cd cnb-mcp-gateway && sudo ./scripts/install-native.sh
+
+# B. Docker / Compose (MCP_TOKEN and ADMIN_PASSWORD are generated on first start)
+git clone https://cnb.cool/webgamer-2026/cnb-mcp-gateway.git && cd cnb-mcp-gateway && cp .env.example .env && docker compose up -d --build
+
+# Verify either deployment: T01–T12 real self-check, explicit PASS / FAIL / SKIP
+python3 scripts/selfcheck_v11.py
+```
+
+Read the generated credentials (never stored in this repository, never printed by
+default):
+
+```bash
+sudo cat /etc/mcp-gateway/env                              # native, mode 600
+docker exec cnb-mcp-gateway cat /app/.env                 # compose, MCP_TOKEN
+docker exec cnb-mcp-admin-web cat /data/audit/.admin_password   # compose, admin password
+```
+
+For a **fixed public HTTPS entry**, set `MCP_PUBLIC_BASE_URL=https://mcp.example.com`
+and put nginx or a Cloudflare named tunnel in front; only `127.0.0.1` is published
+otherwise. Without it, `download_file` still returns a working link but marks it
+`link_scope=local` instead of pretending to be a public URL.
+
+Both modes keep Bearer + OAuth 2.1 PKCE/DCR, built-in Git LFS, SQLite WAL audit
+and persistent volumes for files / task logs. Upgrade and rollback are below;
+optional host Docker control needs the explicit override file described below.
+
+### Upgrade and rollback
+
+- Native: `sudo ./scripts/install-native.sh --upgrade` backs up the previous code
+  to `/opt/mcp-gateway/app.previous`; `--rollback` restores it and restarts both
+  units. Data and `/etc/mcp-gateway/env` are never touched.
+- Compose: change `MCP_IMAGE` in `.env` to the new tag, then
+  `docker compose up -d`; roll back by switching the tag back (e.g.
+  `ghcr.io/ninaawa/cnb-mcp-gateway-plus:v3.1.1`) and re-running `up -d`. Record
+  the current image digest and `docker inspect` arguments before upgrading.
+- The `v3.1.0` tag and the old `cnb-mcp-gateway` package are deliberately not
+  overwritten.
+
+### Docker socket permission (read this)
+
+Container root is **not** host root. Only mounting `/var/run/docker.sock` grants
+effective host-root power (privileged containers, mounting the host filesystem,
+reading any file). It is off by default and requires both `MCP_DOCKER_SOCKET=1`
+and the explicit override file. The override also mounts the host's static `docker`
+CLI read-only (set `MCP_HOST_DOCKER_CLI` if `command -v docker` differs), so
+`run_command`'s `docker ps` / `docker build` really work once authorized. Even
+without that CLI mount, `docker_status` reads the Engine API directly from the
+socket using only the standard library. Native/systemd deployments already use the
+host Docker directly.
+
+### Verification
+
+`python3 scripts/selfcheck_v11.py` runs T01–T12 against a live service and prints
+the real command, output excerpt and PASS/FAIL/SKIP for each. Credentials come
+from `MCP_TOKEN` / `ADMIN_PASSWORD` when set, otherwise from the auto-generated
+`/app/.env` and `/data/audit/.admin_password` inside the containers. Any failure
+or skip is reported explicitly; nothing is simulated. `--skip-restart` omits the
+real container restart in T10 and marks it SKIP. Unit/regression tests: `pytest -q`.
+
 ## Why
 
 You want to let an AI agent run commands **on your server** from anywhere, but
@@ -181,11 +291,26 @@ Example `claude_desktop_config.json`:
 | `MCP_SEARCH_FETCH_MAX_CHARS` | `8000` | Max extracted page text length. |
 | `MCP_SEARCH_FETCH_ALLOW_HOSTS` | (empty) | Optional comma-separated host allow-list for page fetching. |
 
+### v1.1 command / file / task / Docker variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MCP_IMAGE` | `.../plus:v1.1.0` | Image tag; changing it is the whole upgrade/rollback procedure. |
+| `MCP_MAX_OUTPUT_BYTES` | `2000000` | Hard cap on a single command's stdout/stderr (truncation is marked in the result). |
+| `MCP_FILE_ROOT` | `/data/files` | Managed root for binary transfer. Every path is `resolve()`d and must stay inside it; `.git`, `.ssh`, `.env`, keys and token files are refused. |
+| `MCP_FILE_CHUNK_BYTES` | `1048576` | Max base64 chunk size (clamped to 4096..8 MiB). Signed HTTP downloads are streamed and are not subject to this limit. |
+| `MCP_TASK_LOG_DIR` | `/data/audit/task-logs` | Persistent task-log directory; logs stay readable after a restart. |
+| `MCP_PUBLIC_BASE_URL` | (empty) | Public HTTPS origin used as the prefix of `download_file`'s absolute signed link; empty falls back to the request Host (local `curl` only). |
+| `MCP_FILE_SIGNING_SECRET` | (empty → `MCP_TOKEN`) | HMAC key for short-lived download links. Gateway and Admin Web must see the same value. |
+| `MCP_DOCKER_SOCKET` | `0` | `1` + `docker-compose.host-docker.yml` mounts `/var/run/docker.sock`; equivalent to host root. |
+| `MCP_HOST_PORT` / `MCP_BIND_HOST` | `8765` / `127.0.0.1` | Host-side port publishing for the gateway (loopback only by default). |
+| `MCP_ALLOWED_PREFIXES` | (empty = allow all) | **Optional tightening switch only.** Leaving it empty is the v1.1 default administrator mode; Git deletion, catastrophic blocks, the `confirm` gate and full audit remain active either way. |
+
 ### Admin dashboard & audit variables (Compose reads the root `.env`)
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / `admin` | Separate admin account. The weak default is for isolated environments only — override with a strong `ADMIN_PASSWORD`; the effective password is persisted (mode 600) in the `audit-data` volume. |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / generated | Separate admin account. No hardcoded password: leave `ADMIN_PASSWORD` empty to generate a strong random one on first start; it is persisted (mode 600) in the `audit-data` volume and reused across container rebuilds. An explicit value always wins. |
 | `ADMIN_SESSION_SECRET` | (empty → sessions drop on restart) | HMAC key for session cookies. |
 | `ADMIN_SESSION_TTL` | `28800` | Session lifetime in seconds. |
 | `ADMIN_LOGIN_MAX_FAILURES` / `ADMIN_LOGIN_LOCK_MINUTES` | `5` / `15` | Failed-login lockout. |
@@ -195,7 +320,7 @@ Example `claude_desktop_config.json`:
 | `AUDIT_DB_DSN` | (empty = SQLite WAL) | Optional PostgreSQL DSN for the `postgres` profile. |
 | `AUDIT_STRICT` | `0` | `1` rejects high-risk tools when audit storage is unavailable; default is graceful degradation. |
 | `AUDIT_RETENTION_DAYS` / `AUDIT_MAX_DB_MB` | `90` / `512` | Archive retention and DB quota. |
-| `MCP_TUNNEL_DISABLED` | `0` | Set to `1` when using the standalone `cloudflared` service. |
+| `MCP_TUNNEL_DISABLED` | `1` | Built-in random quick tunnel is off by default (not a fixed ingress, and it would expose admin mode publicly). Use an nginx reverse proxy, or set `CF_TUNNEL_TOKEN` and run `docker compose --profile tunnel up -d` for a fixed URL. Set to `0` only if you explicitly want the random quick tunnel. |
 | `MCP_OAUTH_REQUIRE_PKCE` | `1` | Require OAuth S256 PKCE; set `0` only for legacy clients without a challenge. |
 | `MCP_TRUST_PROXY` / `ADMIN_TRUST_PROXY` | `0` | Trust `X-Forwarded-For` only behind a trusted reverse proxy. |
 | `MCP_GIT_EXTRA_SUBCOMMANDS` | (empty) | Extra allowed git subcommands; unknown ones are refused to block aliases. |
@@ -279,10 +404,12 @@ least-privilege deploy key or PAT, keep independent backups, and avoid mounting
 - `MCP_TOKEN` is effectively a **remote shell key**. Treat it like a password,
   and only share it with agents you trust. By default the gateway is **open**
   (no allow-list); use `MCP_ALLOWED_PREFIXES` to tighten if you prefer.
-- Single-container mode listens on `127.0.0.1`; in Compose mode the gateway listens
-  on `0.0.0.0` **inside the container network only** (no host port published).
-  Cloudflare terminates TLS. The admin dashboard is published to `127.0.0.1:8788`
-  and always requires its own admin login.
+- Single-container mode listens on `127.0.0.1`. v1.1 Compose publishes the gateway to
+  `127.0.0.1:${MCP_HOST_PORT:-8765}` for local self-checks / a reverse proxy; it is
+  **not** an open service because `/mcp`, `/run_command` and all tool routes still
+  require a valid Bearer token. The admin dashboard is published to
+  `127.0.0.1:8788` and always requires its own admin login. Keep both on loopback
+  and put TLS in front via nginx or a Cloudflare tunnel.
 - Search tools only call a fixed domain allow-list, cap response size and enforce
   per-source rate limits. `read_web_page` is off by default and blocks non-HTTPS,
   IP literals and private-network targets (including redirects).

@@ -1,0 +1,28 @@
+# 可选覆盖：显式授权 MCP 网关控制宿主机 Docker。
+#
+# 用法（两个条件缺一不可）：
+#   MCP_DOCKER_SOCKET=1 docker compose \
+#     -f docker-compose.yml -f docker-compose.host-docker.yml up -d
+#
+# 安全边界（务必阅读）：
+#   /var/run/docker.sock 的写权限等价于宿主机 root：容器可以启动特权容器、
+#   挂载宿主根目录、读取任意文件。镜像内 root 只是容器命名空间内的 root，
+#   **不等于**宿主机 root；只有挂载 socket 后才会实质获得宿主机控制能力。
+#   默认 compose 不挂载该 socket；只在确实需要 docker build / compose / ps
+#   等宿主机容器操作时叠加本文件，并确保公网入口有强 Bearer 令牌与 HTTPS。
+#
+# 常规 Docker 命令由默认管理员模式的 run_command 覆盖；本文件不改变任何
+# 命令鉴权、Git 删除硬禁或审计规则。镜像本身不含 docker CLI，所以同时只读
+# 挂载宿主机的静态 docker 二进制，授权后 `docker ps` / `docker build` 等才真正可用。
+# 若宿主机 CLI 不在 /usr/local/bin/docker，用 MCP_HOST_DOCKER_CLI 指定
+# `command -v docker` 的结果；即使不挂 CLI，docker_status 仍会通过标准库
+# 直接读 /var/run/docker.sock 的 Engine API 返回真实容器状态。
+# 授权后自检：docker compose exec mcp-gateway docker version
+# 撤销授权：去掉本 override 文件并重新 `docker compose -f docker-compose.yml up -d`。
+services:
+  mcp-gateway:
+    environment:
+      - MCP_DOCKER_SOCKET=1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${MCP_HOST_DOCKER_CLI:-/usr/local/bin/docker}:/usr/local/bin/docker:ro

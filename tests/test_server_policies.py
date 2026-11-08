@@ -78,6 +78,14 @@ class TestCommandClassification(unittest.TestCase):
         finally:
             NS["ALLOWED_PREFIXES"] = []
 
+    def test_empty_allowlist_is_default_admin_mode(self):
+        """v1.1：MCP_ALLOWED_PREFIXES 降级为可选的收紧开关，留空即放行全部命令。"""
+        NS["ALLOWED_PREFIXES"] = []
+        for command in ["apt-get update", "docker ps", "bash -c 'echo ok'",
+                        "python3 train.py", "git status"]:
+            with self.subTest(command=command):
+                self.assertTrue(NS["_prefix_allowed"](command))
+
 
 class TestOAuthPolicies(unittest.TestCase):
     def test_redirect_uri(self):

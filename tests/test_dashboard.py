@@ -120,3 +120,61 @@ def test_config_and_session_management(admin_client, login):
     assert client.get("/api/sessions").json()["rows"]
     assert client.delete("/api/sessions/fake").status_code == 200
     assert len(client.get("/api/clients").json()["rows"]) == 0
+
+
+def test_files_view_and_admin_file_transfer(admin_client, login, tmp_path, monkeypatch):
+    import base64
+    import hashlib
+
+    client, storage, _ = admin_client
+    root = tmp_path / "files"
+    root.mkdir()
+    monkeypatch.setenv("MCP_FILE_ROOT", str(root))
+    from gateway.files import service
+    service.record_transfer("upload_file", "blob.bin", direction="upload",
+                            status="SUCCESS", size=5, sha256="a" * 64)
+    login(client)
+
+    data = client.get("/api/files").json()
+    assert data["summary"]["transfers"] == 1
+    assert data["rows"][0]["path"] == "blob.bin"
+    assert "分片内容" in data["note"]
+
+    payload = b"hello-binary\x00\xff"
+    uploaded = client.post("/files/upload", json={
+        "path": "hello.bin", "content_base64": base64.b64encode(payload).decode(),
+        "total_size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+    })
+    assert uploaded.status_code == 200
+    assert (root / "hello.bin").read_bytes() == payload
+
+    downloaded = client.get("/files/download?path=hello.bin")
+    assert downloaded.status_code == 200 and downloaded.content == payload
+    assert client.get("/files/download?path=../escape").status_code == 404
+    assert client.get("/api/files?keyword=hello.bin").json()["summary"]["transfers"] >= 1
+
+    dashboard = client.get("/api/dashboard").json()
+    assert "file_root_disk" in dashboard and "disks" in dashboard
+    assert dashboard["file_root_disk"]["total_bytes"] > 0
+    assert dashboard["files"]["uploads"] >= 1
+
+
+def test_tasks_view_reports_persisted_unknown(admin_client, login, tmp_path, monkeypatch):
+    import time as _time
+    from gateway.admin import api as api_mod
+    from gateway.tasks.store import TaskRecord, TaskStore
+
+    client, _storage, _ = admin_client
+    store = TaskStore(db_path=str(tmp_path / "tasks.db"))
+    store.create(TaskRecord(
+        task_id="unknown-task", command="python3 train.py", status="unknown",
+        log_path=str(tmp_path / "unknown-task.log"), started_at=_time.time(),
+        detail="服务重启：无法确认进程存活与真实退出码，状态未知",
+    ))
+    monkeypatch.setattr(api_mod, "get_task_store", lambda: store)
+    login(client)
+    payload = client.get("/api/tasks").json()
+    assert payload["orphaned"][0]["status"] == "unknown"
+    assert payload["orphaned"][0]["exit_code"] is None
+    assert "unknown" in payload["note"]
+    assert "tasks" in client.get("/api/dashboard").json()

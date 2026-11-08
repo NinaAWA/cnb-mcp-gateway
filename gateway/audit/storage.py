@@ -42,7 +42,8 @@ HIGH_RISK_TOOLS = frozenset({
     "run_command", "run_command_background", "write_file", "kill_process",
     "stop_task", "read_web_page",
     "git_add", "git_commit", "git_push", "git_pull", "git_fetch",
-    "git_switch", "git_branch_create",
+    "git_switch", "git_branch_create", "git_merge", "git_rebase", "git_stash",
+    "git_cherry_pick", "git_checkout", "upload_file", "download_file",
 })
 
 _SQLITE_SCHEMA = """
@@ -118,6 +119,12 @@ CREATE TABLE IF NOT EXISTS export_jobs (
 CREATE TABLE IF NOT EXISTS admin_settings (
   key TEXT PRIMARY KEY, value TEXT, updated_at TEXT
 );
+CREATE TABLE IF NOT EXISTS file_transfers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL, request_id TEXT, trace_id TEXT, tool_name TEXT,
+  path TEXT, direction TEXT, size INTEGER DEFAULT 0, sha256 TEXT,
+  status TEXT, error_message TEXT, client_id TEXT, duration_ms INTEGER DEFAULT 0
+);
 CREATE INDEX IF NOT EXISTS ix_calls_ts ON tool_calls(timestamp_start);
 CREATE INDEX IF NOT EXISTS ix_calls_tool ON tool_calls(tool_name, timestamp_start);
 CREATE INDEX IF NOT EXISTS ix_calls_status ON tool_calls(status, timestamp_start);
@@ -133,6 +140,8 @@ CREATE INDEX IF NOT EXISTS ix_events_req ON audit_events(request_id);
 CREATE INDEX IF NOT EXISTS ix_git_repo ON git_operations(repo_path, ts);
 CREATE INDEX IF NOT EXISTS ix_exp_task ON experiment_runs(task_id, ts);
 CREATE INDEX IF NOT EXISTS ix_tasks_task ON background_tasks(task_id, ts);
+CREATE INDEX IF NOT EXISTS ix_files_ts ON file_transfers(ts);
+CREATE INDEX IF NOT EXISTS ix_files_tool ON file_transfers(tool_name, ts);
 """
 
 _PG_SCHEMA = _SQLITE_SCHEMA.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
@@ -336,6 +345,19 @@ class AuditStorage:
     def add_approval(self, values: dict[str, Any]) -> None:
         values.setdefault("ts", utcnow())
         self._insert("approval_events", values)
+
+    def add_file_transfer(self, values: dict[str, Any]) -> None:
+        """真实文件传输记录：路径、大小、摘要、方向与终态；绝不存分片内容。"""
+        values.setdefault("ts", utcnow())
+        self._insert("file_transfers", values)
+
+    def file_transfers(self, limit: int = 100, keyword: str = "") -> list[dict[str, Any]]:
+        limit = min(max(1, limit), 500)
+        if keyword:
+            return self._query(
+                "SELECT * FROM file_transfers WHERE path LIKE ? OR tool_name LIKE ? "
+                "ORDER BY ts DESC LIMIT ?", [f"%{keyword}%", f"%{keyword}%", limit])
+        return self._query("SELECT * FROM file_transfers ORDER BY ts DESC LIMIT ?", [limit])
 
     # ---------------------------------------------------------------- queries
     @staticmethod
