@@ -24,35 +24,70 @@
 
 ### 部署 v1.1 —— 一条命令，无需预先填任何秘密
 
-```bash
-# A. 原生 Linux + systemd（推荐：直接复用宿主机软件、GPU、驱动与 Docker）
-git clone https://cnb.cool/webgamer-2026/cnb-mcp-gateway.git && cd cnb-mcp-gateway && sudo ./scripts/install-native.sh
+> **该用哪个 main？** 只有 GitHub `main` 已合并 v1.1；CNB `main` 仍是旧提交
+> `9266f9f`，没有 `.env.example` / `scripts/`，直接克隆会报
+> `cp: 对 '.env.example' 调用 stat 失败: 没有那个文件或目录`。请使用下方 GitHub 地址；
+> 只能用 CNB 时改用
+> `git clone -b feat/mcp-v1.1 https://cnb.cool/webgamer-2026/cnb-mcp-gateway.git`。
+> 当前已是 root 时无需 `sudo`；Docker 路径不依赖 systemd。
 
-# B. Docker / Compose（MCP_TOKEN 与 ADMIN_PASSWORD 首次启动自动生成）
-git clone https://cnb.cool/webgamer-2026/cnb-mcp-gateway.git && cd cnb-mcp-gateway && cp .env.example .env && docker compose up -d --build
-
-# 验证任一部署：T01–T12 真实自检，逐项 PASS / FAIL / SKIP，不虚构
-python3 scripts/selfcheck_v11.py
-```
-
-读取自动生成的凭据（绝不写入本仓库，默认也不打印到容器日志）：
+**Docker / Compose（无 systemd 的主机推荐）** —— 整块粘贴，部署、等就绪、打印配置一次完成：
 
 ```bash
-sudo cat /etc/mcp-gateway/env                              # 原生，600 权限
-docker exec cnb-mcp-gateway cat /app/.env                 # Compose，MCP_TOKEN
-docker exec cnb-mcp-admin-web cat /data/audit/.admin_password   # Compose，管理员口令
+(
+set -e
+DEST=/workspace/mcp-gateway-v11
+if [ -d "$DEST/.git" ]; then git -C "$DEST" pull --ff-only; else git clone https://github.com/NinaAWA/cnb-mcp-gateway.git "$DEST"; fi
+cd "$DEST"
+for f in .env.example docker-compose.yml; do [ -f "$f" ] || { echo "缺少 $f：请确认代码来源包含 v1.1"; exit 1; }; done
+[ -f .env ] || cp .env.example .env && docker compose up -d --build
+for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8765/health >/dev/null 2>&1 && curl -fsS http://127.0.0.1:8788/healthz >/dev/null 2>&1 && break; sleep 2; done
+if [ -f scripts/show-config.sh ]; then
+  bash scripts/show-config.sh
+else
+  # 该 main 尚未合并 show-config.sh 时，用最小内联方式打印同一批信息（默认端口）
+  TOKEN="$(docker exec cnb-mcp-gateway sed -n 's/^MCP_TOKEN=//p' /app/.env | head -1)"
+  PASS="$(docker exec cnb-mcp-admin-web cat /data/audit/.admin_password)"
+  printf 'MCP_URL    http://127.0.0.1:8765/mcp\nBearer     %s\n客户端配置 {"mcpServers":{"cnb-gateway":{"url":"http://127.0.0.1:8765/mcp","headers":{"Authorization":"Bearer %s"}}}}\nAdmin Web  http://127.0.0.1:8788/\n账号       admin\n口令       %s\n' "$TOKEN" "$TOKEN" "$PASS"
+fi
+)
 ```
+
+终端会直接打印：MCP 服务地址、Bearer Token、一行可直接复制的 `mcpServers` JSON、
+管理网站地址、管理员账号与口令、两个健康检查地址。重复执行会复用同一目录且不会覆盖 `.env`。
+
+**原生 Linux + systemd**（能力最完整：复用宿主机软件、GPU、驱动与 Docker；
+需要真实 systemd 与 root，不是 `sudo`）：
+
+```bash
+git clone https://github.com/NinaAWA/cnb-mcp-gateway.git && cd cnb-mcp-gateway && ./scripts/install-native.sh
+```
+
+安装完成后同样会打印连接信息。Compose 部署可用 `python3 scripts/selfcheck_v11.py`
+执行 T01–T12 真实自检（逐项 PASS/FAIL/SKIP）；该脚本硬编码 Compose 路径，
+不是原生部署的通用自检。
+
+### 随时重新打印连接信息（只读）
+
+```bash
+./scripts/show-config.sh                    # 自动探测原生 / Compose
+./scripts/show-config.sh --mode docker     # 强制 Compose
+./scripts/install-native.sh --show-config  # 原生部署
+```
+
+在 `.env` 中设置 `MCP_PUBLIC_BASE_URL`（可选 `ADMIN_PUBLIC_BASE_URL`）即可打印固定公网 HTTPS 地址；
+未配置时脚本会明确标注「仅本机或内网可达」，**不会伪造公网网址**。
 
 需要**固定公网 HTTPS 入口**时设置 `MCP_PUBLIC_BASE_URL=https://mcp.example.com`，
-并在前面放 nginx 或 Cloudflare 命名隧道；默认只把端口发布到 `127.0.0.1`。
-未配置时 `download_file` 仍返回真实可用的链接，但会标注 `link_scope=local`，
-不假装是公网地址。
+并在前面放 nginx 或 Cloudflare 命名隧道（见 `deploy/reverse-proxy.example.conf`）；
+默认只把端口发布到 `127.0.0.1`。未配置时 `download_file` 仍返回真实可用的链接，
+但会标注 `link_scope=local`，不假装是公网地址。
 
 两种方式都保留 Bearer + OAuth 2.1 PKCE/DCR、内置 Git LFS、SQLite WAL 审计，以及文件与任务日志持久卷。升级/回滚见下节；宿主机 Docker 授权需按后文显式叠加 override 文件。
 
 ### 升级与回滚
 
-- 原生：`sudo ./scripts/install-native.sh --upgrade` 会把旧代码备份到 `/opt/mcp-gateway/app.previous`，`--rollback` 恢复备份并重启两个单元；数据与 `/etc/mcp-gateway/env` 从不动。
+- 原生：`./scripts/install-native.sh --upgrade` 会把旧代码备份到 `/opt/mcp-gateway/app.previous`，`--rollback` 恢复备份并重启两个单元；数据与 `/etc/mcp-gateway/env` 从不动。
 - Compose：修改 `.env` 中的 `MCP_IMAGE` 标签后 `docker compose up -d`；回滚把标签改回上一个可用值（如 `ghcr.io/ninaawa/cnb-mcp-gateway-plus:v3.1.1`）再 `up -d`。升级前先记录当前镜像 digest 与 `docker inspect` 启动参数作为回滚锚点。
 - 有意不覆盖 `v3.1.0` 标签与旧 package `cnb-mcp-gateway`。
 
@@ -118,31 +153,25 @@ docker exec cnb-mcp-gateway cat /app/.env   # 读取 MCP_TOKEN
 ./run.sh
 ```
 
-### 带审计后台的四服务部署（推荐用于服务器管理与完整调用审计）
+### 带审计后台的多服务部署
+
+直接用部署章节的一键命令即可。在已有的 v1.1 目录里，最简形式是：
 
 ```bash
-cp docker/.env.template .env
-# 建议在 .env 中固定 MCP_TOKEN 与 ADMIN_PASSWORD
-docker compose up -d --build
-docker exec cnb-mcp-admin-web cat /data/audit/.admin_password   # 读取当前生效口令（默认 admin）
+cp .env.example .env && docker compose up -d --build && ./scripts/show-config.sh
 ```
 
-后台默认只在宿主机 `http://127.0.0.1:8788` 可达，使用**独立管理员账号**登录（与 `MCP_TOKEN` 无关）；
-MCP API 仍通过网关容器日志里的隧道地址访问，两者访问控制互相独立。
-配置、可选 HTTPS 入口、PostgreSQL、备份与验收清单见
+`./scripts/show-config.sh` 是唯一汇总入口：自动读取首次启动生成的 `MCP_TOKEN` 与管理员口令，
+打印 MCP 地址、一行 `mcpServers` JSON 配置、后台地址与账号口令。后台默认只在宿主机
+`http://127.0.0.1:8788` 可达，使用**独立管理员账号**登录（与 `MCP_TOKEN` 无关），
+两者访问控制互相独立。配置、可选 HTTPS 入口、PostgreSQL、备份与验收清单见
 [部署与运维文档](./docs/admin-dashboard.zh-CN.md)。
 
-单容器模式的启动横幅会打印你需要的一切：
-
-```
- 公网根地址 (BASE_URL):   https://xxxx.trycloudflare.com
- MCP 连接器地址 (MCP_URL): https://xxxx.trycloudflare.com/mcp
- ChatGPT 插件 OpenAPI 清单: https://xxxx.trycloudflare.com/openapi.yaml
- 密钥 (MCP_TOKEN):        已写入 /app/.env，默认不在日志打印
-```
-
-> 每次重启容器 → **新的随机地址** + **新的随机令牌**（除非你固定它们，见下）。
-> 用 `docker exec cnb-mcp-gateway cat /app/.env` 取令牌；仅在隔离环境可设 `MCP_PRINT_SECRETS=1` 让日志打印密钥。
+v1.1 默认关闭内置 quick tunnel（`MCP_TUNNEL_DISABLED=1`），因此 `docker logs` 不再打印公网地址。
+需要固定公网 HTTPS 时按上文设置 `MCP_PUBLIC_BASE_URL` 并配置反代/命名隧道；
+未配置时 `show-config.sh` 明确标注「仅本机或内网可达」，不会伪造公网网址。
+生成的凭据默认不进容器日志，统一用 `./scripts/show-config.sh` 读取
+（仅在隔离环境可设 `MCP_PRINT_SECRETS=1` 恢复日志打印）。
 
 ## 连接你的 agent
 
@@ -238,7 +267,7 @@ Authorization: Bearer <MCP_TOKEN>
 | `AUDIT_BACKUP_KEEP` / `AUDIT_MAINTENANCE_INTERVAL` | `7` / `300` | 备份保留数量与维护间隔（秒）。 |
 | `MCP_TUNNEL_DISABLED` | `1` | 内置随机 quick tunnel 默认关闭（域名每次变化、且会把默认管理员模式直接暴露公网）。固定入口请用 nginx 反代，或填 `CF_TUNNEL_TOKEN` 并 `docker compose --profile tunnel up -d`；仅确实需要随机临时域名时才设为 `0`。 |
 
-完整变量见 [`docker/.env.template`](./docker/.env.template)，部署细节见
+完整变量见 [`.env.example`](./.env.example)，部署细节见
 [部署与运维文档](./docs/admin-dashboard.zh-CN.md)。
 
 ## Git 删除保护（硬约束）
@@ -402,7 +431,7 @@ read_image(path="/workspace/results/loss_curve.png", max_dim=1024)
   后台写操作额外校验 Origin / Sec-Fetch-Site，登录锁定默认不信任可伪造的 `X-Forwarded-For`。
   详见 [部署与运维文档](./docs/admin-dashboard.zh-CN.md)。
 - 公网免鉴权的 `/health` 只返回最小存活状态；系统指标与工具数量改由需 Bearer 的 `/internal/metrics` 提供，后台用 `MCP_TOKEN` 读取。
-- `MCP_TOKEN` 与生效管理员口令**默认不再打印到容器日志**，分别从 `/app/.env` 与 `/data/audit/.admin_password` 读取；后台不再内置弱口令，留空时首次启动生成强随机值、以 600 权限持久化并在容器重建时复用。OAuth 默认强制 S256 PKCE、校验 `redirect_uri`、签发的 token 有过期并会回收。
+- `MCP_TOKEN` 与生效管理员口令**默认不再打印到容器日志**，统一用 `./scripts/show-config.sh` 一并打印（底层分别从 `/app/.env` 与 `/data/audit/.admin_password` 读取）；后台不再内置弱口令，留空时首次启动生成强随机值、以 600 权限持久化并在容器重建时复用。OAuth 默认强制 S256 PKCE、校验 `redirect_uri`、签发的 token 有过期并会回收。
 - ⚠️ **密钥提醒**：如果你用的是共享/明文出现的 PAT 或令牌，建议用完后立即在对应平台撤销并轮换；agent 用的 Git 凭据务必最小权限，并在远端开启分支保护（见 [Git 删除保护](#git-删除保护硬约束)）。
 
 ## 从源码构建

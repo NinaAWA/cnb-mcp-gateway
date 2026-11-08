@@ -89,3 +89,27 @@ def test_no_plaintext_pat_in_tracked_sources():
                  "docker-compose.yml", "docker/entrypoint.sh",
                  "scripts/install-native.sh"):
         assert "ghp_" not in _text(path), f"{path} 不应含明文 PAT"
+
+
+def test_one_command_deploy_uses_github_main_and_show_config():
+    for name in ("README.md", "README.zh-CN.md"):
+        text = _text(name)
+        assert "https://github.com/NinaAWA/cnb-mcp-gateway.git" in text
+        assert "cp .env.example .env && docker compose up -d --build" in text
+        assert "scripts/show-config.sh" in text
+        assert "/health" in text and "/healthz" in text, "一键命令必须等待两个服务就绪"
+        assert "9266f9f" in text, "必须说明 CNB main 仍是旧提交"
+        assert "sudo ./scripts/install-native.sh" not in text
+    example = _text(".env.example")
+    assert "https://github.com/NinaAWA/cnb-mcp-gateway.git" in example
+    assert "scripts/show-config.sh" in example
+    assert "ADMIN_PUBLIC_BASE_URL=" in example
+    assert "sudo ./scripts/install-native.sh" not in example
+
+
+def test_native_installer_prints_config_without_sudo():
+    text = _text("scripts/install-native.sh")
+    assert "show-config.sh" in text
+    assert "--show-config" in text
+    assert "sudo ./scripts/install-native.sh" not in text
+    assert "请用 sudo 运行" not in text

@@ -32,30 +32,40 @@ REST /run_command ─┼─> 统一采集层 ─> SQLite WAL (/data/audit/audit.
 
 ```bash
 # v1.1 推荐：使用全量占位配置示例（含文件根目录、任务日志、签名密钥、Docker 授权开关）
-cp .env.example .env          # 或沿用旧的 docker/.env.template，两者变量集合一致
-# 填写 MCP_TOKEN / ADMIN_PASSWORD / MCP_PUBLIC_BASE_URL；公网环境务必改强口令
+cp .env.example .env
+# 全部留空即可：MCP_TOKEN / ADMIN_PASSWORD 首次启动自动生成
 docker compose up -d --build
-docker compose exec mcp-admin-web cat /data/audit/.admin_password   # 读取当前生效口令
-# 浏览器打开 http://127.0.0.1:8788；网关本机自检地址 http://127.0.0.1:8765/mcp
+# 一条命令打印 MCP 地址、Bearer 令牌、客户端 JSON 配置、后台地址与管理员账号口令
+./scripts/show-config.sh
+# 浏览器打开 http://127.0.0.1:8788
 ```
 
-原生 Linux（systemd，直接复用宿主机软件、GPU、驱动与 Docker）：
+> 请从已合并 v1.1 的 GitHub `main` 克隆；CNB `main` 仍是旧提交，没有 `.env.example` 与 `scripts/`。
+> 旧模板 `docker/.env.template` 与 `.env.example` 变量集合并不一致，请勿再用于 v1.1 部署。
+> 完整一键命令（含前置校验与就绪等待）与分支差异见 [README.zh-CN.md](../README.zh-CN.md)。
+
+原生 Linux（systemd，直接复用宿主机软件、GPU、驱动与 Docker；需要真实 systemd 与 root）：
 
 ```bash
-sudo ./scripts/install-native.sh            # --upgrade / --rollback
-# 配置 /etc/mcp-gateway/env（600）；单元 deploy/mcp-gateway.service 与 deploy/mcp-admin-web.service
+./scripts/install-native.sh                # --upgrade / --rollback / --show-config
+# 安装完成后自动打印同一份连接信息；/etc/mcp-gateway/env（600）
+# 单元 deploy/mcp-gateway.service 与 deploy/mcp-admin-web.service
 # 固定 HTTPS 入口见 deploy/reverse-proxy.example.conf
 ```
 
 未设置 `ADMIN_PASSWORD` 时首次启动自动生成强随机口令（`entrypoint.sh` 的 `generate_secret`），以 600 权限写入 `/data/audit/.admin_password`，容器重建时复用；不再有硬编码默认口令。
-入口脚本会忽略旧卷里残留的随机口令文件，并把当前生效口令以 `600` 权限重新写入共享卷
-`/data/audit/.admin_password`；默认**不打印到容器日志**（用上面的 `docker compose exec ... cat` 读取，
-或在隔离环境设 `MCP_PRINT_SECRETS=1` 恢复打印）。`MCP_TOKEN` 同理默认只写入网关容器 `/app/.env`。
+入口脚本会把当前生效口令以 `600` 权限重新写入共享卷 `/data/audit/.admin_password`；
+默认**不打印到容器日志**，统一用 `./scripts/show-config.sh` 读取（或在隔离环境设
+`MCP_PRINT_SECRETS=1` 恢复日志打印）。`MCP_TOKEN` 同理默认只写入网关容器 `/app/.env`。
 Compose 模式下网关还会把令牌同步到共享卷 `/data/audit/.mcp_token`（权限 600），供后台读取需 Bearer 的
 `/internal/metrics`；该文件等同 `MCP_TOKEN`，请控制共享卷的访问权限。`.env` 含密钥，不要提交到仓库。
 
-单容器快速启动（`./run.sh` / `docker run`）仍保持原有行为：一个容器里运行 MCP 网关与内置 quick tunnel，
-但不会启动管理后台；如需审计后台请使用 Compose 部署。
+固定公网 HTTPS 入口：在 `.env` 设置 `MCP_PUBLIC_BASE_URL`（可选 `ADMIN_PUBLIC_BASE_URL`），
+并按 `deploy/reverse-proxy.example.conf` 配置 nginx 或 Cloudflare 命名隧道；
+`show-config.sh` 会据此打印固定公网地址，否则明确标注「仅本机或内网可达」，不会伪造公网网址。
+
+单容器快速启动（`./run.sh` / `docker run`）仍保持原有行为：一个容器里运行 MCP 网关，
+但不会启动管理后台；v1.1 默认关闭内置 quick tunnel，如需审计后台请使用 Compose 部署。
 
 ## 3. 认证与安全边界
 
@@ -169,7 +179,8 @@ docker compose start mcp-gateway mcp-admin-web
 忘记管理员口令（未配置 `ADMIN_PASSWORD` 时为首次启动生成的强随机值）：
 
 ```bash
-docker compose exec mcp-admin-web cat /data/audit/.admin_password
+./scripts/show-config.sh                  # 同时打印 MCP 地址、Bearer 令牌、后台地址与账号口令
+docker compose exec mcp-admin-web cat /data/audit/.admin_password   # 只取口令
 ```
 
 ## 8. 测试与验收
@@ -206,7 +217,7 @@ MCP_TOKEN=<令牌> ADMIN_PASSWORD=<口令> python3 scripts/selfcheck_v11.py
 |---|---|
 | 后台打不开 | `docker logs cnb-mcp-admin-web`；确认 `ADMIN_HOST_PORT` 与 `ADMIN_BIND_HOST` |
 | 端口预览报 `dial tcp <工作区IP>:8788: connect: connection refused` | 容器已停止或端口只绑了 `127.0.0.1`；`docker compose up -d` 并临时设置 `ADMIN_BIND_HOST=0.0.0.0` 后重建后台服务 |
-| 忘记密码 | `docker compose exec mcp-admin-web cat /data/audit/.admin_password` |
+| 忘记密码 | `./scripts/show-config.sh`，或 `docker compose exec mcp-admin-web cat /data/audit/.admin_password` |
 | 登录被锁 | 等待 `ADMIN_LOGIN_LOCK_MINUTES`，或审查 `login_attempts` 事件 |
 | 仪表盘显示网关离线 | 检查 `GATEWAY_URL=http://mcp-gateway:8765` 与网关 `MCP_BIND=0.0.0.0`；后台仍可查历史 |
 | 审计状态「降级」 | 检查卷权限与磁盘；恢复后缓冲会自动补写；查看 `audit_storage_warning` 事件 |
