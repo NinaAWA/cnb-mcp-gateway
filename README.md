@@ -62,29 +62,69 @@ multi-tenancy, no Redis/Celery/Kubernetes.
 
 ### Deploy v1.1 — one command, nothing to pre-fill
 
-```bash
-# A. Native Linux + systemd (recommended: reuses host toolchain, GPU, drivers, Docker)
-git clone https://cnb.cool/webgamer-2026/cnb-mcp-gateway.git && cd cnb-mcp-gateway && sudo ./scripts/install-native.sh
+> **Which `main`?** Only GitHub `main` contains v1.1. CNB `main` is still commit
+> `9266f9f` and has no `.env.example` / `scripts/` — cloning it fails with
+> `cp: cannot stat '.env.example'`. Use the GitHub URL below. If you must use CNB:
+> `git clone -b feat/mcp-v1.1 https://cnb.cool/webgamer-2026/cnb-mcp-gateway.git`.
+> No `sudo` is needed when already root, and the Docker path needs no systemd.
 
-# B. Docker / Compose (MCP_TOKEN and ADMIN_PASSWORD are generated on first start)
-git clone https://cnb.cool/webgamer-2026/cnb-mcp-gateway.git && cd cnb-mcp-gateway && cp .env.example .env && docker compose up -d --build
-
-# Verify either deployment: T01–T12 real self-check, explicit PASS / FAIL / SKIP
-python3 scripts/selfcheck_v11.py
-```
-
-Read the generated credentials (never stored in this repository, never printed by
-default):
+**Docker / Compose** — paste the whole block. It deploys, waits for both health
+endpoints, then prints every value you need to copy:
 
 ```bash
-sudo cat /etc/mcp-gateway/env                              # native, mode 600
-docker exec cnb-mcp-gateway cat /app/.env                 # compose, MCP_TOKEN
-docker exec cnb-mcp-admin-web cat /data/audit/.admin_password   # compose, admin password
+(
+set -e
+DEST=/workspace/mcp-gateway-v11
+if [ -d "$DEST/.git" ]; then git -C "$DEST" pull --ff-only; else git clone https://github.com/NinaAWA/cnb-mcp-gateway.git "$DEST"; fi
+cd "$DEST"
+for f in .env.example docker-compose.yml; do [ -f "$f" ] || { echo "缺少 $f：请确认代码来源包含 v1.1"; exit 1; }; done
+[ -f .env ] || cp .env.example .env && docker compose up -d --build
+for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8765/health >/dev/null 2>&1 && curl -fsS http://127.0.0.1:8788/healthz >/dev/null 2>&1 && break; sleep 2; done
+if [ -f scripts/show-config.sh ]; then
+  bash scripts/show-config.sh
+else
+  # A main without show-config.sh: print the same values inline (default ports).
+  TOKEN="$(docker exec cnb-mcp-gateway sed -n 's/^MCP_TOKEN=//p' /app/.env | head -1)"
+  PASS="$(docker exec cnb-mcp-admin-web cat /data/audit/.admin_password)"
+  printf 'MCP_URL    http://127.0.0.1:8765/mcp\nBearer     %s\nClient config:\n{\n  "mcpServers": {\n    "cnb-gateway": {\n      "url": "http://127.0.0.1:8765/mcp",\n      "headers": {\n        "Authorization": "Bearer %s"\n      }\n    }\n  }\n}\nAdmin Web  http://127.0.0.1:8788/\nUsername   admin\nPassword   %s\n' "$TOKEN" "$TOKEN" "$PASS"
+fi
+)
 ```
+
+The printed block contains the **public** MCP URL (a random
+`https://<name>.trycloudflare.com/mcp` by default, reachable by remote agents),
+Bearer token, a formatted, indented `mcpServers` JSON block, the Admin Web URL, admin
+username and password, and both health checks. Re-running the block reuses the
+same directory and never overwrites `.env`.
+
+**Native Linux + systemd** (most complete: reuses host toolchain, GPU, drivers
+and Docker; needs a real systemd and root, not `sudo`):
+
+```bash
+git clone https://github.com/NinaAWA/cnb-mcp-gateway.git && cd cnb-mcp-gateway && ./scripts/install-native.sh
+```
+
+It prints the same connection block when it finishes. For Compose deployments,
+`python3 scripts/selfcheck_v11.py` runs the T01–T12 real self-check with explicit
+PASS / FAIL / SKIP; that script hard-codes Compose paths and is not a generic
+native-deployment check.
+
+### Reprint the connection info (read-only)
+
+```bash
+./scripts/show-config.sh                    # auto-detect native systemd / Compose
+./scripts/show-config.sh --mode docker     # force Compose
+./scripts/install-native.sh --show-config  # native deployment
+```
+
+Set `MCP_PUBLIC_BASE_URL` (and optionally `ADMIN_PUBLIC_BASE_URL`) in `.env` for
+fixed public HTTPS addresses. Without them the script labels addresses as
+local-only; it never invents a public URL.
 
 For a **fixed public HTTPS entry**, set `MCP_PUBLIC_BASE_URL=https://mcp.example.com`
-and put nginx or a Cloudflare named tunnel in front; only `127.0.0.1` is published
-otherwise. Without it, `download_file` still returns a working link but marks it
+and put nginx or a Cloudflare named tunnel in front (see
+`deploy/reverse-proxy.example.conf`); only `127.0.0.1` is published otherwise.
+Without it, `download_file` still returns a working link but marks it
 `link_scope=local` instead of pretending to be a public URL.
 
 Both modes keep Bearer + OAuth 2.1 PKCE/DCR, built-in Git LFS, SQLite WAL audit
@@ -93,7 +133,7 @@ optional host Docker control needs the explicit override file described below.
 
 ### Upgrade and rollback
 
-- Native: `sudo ./scripts/install-native.sh --upgrade` backs up the previous code
+- Native: `./scripts/install-native.sh --upgrade` backs up the previous code
   to `/opt/mcp-gateway/app.previous`; `--rollback` restores it and restarts both
   units. Data and `/etc/mcp-gateway/env` are never touched.
 - Compose: change `MCP_IMAGE` in `.env` to the new tag, then
@@ -206,34 +246,32 @@ Or use the bundled helper (env-overridable):
 ./run.sh
 ```
 
-### Multi-service deployment with the audit dashboard (recommended for server management)
+### Multi-service deployment with the audit dashboard
+
+Use the one-command block above. In an existing v1.1 checkout the short form is:
 
 ```bash
-cp docker/.env.template .env
-# Pin MCP_TOKEN and ADMIN_PASSWORD in .env for production
-docker compose up -d --build
-docker exec cnb-mcp-admin-web cat /data/audit/.admin_password   # read the effective password (default: admin)
+cp .env.example .env && docker compose up -d --build && ./scripts/show-config.sh
 ```
 
-The dashboard listens on `http://127.0.0.1:8788` only and uses a **separate admin account**
-(unrelated to `MCP_TOKEN`); the MCP API is still reached through the tunnel URL printed by the
-gateway container. The two entry points have independent access control. Configuration, optional
-HTTPS ingress, PostgreSQL, backup and the acceptance checklist are in the
+`./scripts/show-config.sh` is the single place that reads the generated
+`MCP_TOKEN` and admin password and prints the MCP URL, client config and Admin
+Web URL. The dashboard listens on `http://127.0.0.1:8788` only and uses a
+**separate admin account** (unrelated to `MCP_TOKEN`); both entry points have
+independent access control. Configuration, optional HTTPS ingress, PostgreSQL,
+backup and the acceptance checklist are in the
 [deployment guide](./docs/admin-dashboard.zh-CN.md).
 
-For single-container mode, the startup banner prints everything you need:
-
-```
- 公网根地址 (BASE_URL):   https://xxxx.trycloudflare.com
- MCP 连接器地址 (MCP_URL): https://xxxx.trycloudflare.com/mcp
- ChatGPT 插件 OpenAPI 清单: https://xxxx.trycloudflare.com/openapi.yaml
- 密钥 (MCP_TOKEN):        written to /app/.env, not printed to logs by default
-```
-
-> Every container restart → a **new random URL** + **new random token** (unless
-> you pin them, see below). Read the token with
-> `docker exec cnb-mcp-gateway cat /app/.env`; set `MCP_PRINT_SECRETS=1` only in
-> isolated environments to print secrets in the container log.
+The built-in quick tunnel is **on by default** (`MCP_TUNNEL_DISABLED=0`), so the
+one-command deploy already yields a public `https://<random>.trycloudflare.com/mcp`
+URL that a remote agent can reach; `./scripts/show-config.sh` prints that URL,
+the Bearer token and the client JSON. The random domain changes whenever the
+container is recreated. For a **fixed** public HTTPS address, set
+`MCP_PUBLIC_BASE_URL` plus a reverse proxy / named tunnel (see above) — the
+script then labels the entry as fixed. Generated credentials never appear in
+container logs; use `./scripts/show-config.sh` (or `set MCP_PRINT_SECRETS=1`
+only in isolated environments). Set `MCP_TUNNEL_DISABLED=1` and recreate to
+close public ingress.
 
 ## Connect your agent
 
@@ -320,13 +358,13 @@ Example `claude_desktop_config.json`:
 | `AUDIT_DB_DSN` | (empty = SQLite WAL) | Optional PostgreSQL DSN for the `postgres` profile. |
 | `AUDIT_STRICT` | `0` | `1` rejects high-risk tools when audit storage is unavailable; default is graceful degradation. |
 | `AUDIT_RETENTION_DAYS` / `AUDIT_MAX_DB_MB` | `90` / `512` | Archive retention and DB quota. |
-| `MCP_TUNNEL_DISABLED` | `1` | Built-in random quick tunnel is off by default (not a fixed ingress, and it would expose admin mode publicly). Use an nginx reverse proxy, or set `CF_TUNNEL_TOKEN` and run `docker compose --profile tunnel up -d` for a fixed URL. Set to `0` only if you explicitly want the random quick tunnel. |
+| `MCP_TUNNEL_DISABLED` | `0` | Built-in random quick tunnel is on by default, so a remote agent gets a public `https://<random>.trycloudflare.com/mcp` URL right after deploy; the domain changes on recreate. For a fixed URL use an nginx reverse proxy (+ `MCP_PUBLIC_BASE_URL`), or set `CF_TUNNEL_TOKEN` and run `docker compose --profile tunnel up -d` with this set to `1`. Set to `1` to disable public ingress entirely. |
 | `MCP_OAUTH_REQUIRE_PKCE` | `1` | Require OAuth S256 PKCE; set `0` only for legacy clients without a challenge. |
 | `MCP_TRUST_PROXY` / `ADMIN_TRUST_PROXY` | `0` | Trust `X-Forwarded-For` only behind a trusted reverse proxy. |
 | `MCP_GIT_EXTRA_SUBCOMMANDS` | (empty) | Extra allowed git subcommands; unknown ones are refused to block aliases. |
 | `MCP_PRINT_SECRETS` | `0` | `1` prints `MCP_TOKEN` and the admin password to container logs (isolated environments only). |
 
-Full list: [`docker/.env.template`](./docker/.env.template) and the
+Full list: [`.env.example`](./.env.example) and the
 [deployment guide](./docs/admin-dashboard.zh-CN.md).
 
 ## Tools reference
@@ -430,8 +468,9 @@ least-privilege deploy key or PAT, keep independent backups, and avoid mounting
   metrics and tool counts moved to the Bearer-protected `/internal/metrics`, which the
   dashboard reads with `MCP_TOKEN`.
 - `MCP_TOKEN` and the effective admin password are **no longer printed to container
-  logs** by default: read them from `/app/.env` and `/data/audit/.admin_password`.
-  The admin password defaults to `admin`; override it for any network-reachable deployment.
+  logs** by default: use `./scripts/show-config.sh` to print both in one block.
+  Leaving `ADMIN_PASSWORD` empty generates a strong random password persisted at
+  `/data/audit/.admin_password` (mode 600); there is no hardcoded default.
   OAuth requires S256 PKCE by default, validates `redirect_uri`, and expires tokens.
 
 ## Build from source

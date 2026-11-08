@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # CNB MCP Gateway v1.1 — 原生 Linux/systemd 一键安装。
 #
-#   sudo ./scripts/install-native.sh                 # 首次安装
-#   sudo ./scripts/install-native.sh --upgrade      # 升级代码，保留 .env 与数据
-#   sudo ./scripts/install-native.sh --rollback     # 回滚到升级前备份的代码
-#   sudo MCP_SERVICE_USER=mcp ./scripts/install-native.sh   # 降权运行（会失去 apt 等能力）
+#   ./scripts/install-native.sh                      # 首次安装（当前已是 root 时直接运行）
+#   ./scripts/install-native.sh --upgrade           # 升级代码，保留 .env 与数据
+#   ./scripts/install-native.sh --rollback          # 回滚到升级前备份的代码
+#   ./scripts/install-native.sh --show-config       # 只打印连接信息，不改动系统
+#   MCP_SERVICE_USER=mcp ./scripts/install-native.sh   # 降权运行（会失去 apt 等能力）
 #
 # 不绑定任何科研项目/目录/仓库；不引入 Redis/Celery/Kubernetes 等编排组件。
 set -euo pipefail
@@ -19,21 +20,26 @@ SERVICE_USER="${MCP_SERVICE_USER:-root}"
 MODE="install"
 
 usage() {
-  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --upgrade) MODE="upgrade" ;;
     --rollback) MODE="rollback" ;;
+    --show-config) MODE="show-config" ;;
     --help|-h) usage; exit 0 ;;
     *) echo "未知参数: $1" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
 
+if [ "$MODE" = "show-config" ]; then
+  exec bash "$ROOT/scripts/show-config.sh" --mode native
+fi
+
 if [ "$(id -u)" -ne 0 ]; then
-  echo "需要 root 权限（安装系统包与 systemd 单元）；请用 sudo 运行。" >&2
+  echo "需要 root 权限（安装系统包与 systemd 单元）；请先切换到 root 再运行，本脚本不依赖 sudo。" >&2
   exit 1
 fi
 
@@ -131,12 +137,7 @@ ADMIN_PORT=8788
 ADMIN_COOKIE_SECURE=${ADMIN_COOKIE_SECURE:-0}
 EOF
   chmod 600 "$ENV_FILE"
-  echo "=============================================================="
-  echo " 已生成配置：$ENV_FILE（600 权限，未写入本仓库）"
-  echo " MCP_TOKEN=$MCP_TOKEN"
-  echo " ADMIN_PASSWORD=$ADMIN_PASSWORD"
-  echo " 请立即保存，之后可用 sudo cat $ENV_FILE 查看。"
-  echo "=============================================================="
+  echo "已生成配置：$ENV_FILE（600 权限，未写入本仓库）；连接信息在安装完成后统一打印。"
 else
   echo "保留已有配置：$ENV_FILE"
 fi
@@ -160,14 +161,17 @@ systemctl restart mcp-gateway.service mcp-admin-web.service
 
 echo
 echo "安装完成（$MODE）。"
-echo "  MCP:        http://127.0.0.1:8765/mcp   （Bearer /run_command）"
-echo "  Admin Web:  http://127.0.0.1:8788/      （独立管理员登录）"
 echo "  状态检查:   systemctl status mcp-gateway mcp-admin-web"
-echo "  公网 HTTPS: 参考 deploy/reverse-proxy.example.conf 配置反代，并设置 MCP_PUBLIC_BASE_URL"
 echo "  升级/回滚:  $0 --upgrade / --rollback"
+echo "  连接信息:   $0 --show-config（可随时重复打印）"
+echo "  公网 HTTPS: 参考 deploy/reverse-proxy.example.conf 配置反代，并设置 MCP_PUBLIC_BASE_URL"
 echo
 echo "安全边界：原生部署直接复用宿主机已有软件、GPU、驱动与 Docker。"
 echo "  默认以 root 运行即默认管理员模式；如设置 MCP_SERVICE_USER 降权，apt/docker 等"
-echo "  操作会失败，需要自行配置免密 sudo 与 docker 组。原生部署不替换 /usr/bin/git，"
+echo "  操作会失败，需要自行配置相应权限与 docker 组。原生部署不替换 /usr/bin/git，"
 echo "  因此 Git 删除保护由 check_command + 结构化工具 check_argv 两层提供（无容器 wrapper）。"
 echo "  /var/run/docker.sock 的写权限等价于宿主机 root，请务必给公网入口配置 HTTPS 与强令牌。"
+echo
+if ! bash "$ROOT/scripts/show-config.sh" --mode native; then
+  echo "[提示] 连接信息打印失败，请稍后执行：$0 --show-config" >&2
+fi

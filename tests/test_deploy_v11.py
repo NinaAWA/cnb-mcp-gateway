@@ -31,7 +31,7 @@ def test_env_example_has_all_required_keys_and_no_secrets():
     assert "REPLACE_WITH_A_LONG_RANDOM_TOKEN" not in text
     assert "MCP_TOKEN=" in lines, "一键部署应允许留空自动生成令牌"
     assert "ADMIN_PASSWORD=" in lines, "一键部署应允许留空自动生成口令"
-    assert "MCP_TUNNEL_DISABLED=1" in lines, "默认不应暴露随机公网隧道"
+    assert "MCP_TUNNEL_DISABLED=0" in lines, "默认必须开启公网入口，否则远程客户端只能拿到 127.0.0.1"
 
 
 def test_selfcheck_waits_for_real_readiness_before_scoring():
@@ -89,3 +89,27 @@ def test_no_plaintext_pat_in_tracked_sources():
                  "docker-compose.yml", "docker/entrypoint.sh",
                  "scripts/install-native.sh"):
         assert "ghp_" not in _text(path), f"{path} 不应含明文 PAT"
+
+
+def test_one_command_deploy_uses_github_main_and_show_config():
+    for name in ("README.md", "README.zh-CN.md"):
+        text = _text(name)
+        assert "https://github.com/NinaAWA/cnb-mcp-gateway.git" in text
+        assert "cp .env.example .env && docker compose up -d --build" in text
+        assert "scripts/show-config.sh" in text
+        assert "/health" in text and "/healthz" in text, "一键命令必须等待两个服务就绪"
+        assert "9266f9f" in text, "必须说明 CNB main 仍是旧提交"
+        assert "sudo ./scripts/install-native.sh" not in text
+    example = _text(".env.example")
+    assert "https://github.com/NinaAWA/cnb-mcp-gateway.git" in example
+    assert "scripts/show-config.sh" in example
+    assert "ADMIN_PUBLIC_BASE_URL=" in example
+    assert "sudo ./scripts/install-native.sh" not in example
+
+
+def test_native_installer_prints_config_without_sudo():
+    text = _text("scripts/install-native.sh")
+    assert "show-config.sh" in text
+    assert "--show-config" in text
+    assert "sudo ./scripts/install-native.sh" not in text
+    assert "请用 sudo 运行" not in text
