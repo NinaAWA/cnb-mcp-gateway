@@ -1,3 +1,8 @@
+# Cloudflare publishes the same release as a signed registry image; copying its
+# binary avoids treating a transient GitHub 504 HTML response as an executable.
+# Keep the version pinned for reproducible builds.
+FROM cloudflare/cloudflared:2026.10.7 AS cloudflared-bin
+
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -12,15 +17,11 @@ RUN GIT_REAL="$(readlink -f /usr/bin/git)" \
  && mv "$GIT_REAL" /usr/lib/git-core/git.real \
  && rm -f /usr/bin/git
 
-# cloudflared（固定版本；设置 CLOUDFLARED_SHA256 可校验下载完整性）
-ARG CLOUDFLARED_VERSION=2026.10.7
-ARG CLOUDFLARED_SHA256=""
-RUN curl -sSL -o /usr/local/bin/cloudflared \
-      "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64" \
- && if [ -n "$CLOUDFLARED_SHA256" ]; then \
-      echo "$CLOUDFLARED_SHA256  /usr/local/bin/cloudflared" | sha256sum -c -; \
-    fi \
- && chmod +x /usr/local/bin/cloudflared
+# Import a real ELF binary from Cloudflare's published image. Docker image pulls
+# fail on bad HTTP responses instead of silently storing a 504 HTML file.
+COPY --from=cloudflared-bin /usr/local/bin/cloudflared /usr/local/bin/cloudflared
+RUN test "$(head -c 4 /usr/local/bin/cloudflared | od -An -tx1 | tr -d ' \n')" = "7f454c46" \
+ && /usr/local/bin/cloudflared --version
 
 # 构建上下文为仓库根目录：docker build -f docker/Dockerfile -t <image> .
 COPY docker/requirements.txt ./
