@@ -97,11 +97,11 @@ def test_one_command_deploy_uses_github_main_and_show_config():
         assert "https://github.com/NinaAWA/cnb-mcp-gateway.git" in text
         assert "scripts/deploy-docker.sh" in text
         assert "scripts/show-config.sh" in text
-        assert "/health" in text and "/healthz" in text, "一键命令必须等待两个服务就绪"
+        assert "scripts/deploy-docker.sh" in text, "部署文档必须使用统一且安全的安装脚本"
         assert "9266f9f" in text, "必须说明 CNB main 仍是旧提交"
         assert "sudo ./scripts/install-native.sh" not in text
         assert 'docker rm -f "$name"' not in text, "安装文档不能无条件删除同名容器"
-        assert "docker compose down -v" in text, "删除数据卷只能作为独立警告，不得混入安装命令"
+        assert "docker compose down -v" not in text, "安装示例不应包含可能删除数据卷的命令"
     example = _text(".env.example")
     assert "https://github.com/NinaAWA/cnb-mcp-gateway.git" in example
     assert "scripts/show-config.sh" in example
@@ -122,6 +122,8 @@ def test_safe_deploy_refuses_foreign_container_and_never_deletes():
     assert 'Refusing to stop/remove it' in text
     assert 'docker compose config --quiet' in text
     assert 'docker compose up -d --build' in text
+    assert 'http://127.0.0.1:8765/health' in text
+    assert 'http://127.0.0.1:8788/healthz' in text
     assert 'scripts/show-config.sh --mode docker' in text
     for forbidden in ("docker rm -f", "docker compose down -v", "docker container rm", "docker compose down --remove-orphans"):
         assert forbidden not in text, f"Installer must not delete existing assets: {forbidden}"
