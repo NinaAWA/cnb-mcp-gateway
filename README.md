@@ -182,8 +182,11 @@ It also mounts `/var/run/docker.sock` and the host's static `docker` CLI, which
 is equivalent to host root (see the permission section below). Two independent
 quick-tunnel containers forward to `mcp-gateway:8765` and `mcp-admin-web:8788`;
 keeping them separate means recreating the business containers does not change
-the published HTTPS URLs. `show-config.sh` prefers the two fixed base URLs, then
-parses the admin tunnel container's logs, and only then falls back to loopback.
+the published HTTPS URLs. For the Admin Web URL, `show-config.sh` prefers
+`ADMIN_PUBLIC_BASE_URL`, then parses the admin tunnel container's logs, and only
+then falls back to loopback. The MCP URL is printed from `MCP_PUBLIC_BASE_URL`
+(or the local address while it is empty), so the gateway tunnel domain must be
+written back into `.env` as shown above.
 
 Random tunnel domains change only when the tunnel containers themselves are
 recreated. To verify volume persistence, recreate just `mcp-gateway` and

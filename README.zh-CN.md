@@ -124,7 +124,7 @@ docker compose -p <项目名> -f docker-compose.yml -f docker-compose.runtime.ym
 
 override 把 `MCP_HOST_WORKSPACE` 同时挂到 `/workspace`（让 `MCP_WORKDIR` 与结构化 `git_*` 工具看到真实仓库）和 `/data/files/host-workspace`（文件工具根仍是 `/data/files`，经 `host-workspace/...` 访问同一批文件）。`MCP_FILE_ROOT` 不变，因此既有 `files-data` 卷与后台共用的 HMAC 签名密钥保持一致。文件工具仍硬禁 `.git`、`.env`、私钥与凭据目录；`run_command` 保持完整管理员权限。
 
-override 同时挂载 `/var/run/docker.sock` 与宿主静态 `docker` CLI，权限等价宿主 root（见后文）。两条独立 quick tunnel 分别转发 `mcp-gateway:8765` 与 `mcp-admin-web:8788`：把隧道拆成独立容器后，重建业务容器不会改变已分发的公网地址。`show-config.sh` 优先读取两个固定基址，其次解析 `admin-tunnel` 容器日志中的域名，最后才回落本机地址。
+override 同时挂载 `/var/run/docker.sock` 与宿主静态 `docker` CLI，权限等价宿主 root（见后文）。两条独立 quick tunnel 分别转发 `mcp-gateway:8765` 与 `mcp-admin-web:8788`：把隧道拆成独立容器后，重建业务容器不会改变已分发的公网地址。后台地址方面，`show-config.sh` 优先读取 `ADMIN_PUBLIC_BASE_URL`，其次解析 `admin-tunnel` 容器日志中的域名，最后才回落本机地址；MCP 地址则由 `MCP_PUBLIC_BASE_URL` 决定，该项留空期间只打印本机地址，因此网关隧道域名需按上面的步骤回写 `.env`。
 
 随机域名只在隧道容器自身重建时变化。验证卷持久化时请按上面的 `--no-deps` 命令只重建
 `mcp-gateway` 与 `mcp-admin-web`；不带服务名的 `up -d --force-recreate` 会连两条隧道容器一起重建，
