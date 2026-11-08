@@ -37,6 +37,12 @@
 # 初次部署（已部署时从项目目录重新执行同一脚本即可）
 git clone https://github.com/NinaAWA/cnb-mcp-gateway.git /workspace/mcp-gateway-v11
 bash /workspace/mcp-gateway-v11/scripts/deploy-docker.sh
+```
+
+升级时直接重新运行 `bash /workspace/mcp-gateway-v11/scripts/deploy-docker.sh`。脚本拒绝接管其他 Compose 项目的同名容器，且不会删除数据卷。
+
+**原生 Linux + systemd**（直接使用宿主机工具链、GPU 与 Docker；需要 root 和 systemd）：
+
 ```bash
 git clone https://github.com/NinaAWA/cnb-mcp-gateway.git && cd cnb-mcp-gateway && ./scripts/install-native.sh
 ```
