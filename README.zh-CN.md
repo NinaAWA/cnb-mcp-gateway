@@ -37,9 +37,17 @@
 (
 set -e
 DEST=/workspace/mcp-gateway-v11
+
+# 先删除之前的部署：compose 里容器名写死，来自其他项目目录的旧实例也会冲突
+for name in cnb-mcp-gateway cnb-mcp-admin-web cnb-audit-storage cnb-mcp-cloudflared cnb-mcp-postgres; do
+  docker rm -f "$name" >/dev/null 2>&1 || true
+done
+
 if [ -d "$DEST/.git" ]; then git -C "$DEST" pull --ff-only; else git clone https://github.com/NinaAWA/cnb-mcp-gateway.git "$DEST"; fi
 cd "$DEST"
 for f in .env.example docker-compose.yml; do [ -f "$f" ] || { echo "缺少 $f：请确认代码来源包含 v1.1"; exit 1; }; done
+# 需要连数据卷一起清空时加 PURGE_DATA=1（会丢失审计记录、文件与自动生成的凭据）
+if [ "${PURGE_DATA:-0}" = "1" ]; then docker compose down -v --remove-orphans; fi
 [ -f .env ] || cp .env.example .env && docker compose up -d --build
 for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8765/health >/dev/null 2>&1 && curl -fsS http://127.0.0.1:8788/healthz >/dev/null 2>&1 && break; sleep 2; done
 if [ -f scripts/show-config.sh ]; then
@@ -56,6 +64,10 @@ fi
 终端会直接打印：**可远程连接的公网 MCP 地址**（默认随机 `https://<域名>.trycloudflare.com/mcp`）、
 Bearer Token、分行缩进、可直接复制的 `mcpServers` JSON、管理网站地址、管理员账号与口令、
 两个健康检查地址。重复执行会复用同一目录且不会覆盖 `.env`。
+
+重复执行会**先删除之前的部署**（按固定的 `cnb-*` 容器名清理，不论旧实例在哪个目录），
+再重新部署，因此不会再出现容器名冲突。默认保留命名卷；需要连审计记录、文件与
+自动生成的凭据一起清空时，在命令前加 `PURGE_DATA=1`。
 
 **原生 Linux + systemd**（能力最完整：复用宿主机软件、GPU、驱动与 Docker；
 需要真实 systemd 与 root，不是 `sudo`）：
