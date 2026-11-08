@@ -152,15 +152,22 @@ deployment directory) and publishes only loopback ports. When the gateway must
 operate on the real host checkout, add `docker-compose.runtime.yml` explicitly:
 
 ```bash
-# in .env (keep existing MCP_TOKEN / ADMIN_PASSWORD untouched)
+# in .env (keep existing MCP_TOKEN / ADMIN_PASSWORD untouched; leave the two
+# public base URLs empty until the tunnel containers have reported their domains)
 MCP_HOST_WORKSPACE=/workspace
 MCP_DOCKER_SOCKET=1
-MCP_PUBLIC_BASE_URL=https://<gateway-tunnel>.trycloudflare.com
-ADMIN_PUBLIC_BASE_URL=https://<admin-tunnel>.trycloudflare.com
+MCP_PUBLIC_BASE_URL=
+ADMIN_PUBLIC_BASE_URL=
 
 docker compose -p <project> -f docker-compose.yml -f docker-compose.runtime.yml \
   up -d --force-recreate
-docker logs <gateway-tunnel-container>   # parse the two random HTTPS URLs from the logs
+# each tunnel logs its own random HTTPS domain
+docker logs <gateway-tunnel-container>
+docker logs <admin-tunnel-container>
+# write the two domains back into .env, then recreate ONLY the business containers
+# so the tunnel containers (and their already-distributed domains) stay untouched
+docker compose -p <project> -f docker-compose.yml -f docker-compose.runtime.yml \
+  up -d --force-recreate --no-deps mcp-gateway mcp-admin-web
 ```
 
 The override bind-mounts `MCP_HOST_WORKSPACE` to `/workspace` (so `MCP_WORKDIR`
@@ -178,10 +185,14 @@ keeping them separate means recreating the business containers does not change
 the published HTTPS URLs. `show-config.sh` prefers the two fixed base URLs, then
 parses the admin tunnel container's logs, and only then falls back to loopback.
 
-Random tunnel domains change when the tunnel containers themselves are recreated.
-Re-read both `docker logs` outputs and update the two `.env` entries before
-recreating the gateway. Recreate without `-v` so `audit-data` (the SQLite audit
-DB, `task-logs/`, generated credentials) and `files-data` are preserved.
+Random tunnel domains change only when the tunnel containers themselves are
+recreated. To verify volume persistence, recreate just `mcp-gateway` and
+`mcp-admin-web` with `--no-deps` (as above); a bare `up -d --force-recreate`
+also recreates both tunnel containers and therefore invalidates the two URLs
+you already distributed. Re-read both `docker logs` outputs and update the two
+`.env` entries whenever a tunnel container really is recreated. Never pass
+`-v`, so `audit-data` (the SQLite audit DB, `task-logs/`, generated credentials)
+and `files-data` are preserved.
 
 ### Upgrade and rollback
 

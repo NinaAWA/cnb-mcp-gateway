@@ -106,23 +106,30 @@ git clone https://github.com/NinaAWA/cnb-mcp-gateway.git && cd cnb-mcp-gateway &
 
 ```bash
 # 在 .env 中设置（保留已有的 MCP_TOKEN / ADMIN_PASSWORD）
+# 两个公网基址先留空，等隧道容器报出域名后再回写
 MCP_HOST_WORKSPACE=/workspace
 MCP_DOCKER_SOCKET=1
-MCP_PUBLIC_BASE_URL=https://<网关隧道域名>.trycloudflare.com
-ADMIN_PUBLIC_BASE_URL=https://<后台隧道域名>.trycloudflare.com
+MCP_PUBLIC_BASE_URL=
+ADMIN_PUBLIC_BASE_URL=
 
 docker compose -p <项目名> -f docker-compose.yml -f docker-compose.runtime.yml \
   up -d --force-recreate
-# 从两个隧道容器日志里解析随机 HTTPS 域名，再回写以上两项并重建业务容器
+# 两条隧道各自打印自己的随机 HTTPS 域名
 docker logs <gateway-tunnel 容器名>
 docker logs <admin-tunnel 容器名>
+# 把两个域名回写 .env 后，只重建业务容器，避免隧道容器被重建导致域名变化
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.runtime.yml \
+  up -d --force-recreate --no-deps mcp-gateway mcp-admin-web
 ```
 
 override 把 `MCP_HOST_WORKSPACE` 同时挂到 `/workspace`（让 `MCP_WORKDIR` 与结构化 `git_*` 工具看到真实仓库）和 `/data/files/host-workspace`（文件工具根仍是 `/data/files`，经 `host-workspace/...` 访问同一批文件）。`MCP_FILE_ROOT` 不变，因此既有 `files-data` 卷与后台共用的 HMAC 签名密钥保持一致。文件工具仍硬禁 `.git`、`.env`、私钥与凭据目录；`run_command` 保持完整管理员权限。
 
 override 同时挂载 `/var/run/docker.sock` 与宿主静态 `docker` CLI，权限等价宿主 root（见后文）。两条独立 quick tunnel 分别转发 `mcp-gateway:8765` 与 `mcp-admin-web:8788`：把隧道拆成独立容器后，重建业务容器不会改变已分发的公网地址。`show-config.sh` 优先读取两个固定基址，其次解析 `admin-tunnel` 容器日志中的域名，最后才回落本机地址。
 
-随机域名只在隧道容器自身重建时变化：重新读取两条 `docker logs` 并回写 `.env` 的两项，再重建业务容器即可。重建务必不带 `-v`，以保留 `audit-data`（审计库、`task-logs/`、自动生成的凭据）与 `files-data`。
+随机域名只在隧道容器自身重建时变化。验证卷持久化时请按上面的 `--no-deps` 命令只重建
+`mcp-gateway` 与 `mcp-admin-web`；不带服务名的 `up -d --force-recreate` 会连两条隧道容器一起重建，
+已分发的两个公网地址随即失效。隧道容器确实被重建时，重新读取两条 `docker logs` 并回写 `.env` 的两项即可。
+重建务必不带 `-v`，以保留 `audit-data`（审计库、`task-logs/`、自动生成的凭据）与 `files-data`。
 
 ### 升级与回滚
 

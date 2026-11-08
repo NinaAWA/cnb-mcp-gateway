@@ -80,8 +80,15 @@ Compose 模式下网关还会把令牌同步到共享卷 `/data/audit/.mcp_token
 
 **审计卷验证**：网关与后台共享同一个 `audit-data` 卷（`/data/audit`），用
 `docker inspect <容器> --format '{{range .Mounts}}{{.Name}} -> {{.Destination}}{{end}}'`
-可核对两端卷名一致。重建业务容器请用
-`docker compose -p <项目名> -f docker-compose.yml -f docker-compose.runtime.yml up -d --force-recreate`（**不带 `-v`**），
+可核对两端卷名一致。重建业务容器请限定服务名（**不带 `-v`**）：
+
+```bash
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.runtime.yml \
+  up -d --force-recreate --no-deps mcp-gateway mcp-admin-web
+```
+
+不带服务名的 `up -d --force-recreate` 会连两个隧道容器一起重建，两条随机公网域名随即变化，
+`.env` 中已回写的 `MCP_PUBLIC_BASE_URL` / `ADMIN_PUBLIC_BASE_URL` 也会失效。
 重建后 `/healthz` 返回 `audit.healthy=true`，历史调用记录（`/api/calls`）与
 历史任务日志（`/api/experiments/<task_id>/logs`、`/data/audit/task-logs/`）仍可读取；
 `audit.db`、`task-logs/`、`.mcp_token`、`.admin_password` 都在卷内，不随容器销毁。

@@ -6,15 +6,21 @@
 # 网关才生效，域名会再次变化。把隧道拆成独立容器后，域名只在重建隧道时变化，
 # 重建业务容器不会影响已分发的公网地址。
 #
-# 用法（项目名必须保持 mcp-gateway-v11，否则 audit-data/files-data 卷会换前缀）：
+# 首次启动（项目名必须保持 mcp-gateway-v11，否则 audit-data/files-data 卷会换前缀）：
 #   docker compose -p mcp-gateway-v11 \
 #     -f docker-compose.yml -f docker-compose.runtime.yml up -d --force-recreate
+# 之后只重建业务容器、保持隧道域名不变（不带 -v，卷数据不丢）：
+#   docker compose -p mcp-gateway-v11 \
+#     -f docker-compose.yml -f docker-compose.runtime.yml \
+#     up -d --force-recreate --no-deps mcp-gateway mcp-admin-web
 #
 # 只读校验：
 #   docker compose -p mcp-gateway-v11 \
 #     -f docker-compose.yml -f docker-compose.runtime.yml config -q
 #
-# 撤销：去掉 -f docker-compose.runtime.yml 再 up -d。切勿使用 down -v，
+# 撤销：去掉 -f docker-compose.runtime.yml，用
+#   docker compose -p mcp-gateway-v11 -f docker-compose.yml up -d --remove-orphans
+# 重建并清掉两个隧道容器；单独 up -d 不会移除它们。切勿使用 down -v，
 # 卷内的审计库、任务日志、上传文件与自动生成的凭据都会随卷删除。
 services:
   mcp-gateway:
