@@ -5,19 +5,36 @@ set -euo pipefail
 ROLE="${MCP_SERVICE_ROLE:-gateway}"
 cd /app
 
+# 统一的强随机密钥生成：管理员口令与 MCP_TOKEN 复用同一实现。
+# 只在此处出现一次 python -c，便于 tests/test_entrypoint.py 静态校验。
+generate_secret() {
+  python -c 'import secrets,string; alphabet=string.ascii_letters+string.digits; print("".join(secrets.choice(alphabet) for _ in range(48)))'
+}
+
+# v1.1 持久目录：受管文件根目录与长任务日志目录必须落持久卷，
+# 否则容器重建会丢失已上传的二进制文件与任务日志。
+FILE_ROOT="${MCP_FILE_ROOT:-/data/files}"
+TASK_LOG_DIR="${MCP_TASK_LOG_DIR:-/data/audit/task-logs}"
+mkdir -p "$FILE_ROOT" "$TASK_LOG_DIR" /data/audit
+export MCP_FILE_ROOT="$FILE_ROOT" MCP_TASK_LOG_DIR="$TASK_LOG_DIR"
+
 case "$ROLE" in
   admin-web)
     mkdir -p /data/audit
     PASS_FILE="${ADMIN_PASSWORD_FILE:-/data/audit/.admin_password}"
     ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
-    # 镜像默认口令 admin；显式传入空串也回落到默认值。旧部署的共享卷里可能残留
-    # 随机口令文件，升级后必须忽略而不是读取，否则固定口令不会生效。
-    # 仍以 600 权限写入最终生效口令，保证既有「cat $PASS_FILE」取口令方式可用。
+    # 不再内置弱口令：显式 ADMIN_PASSWORD 优先；否则首次启动随机生成，
+    # 容器重建复用持久卷里已生成的口令，避免每次重建都要重新分发。
     if [ -z "${ADMIN_PASSWORD:-}" ]; then
-      ADMIN_PASSWORD="admin"
-      echo "[entrypoint] 未配置 ADMIN_PASSWORD，使用镜像默认口令 'admin'（仅限隔离环境）"
-      echo "  建议启动时加 -e ADMIN_PASSWORD='<强口令>' 覆盖"
+      if [ -s "$PASS_FILE" ]; then
+        ADMIN_PASSWORD="$(cat "$PASS_FILE")"
+        echo "[entrypoint] 复用持久卷中的管理员口令（$PASS_FILE）"
+      else
+        ADMIN_PASSWORD="$(generate_secret)"
+        echo "[entrypoint] 首次启动：已随机生成管理员口令（不写入容器日志）"
+      fi
     fi
+    # 以 600 权限写入最终生效口令，兼容既有「cat $PASS_FILE」取口令方式。
     (umask 077; printf '%s\n' "$ADMIN_PASSWORD" > "$PASS_FILE")
     export ADMIN_PASSWORD ADMIN_USERNAME
     if [ "${MCP_PRINT_SECRETS:-0}" = "1" ]; then
@@ -83,6 +100,11 @@ SEARCH_VARS=(
   MCP_SEARCH_FETCH_ALLOW_HOSTS
   MCP_DENY_PREFIXES
   MCP_REQUIRE_CONFIRM
+  MCP_MAX_OUTPUT_BYTES
+  MCP_FILE_CHUNK_BYTES
+  MCP_PUBLIC_BASE_URL
+  MCP_DOCKER_SOCKET
+  MCP_FILE_SIGNING_SECRET
 )
 for name in "${SEARCH_VARS[@]}"; do
   value="${!name:-}"
@@ -94,17 +116,24 @@ done
 # 确保工作目录存在（新服务器未挂载时也不至于命令失败）
 mkdir -p "$WORKDIR"
 
-# 密钥：未提供则随机生成（容器重建会变化，请从 docker logs 记录）
+# 密钥：显式配置优先；否则复用持久卷里已生成的令牌，只有首次启动才随机生成。
+# 必须复用：docker restart 会重跑本脚本，若每次都换新令牌，客户端与自检会全部 401。
 if [ -z "${MCP_TOKEN:-}" ]; then
-  MCP_TOKEN="$(python -c 'import secrets,string; alphabet=string.ascii_letters+string.digits; print("".join(secrets.choice(alphabet) for _ in range(48)))')"
-  if [ "${MCP_PRINT_SECRETS:-0}" = "1" ]; then
-    echo "==================================================================="
-    echo " [自动生成] MCP_TOKEN（重开容器会变化，请妥善保存）:"
-    echo "   $MCP_TOKEN"
-    echo "==================================================================="
+  TOKEN_FILE=/data/audit/.mcp_token
+  if [ -d /data/audit ] && [ -s "$TOKEN_FILE" ]; then
+    MCP_TOKEN="$(cat "$TOKEN_FILE")"
+    echo "[entrypoint] 复用持久卷中的 MCP_TOKEN（$TOKEN_FILE）"
   else
-    echo "[entrypoint] 已生成 MCP_TOKEN 并写入 /app/.env（默认不写入容器日志）"
-    echo "  读取方式: docker exec <容器名> cat /app/.env（例如 cnb-mcp-gateway-plus）"
+    MCP_TOKEN="$(generate_secret)"
+    if [ "${MCP_PRINT_SECRETS:-0}" = "1" ]; then
+      echo "==================================================================="
+      echo " [自动生成] MCP_TOKEN（已持久化，重启不会变化）:"
+      echo "   $MCP_TOKEN"
+      echo "==================================================================="
+    else
+      echo "[entrypoint] 已生成 MCP_TOKEN 并写入 /app/.env（默认不写入容器日志）"
+      echo "  读取方式: docker exec <容器名> cat /app/.env（例如 cnb-mcp-gateway）"
+    fi
   fi
 fi
 export MCP_TOKEN MCP_PORT="$PORT" MCP_BIND="$BIND" MCP_WORKDIR="$WORKDIR" MCP_ALLOWED_PREFIXES="$ALLOWED"
@@ -140,6 +169,8 @@ MCP_PORT=$PORT
 MCP_BIND=$BIND
 MCP_WORKDIR=$WORKDIR
 MCP_ALLOWED_PREFIXES=$ALLOWED
+MCP_FILE_ROOT=$FILE_ROOT
+MCP_TASK_LOG_DIR=$TASK_LOG_DIR
 EOF
   for name in "${SEARCH_VARS[@]}"; do
     value="${!name:-}"

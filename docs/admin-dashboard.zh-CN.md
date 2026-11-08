@@ -1,13 +1,15 @@
 # MCP Admin Dashboard 部署与运维（中文）
 
-> 适用分支：`feature/admin-dashboard`。目标是在不削弱原有 Shell / 文件 / Git / 实验能力的前提下，
+> 适用版本：v1.1（开发分支 `feat/mcp-v1.1`）。目标是在不削弱原有 Shell / 文件 / Git / 实验能力的前提下，
 > 完整记录、查询、审计与监控 AI Agent 对服务器发起的每一次操作。
+> 本文第 1–9 节为通用部署运维说明，第 10 节是初版历史实测数据，第 11 节为 v1.1 增量；
+> v1.1 逐项真实验收结果以 `scripts/selfcheck_v11.py` 的 T01–T12 输出为准。
 
 ## 1. 架构与数据流
 
 | 服务 | 角色（`MCP_SERVICE_ROLE`） | 暴露方式 | 认证 |
 |---|---|---|---|
-| `mcp-gateway` | `gateway`（默认） | 仅容器网络 `8765`，无宿主端口 | `MCP_TOKEN` / OAuth |
+| `mcp-gateway` | `gateway`（默认） | 容器网络 `8765` + v1.1 宿主回环 `127.0.0.1:${MCP_HOST_PORT:-8765}`（本机自检 / 反代用） | `MCP_TOKEN` / OAuth |
 | `mcp-admin-web` | `admin-web` | 宿主机 `127.0.0.1:8788` | 独立管理员账号 + 会话 Cookie |
 | `audit-storage` | `maintenance` | 无端口，定时维护共享卷 | — |
 | `cloudflared` | `cloudflared`（profile `tunnel`） | 可选 HTTPS 入口 | 由 Cloudflare 终结 TLS |
@@ -20,20 +22,32 @@ REST /run_command ─┼─> 统一采集层 ─> SQLite WAL (/data/audit/audit.
                     脱敏 / 大输出引用      SSE / 图表 / 详情 / 导出
 ```
 
-采集发生在 FastMCP 工具分发中间件与 REST/任务入口，**不修改任何现有工具内部**，原有 21 个工具保持兼容。
+采集发生在 FastMCP 工具分发中间件与 REST/任务入口，**不修改任何现有工具内部**。v1.1 共注册 45 个 MCP 工具
+（`docker/server.py` 26 个 + `gateway/git_guard.py` 19 个结构化 `git_*`），原有工具签名保持兼容。
+除调用记录外，v1.1 还有两条独立数据流：文件传输由 `gateway/files/service.py` 直接写 `file_transfers` 表，
+后台任务状态由 `gateway/tasks/store.py` 写入同一 SQLite WAL 的 `mcp_tasks` 表、日志落持久卷。
 管理后台与网关是不同进程：后台停止不会影响已启动的训练任务；网关离线时后台仍可查询历史。
 
 ## 2. 快速开始
 
 ```bash
-cp docker/.env.template .env
-# 默认管理员口令为 admin；公网 / 生产环境务必改成强 ADMIN_PASSWORD
+# v1.1 推荐：使用全量占位配置示例（含文件根目录、任务日志、签名密钥、Docker 授权开关）
+cp .env.example .env          # 或沿用旧的 docker/.env.template，两者变量集合一致
+# 填写 MCP_TOKEN / ADMIN_PASSWORD / MCP_PUBLIC_BASE_URL；公网环境务必改强口令
 docker compose up -d --build
 docker compose exec mcp-admin-web cat /data/audit/.admin_password   # 读取当前生效口令
-# 浏览器打开 http://127.0.0.1:8788
+# 浏览器打开 http://127.0.0.1:8788；网关本机自检地址 http://127.0.0.1:8765/mcp
 ```
 
-未设置 `ADMIN_PASSWORD` 时使用镜像默认口令 `admin`（**仅限隔离环境**，公网可达时务必用强口令覆盖）。
+原生 Linux（systemd，直接复用宿主机软件、GPU、驱动与 Docker）：
+
+```bash
+sudo ./scripts/install-native.sh            # --upgrade / --rollback
+# 配置 /etc/mcp-gateway/env（600）；单元 deploy/mcp-gateway.service 与 deploy/mcp-admin-web.service
+# 固定 HTTPS 入口见 deploy/reverse-proxy.example.conf
+```
+
+未设置 `ADMIN_PASSWORD` 时首次启动自动生成强随机口令（`entrypoint.sh` 的 `generate_secret`），以 600 权限写入 `/data/audit/.admin_password`，容器重建时复用；不再有硬编码默认口令。
 入口脚本会忽略旧卷里残留的随机口令文件，并把当前生效口令以 `600` 权限重新写入共享卷
 `/data/audit/.admin_password`；默认**不打印到容器日志**（用上面的 `docker compose exec ... cat` 读取，
 或在隔离环境设 `MCP_PRINT_SECRETS=1` 恢复打印）。`MCP_TOKEN` 同理默认只写入网关容器 `/app/.env`。
@@ -88,7 +102,10 @@ Compose 模式下网关还会把令牌同步到共享卷 `/data/audit/.mcp_token
 两个容器各自的 CPU/内存/磁盘/进程指标）、实时调用监控（SSE）、完整调用记录（组合筛选、排序、
 分页、详情、时间线、关联任务/Git/实验、JSON 格式化与折叠复制）、Git 操作审计、科研实验监控与日志、
 服务器状态、客户端与会话、服务配置、CSV/JSON/JSONL 导出（直接下载或后台任务 + 签名链接）。
-界面中文优先，支持深浅色与窄屏布局，零外部 CDN 依赖。
+v1.1 侧边栏固定为五个页面：首页仪表盘、完整调用记录、后台任务、Git 操作审计、文件传输记录。
+首页新增受管文件根目录的磁盘容量/已用/可用与各挂载点用量、文件传输次数与累计字节，以及
+`mcp_tasks` 持久任务状态卡片（重启后无法确认的任务显示 `unknown`，退出码不冒充 0）。
+界面中文优先，支持深浅色与窄屏布局，零外部 CDN 依赖；五个页面的 v1.1 增量见第 11 节。
 
 > 监控指标来自**容器自身**，不是宿主机全机指标：后台容器与 MCP 网关容器分开标注，
 > 命令实际在网关容器内执行。GPU 只有在容器能调用 `nvidia-smi` 时显示；
@@ -149,7 +166,7 @@ docker compose exec audit-storage python -c \
 docker compose start mcp-gateway mcp-admin-web
 ```
 
-忘记管理员口令（未配置 `ADMIN_PASSWORD` 时默认为 `admin`）：
+忘记管理员口令（未配置 `ADMIN_PASSWORD` 时为首次启动生成的强随机值）：
 
 ```bash
 docker compose exec mcp-admin-web cat /data/audit/.admin_password
@@ -163,9 +180,17 @@ python -m venv .venv
 .venv/bin/python -m pytest tests -q
 ```
 
+v1.1 新增端到端自检（对真实运行的服务逐项输出 PASS/FAIL/SKIP，不模拟）：
+
+```bash
+MCP_TOKEN=<令牌> ADMIN_PASSWORD=<口令> python3 scripts/selfcheck_v11.py
+# 本机无容器权限时可用 --skip-restart，T10 会被明确标记为 SKIP 而不是伪报成功
+```
+
 验收清单：
 
-- [ ] `docker compose config --quiet`、镜像构建成功；21 个原有工具仍可调用。
+- [ ] `docker compose config --quiet`、镜像构建成功；v1.1 共 45 个 MCP 工具可调用（21 个原有 + 19 个 `git_*` + 5 个新增文件/Docker 工具），原有工具签名保持兼容。
+- [ ] 单元测试 `pytest -q` 全通过；T01–T12 逐项有真实输出，任何 FAIL/SKIP 都在交付说明中列明。
 - [ ] 未登录访问 `/`、`/api/calls` 分别重定向 / 返回 401；登录后页面与数据可用。
 - [ ] MCP `tools/call` 与 REST `/run_command` 都产生记录，含参数、输出、状态、耗时与 Git 关联。
 - [ ] 同步命令、后台任务、失败/拒绝/超时/确认门均有记录；任务启动与真实运行结果分开。
@@ -185,13 +210,20 @@ python -m venv .venv
 | 登录被锁 | 等待 `ADMIN_LOGIN_LOCK_MINUTES`，或审查 `login_attempts` 事件 |
 | 仪表盘显示网关离线 | 检查 `GATEWAY_URL=http://mcp-gateway:8765` 与网关 `MCP_BIND=0.0.0.0`；后台仍可查历史 |
 | 审计状态「降级」 | 检查卷权限与磁盘；恢复后缓冲会自动补写；查看 `audit_storage_warning` 事件 |
-| SSE 无新事件 | 确认调用确实发生；SSE 只推送 `tool_call` / `task_lifecycle` / `admin_auth` 三类已落库事件 |
+| SSE 无新事件 | 确认调用确实发生；SSE 只推送 `tool_call` / `task_lifecycle` / `admin_auth` / `file_transfer` 四类已落库事件 |
 | 看不到 GPU / 容器列表 | 未透传 `nvidia-smi` 或未挂载 `docker.sock`（默认如此） |
 | 导出文件下载 401 | 签名链接 10 分钟过期，请在导出页重新生成；或保持登录会话 |
+| `download_file` 链接打开报签名无效 | 网关与后台的 `MCP_FILE_SIGNING_SECRET`（或回落用的 `MCP_TOKEN`）必须一致；Compose 已把两者注入两个服务，原生部署请确认两个 systemd 单元的 EnvironmentFile 相同 |
+| `download_file` 返回本机地址而非公网 HTTPS | 设置 `MCP_PUBLIC_BASE_URL=https://<固定域名>`；留空时只回落到请求 Host |
+| 后台任务显示 `unknown` 且退出码为 `unknown` | 这是 v1.1 的正确行为：服务重启后无法确认进程存活与真实退出码，绝不误标成功；日志仍可从 `MCP_TASK_LOG_DIR` 读取 |
+| Docker 命令在容器内查不到宿主容器 | 默认未挂载 `/var/run/docker.sock`；确认确实需要后叠加 `docker-compose.host-docker.yml` 并设 `MCP_DOCKER_SOCKET=1`（等价宿主机 root） |
 
-## 10. 本轮实测记录
+## 10. 历史实测记录（Admin Dashboard 初版，非 v1.1 验收数据）
 
-- 镜像构建成功；`docker compose up -d` 后三个服务均为 `healthy`；MCP `tools/list` = 34
+> 以下数字来自初版部署（当时 21 个原有工具 + 13 个 `git_*` = 34，测试 21 passed），仅作变更溯源。
+> v1.1 为 45 个工具，逐项验收结果以 `scripts/selfcheck_v11.py` 的 T01–T12 真实输出为准。
+
+- 镜像构建成功；`docker compose up -d` 后三个服务均为 `healthy`；当时 MCP `tools/list` = 34
   （原有 21 个 + 13 个结构化 `git_*` 工具）。网关 `/health` 只返回最小存活状态，
   后台通过需 Bearer 的 `/internal/metrics` 读取网关指标。
 - 真实 MCP 会话（`initialize` / `tools/list` / `tools/call`）与 REST `/run_command` 都产生审计记录；
@@ -202,3 +234,64 @@ python -m venv .venv
   后台容器停机期间 MCP 调用仍成功，恢复后台后可查到该记录。
 - 自动测试：`.venv/bin/python -m pytest tests -q` → 21 passed。
 - 镜像补装 `git`，使 Git 命令与对应审计在容器内可用。
+
+## 11. v1.1 增量（五个页面与文件传输记录）
+
+v1.1 不重做监控平台，只在既有简洁页面上补齐必要区块：
+
+| 页面 | 路由 | v1.1 变化 |
+|---|---|---|
+| 首页仪表盘 | `/api/dashboard` | 新增受管文件根目录的磁盘容量 / 已用 / 可用、各挂载点用量、文件传输次数与累计字节、SQLite 持久任务状态卡片 |
+| 完整调用记录 | `/api/calls` | 保持原有筛选 / 排序 / 分页 / 详情；新增工具的 `env`、`stdin`、base64 分片只记录键名或是否提供 |
+| 后台任务 | `/api/tasks` | 生命周期事件与 `mcp_tasks` 持久状态合并展示；`unknown` 明确标注「重启后无法确认真实退出码」，退出码显示 `unknown` 而非 0 |
+| Git 操作审计 | `/api/git` | 新增 `recent_commits` / `recent_pushes` 摘要；结构化 `git_*` 工具也会写入 Git 记录 |
+| 文件传输记录 | `/api/files` | 新增页面：时间、工具、方向、路径、大小、SHA-256、状态、耗时与失败原因；含上传/下载/失败/累计字节统计 |
+
+**审计脱敏**：写库与读库双向脱敏。口令、私钥、完整令牌、`Authorization` 头、连接串凭据一律替换；`env`、`stdin`、`content_base64` / `chunk_base64`、`signature` 整值不入库；工具结果里整行的 base64 分片会被替换成 `***REDACTED***`；签名链接中的 `token=` 也会被脱敏。大输出只保存受保护引用、大小与 SHA-256。
+
+**文件传输真实记录**：`file_transfers` 表由 `gateway/files/service.py` 直接写入，包含成功与失败（越权、覆盖拒绝、摘要不符）两类记录，只存路径、大小、摘要、方向与终态，绝不存分片内容。管理网站另提供登录后可用的 `POST /files/upload` 与 `GET /files/download`；公网可直开的免登录链接由网关 `GET /files/download` 的 HMAC 签名 token 提供，两者鉴权路径彼此独立。
+
+**Docker 授权边界**：容器化部署默认不挂载 `/var/run/docker.sock`；只有显式设置 `MCP_DOCKER_SOCKET=1` 并叠加 `docker-compose.host-docker.yml` 才开放，该权限等价于宿主机 root。override 同时只读挂载宿主机静态 `docker` CLI（路径用 `MCP_HOST_DOCKER_CLI` 调整），使 `run_command` 的 `docker ps` / `docker build` 在授权后真实可用；`docker_status` 在没有 CLI 时也能通过标准库直读 socket 的 Engine API 返回真实容器状态。原生 systemd 部署直接复用宿主机 Docker，不需要该开关。
+
+**验证**：`MCP_TOKEN=... ADMIN_PASSWORD=... python3 scripts/selfcheck_v11.py` 逐项输出 T01–T12 的真实命令、输出与 PASS/FAIL/SKIP；失败与跳过明确说明，不虚构成功。
+
+## 12. v1.1 T01–T12 实测结果（本机真实服务）
+
+执行环境：本机 `ghcr.io/ninaawa/cnb-mcp-gateway-plus:v1.1.0`（镜像 ID `31b2ac03f67b`），
+网关发布 `127.0.0.1:8765`、后台 `127.0.0.1:8788`，共享卷 `mcp-audit-data` / `mcp-files-data`。
+自检脚本 `scripts/selfcheck_v11.py` 通过真实 `fastmcp.Client`、REST、HTTP 与管理网站会话调用，
+完整输出保存在 `/tmp/mcp_v11_selfcheck_final.log`。最终退出码 `0`，**PASS=12 / FAIL=0 / SKIP=0**。
+
+| 项 | 结果 | 真实证据摘录 |
+|---|---|---|
+| T01 普通命令与结果语义 | PASS | `exit_code=0 duration_ms=4 timed_out=false`，stdout 含 `root / Linux / overlay 256G` |
+| T02 软件安装能力 | PASS | 上传离线 wheel（836 B）后 `python3 -m venv` + `pip install --no-index`，输出 `SELFCHECK_PKG=1.0` |
+| T03 env / stdin / 退出码 / 耗时 | PASS | `exit_code=7`，stdout 含 `from-stdin`、`ENV=from-env` |
+| T04 后台任务 | PASS | `task_id=dae011c3c3890ed9` → `status=done exit_code=3`，日志含 `tick-1` / `DONE` |
+| T05 二进制分片与签名链接 | PASS | 2,109,497 B 随机数据分片往返，SHA-256 一致，签名链接 HTTP `200` 与 `Range` `206` 均一致 |
+| T06 Docker 授权边界 | PASS | 默认 `docker_available=false authorized=False socket_present=False`，`docker` 命令未被白名单误拦 |
+| T07 Git 推送远端核验 | PASS | `remote_verification=PASS`，`git ls-remote` 得 `11b7a24b…` 与本地 HEAD 一致 |
+| T08 分支删除硬禁 | PASS | 本地/远端删除、`base64 -d \| sh`、后台入口四种写法全部返回「硬禁止」 |
+| T09 Git LFS 回归 | PASS | `git-lfs/3.6.1`，`sh -c '… repo.git'` 放行，`git lfs prune` 仍拒绝 |
+| T10 重启后日志与未知态 | PASS | 真实 `docker restart` 后 `status=unknown exit_code=unknown source=sqlite`，日志含 `before-restart` |
+| T11 管理网站五页面 | PASS | `/api/dashboard`、`/api/calls`、`/api/tasks`、`/api/git`、`/api/files` 全 200，含 `file_root_disk`，无明文令牌 |
+| T12 未授权访问拒绝 | PASS | 无 Bearer / 错 Bearer 均 `401`，合法令牌下 `git branch -D` 仍硬禁 |
+
+**额外真实核验（显式 Docker 授权）**：一次性容器挂载 `/var/run/docker.sock` 且
+`MCP_DOCKER_SOCKET=1` 时，`docker_status` 经标准库 Engine API 返回真实版本
+`29.9.2-2` 与宿主机容器列表；再只读挂载宿主机静态 `docker` CLI 时 CLI 分支同样返回真实列表；
+不授权时明确返回 `docker_available=false`。
+
+**首轮真实失败与修复（不隐瞒）**：首轮 `PASS=7 / FAIL=5`，逐项定位后修复并重新在真实服务上验证：
+- T02：自检构造的 `pkg.whl` 不符合 PEP 427 命名 → 改为 `mcp_v11_selfcheck-1.0-py3-none-any.whl`。
+- T05：`t05()` 返回值数量与 `check()` 的四元组约定不一致 → 改为显式四元组（并新增 AST 校验脚本）。
+- T07：`CATASTROPHIC_PATTERNS` 的 `\.git(?:/|\b)` 把 bare 仓库名 `remote.git` 误判为 `.git` 目录删除 →
+  服务端与 `git_guard._SCRIPT_DANGER_RE` 统一改为 `(?<![\w.-])\.git(?:/|\b)`，并补回归测试；
+  同时自检改为写仓库级 `git config user.name/email`（结构化 `git_commit` 不接受 `env`）。
+- T10 / T12：`docker restart` 重建端口映射瞬间的 TCP RST 让 `_http()` 抛出未捕获异常 →
+  `_http` 对连接异常返回可判定结果、重启后等待真实 MCP 会话恢复、MCP 调用对连接类异常有限重试。
+
+单元测试 `pytest -q` 共 85 项全部通过；`docker compose config --quiet`（含 override）、
+Python/Shell 语法检查与 `read_lints` 均无错误。回滚锚点：旧镜像
+`plus:v3.1.1` = `bb89f31c149c`、`plus:v3.1.0` = `7a33b2aa65ef`，两者及旧 package
+`cnb-mcp-gateway` 均未被覆盖。

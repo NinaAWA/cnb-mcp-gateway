@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 _SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
 _TASK_RE = re.compile(r"task_id\s*[=:]\s*([A-Za-z0-9_-]{4,64})")
-_EXIT_RE = re.compile(r"(?:^|\n)exit[=:]\s*(-?\d+)")
+_EXIT_RE = re.compile(r"(?:^|\n)exit(?:_code)?[=:]\s*(-?\d+)")
 _FILES_RE = re.compile(r"(\d+)\s+files?\s+changed")
 _CD_RE = re.compile(r"(?:^|&&|\|)\s*cd\s+([^\s;&|]+)")
 _BRANCH_RE = re.compile(r"(?:git\s+branch\s+--show-current|On branch\s+)([^\s\n]+)")
@@ -123,6 +123,36 @@ def enrich(record: dict[str, Any], arguments: dict[str, Any],
                 "status": record.get("status", ""),
                 "error_message": record.get("error_message", ""),
             }))
+
+    # 结构化 git_* 工具同样进 Git 记录页（此前只有 run_command 里的 git 才入库）。
+    if tool.startswith("git_") and tool != "git_guard":
+        cwd = str(args.get("cwd") or "")
+        repo_path, repo_name = _repo_from_command("", cwd)
+        operation = tool[len("git_"):]
+        is_push = operation == "push"
+        out["git_repo"] = repo_name or repo_path
+        out["sub_events"].append(("git", {
+            "request_id": record.get("request_id", ""),
+            "trace_id": record.get("trace_id", ""),
+            "repo_path": repo_path,
+            "repo_name": repo_name,
+            "branch": str(args.get("branch") or "") if is_push else "",
+            "operation": operation,
+            "files_changed": int(_FILES_RE.search(text).group(1)) if _FILES_RE.search(text) else 0,
+            "commit_sha": (_SHA_RE.search(text).group(0)
+                           if operation == "commit" and _SHA_RE.search(text) else ""),
+            "commit_message": str(args.get("message") or ""),
+            "push_remote": str(args.get("remote") or "") if is_push else "",
+            "push_branch": str(args.get("branch") or "") if is_push else "",
+            "client_id": record.get("client_id", ""),
+            "status": record.get("status", ""),
+            "error_message": record.get("error_message", ""),
+        }))
+
+    # 传输的真实大小/摘要由 gateway.files 直接写 file_transfers 表（含失败记录），
+    # 这里只补上通用的 file_path 派生字段。
+    if tool in ("upload_file", "download_file", "file_info", "file_checksum"):
+        out["file_path"] = str(args.get("path") or "")
 
     if tool == "run_command_background":
         command = str(args.get("command") or "")

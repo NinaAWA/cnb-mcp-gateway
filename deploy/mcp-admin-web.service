@@ -1,0 +1,22 @@
+[Unit]
+Description=CNB MCP Gateway v1.1 Admin Web
+After=network-online.target mcp-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/mcp-gateway/app
+EnvironmentFile=/etc/mcp-gateway/env
+Environment=PYTHONPATH=/opt/mcp-gateway/app
+Environment=PYTHONUNBUFFERED=1
+Environment=MCP_SERVICE_ROLE=admin-web
+ExecStart=/opt/mcp-gateway/venv/bin/uvicorn gateway.admin.api:app --host 127.0.0.1 --port 8788 --log-level info
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

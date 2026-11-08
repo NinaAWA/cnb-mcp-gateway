@@ -129,13 +129,28 @@ class TestGitGuard(unittest.TestCase):
             ["lfs", "fsck"],
             ["lfs", "push", "origin", "main"],
             ["lfs", "fetch", "origin"],
+            # v1.1：安装 / 拉取 / 检出 / 锁 等常规 LFS 操作不得被误拦
+            ["lfs", "install"],
+            ["lfs", "install", "--local"],
+            ["lfs", "install", "--system"],
+            ["lfs", "install", "--skip-smudge"],
+            ["lfs", "pull"],
+            ["lfs", "pull", "origin", "main"],
+            ["lfs", "checkout"],
+            ["lfs", "clone", "https://example.invalid/team/repo.git"],
+            ["lfs", "untrack", "*.zip"],
+            ["lfs", "lock", "model.bin"],
+            ["lfs", "unlock", "model.bin"],
+            ["lfs", "locks"],
         ]
         deny = [
             ["lfs", "prune"],
             ["lfs", "uninstall"],
+            ["lfs", "uninstall", "--system"],
             ["lfs", "migrate", "import", "--everything"],
             ["lfs", "pre-push", "--delete", "origin"],
             ["lfs", "track", "--force"],
+            ["lfs", "install", "--force"],
             ["lfs"],
         ]
         for argv in allow:
@@ -145,7 +160,20 @@ class TestGitGuard(unittest.TestCase):
         for argv in deny:
             with self.subTest(argv=argv):
                 self.assertFalse(check_argv(argv).allowed, argv)
-        self.assertTrue(check_command("git lfs version", cwd="/workspace").allowed)
+
+    def test_lfs_install_via_shell_command_is_allowed(self):
+        """回归：原生安装脚本建议的 `git lfs install` 曾被自身守卫拒绝。"""
+        for command in ["git lfs version", "git lfs install", "git lfs install --local",
+                        "git lfs install --system", "git lfs pull", "git lfs checkout",
+                        "git lfs track '*.bin'", "git lfs ls-files"]:
+            with self.subTest(command=command):
+                decision = check_command(command, cwd="/workspace")
+                self.assertTrue(decision.allowed, f"{command} -> {decision.reason}")
+        for command in ["git lfs prune", "git lfs uninstall",
+                        "git lfs install --force", "git lfs migrate import --everything"]:
+            with self.subTest(command=command):
+                decision = check_command(command, cwd="/workspace")
+                self.assertFalse(decision.allowed, f"应被拒绝: {command}")
 
     def test_repository_directory_is_protected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -181,12 +209,52 @@ class TestGitGuard(unittest.TestCase):
 
         fake = FakeMCP()
         git_guard.register_git_tools(fake, "/tmp", lambda _msg: None)
-        self.assertEqual(len(fake.tools), 13)
-        for name in ("git_status", "git_commit", "git_switch", "git_branch_create", "git_push"):
+        self.assertEqual(len(fake.tools), 19)
+        for name in ("git_status", "git_commit", "git_switch", "git_branch_create",
+                     "git_push", "git_merge", "git_rebase", "git_stash", "git_show",
+                     "git_cherry_pick", "git_checkout"):
             self.assertIn(name, fake.tools)
         for name in fake.tools:
             self.assertNotIn("delete", name)
             self.assertNotIn("remove", name)
+
+    def test_dot_git_urls_are_not_false_positives(self):
+        """LFS pre-push hook 的远端 URL 以 .git 结尾，不得被解释器内嵌检查误杀。"""
+        allow = [
+            "git lfs pre-push origin https://cnb.cool/team/repo.git",
+            "sh -c 'git lfs pre-push origin https://cnb.cool/team/repo.git'",
+            'bash -c "git lfs pre-push origin https://cnb.cool/team/repo.git"',
+            "git clone https://cnb.cool/team/repo.git /tmp/repo",
+            "git push origin https://cnb.cool/team/repo.git",
+        ]
+        for command in allow:
+            with self.subTest(command=command):
+                decision = check_command(command, cwd="/workspace")
+                self.assertTrue(decision.allowed, f"{command} -> {decision.reason}")
+        # 「写脚本再执行」组合里出现 bare 仓库名同样不能被误杀；真正删 .git 目录仍硬禁
+        benign = "echo 'git init --bare /tmp/remote.git' > /tmp/setup.sh && sh /tmp/setup.sh"
+        self.assertTrue(check_command(benign, cwd="/workspace").allowed)
+        danger = "echo 'rm -rf /tmp/repo/.git' > /tmp/setup.sh && sh /tmp/setup.sh"
+        self.assertFalse(check_command(danger, cwd="/workspace").allowed)
+
+    def test_new_argv_guards(self):
+        deny = [
+            ["rebase", "--onto", "main"], ["rebase", "-i", "HEAD~3"],
+            ["stash", "drop"], ["stash", "clear"], ["checkout", "--force"],
+            ["lfs", "prune"], ["lfs", "migrate", "import"],
+        ]
+        allow = [
+            ["rebase", "main"], ["rebase", "--continue"],
+            ["stash", "list"], ["stash", "push", "-m", "wip"], ["stash", "pop"],
+            ["checkout", "-b", "feature"], ["show", "--stat", "HEAD"],
+            ["merge", "main"], ["cherry-pick", "abc1234"],
+        ]
+        for argv in deny:
+            with self.subTest(argv=argv):
+                self.assertFalse(check_argv(argv).allowed, argv)
+        for argv in allow:
+            with self.subTest(argv=argv):
+                self.assertTrue(check_argv(argv).allowed, f"{argv} -> {check_argv(argv).reason}")
 
     @unittest.skipUnless(shutil.which("git"), "需要系统 git")
     def test_run_git_allows_commit_and_denies_delete(self):

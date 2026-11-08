@@ -52,6 +52,12 @@
     if (ms < 60000) return (ms / 1000).toFixed(2) + ' s';
     return (ms / 60000).toFixed(1) + ' min';
   }
+  function fmtBytes(v) {
+    const n = num(v);
+    if (n < 1024) return n + ' B';
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+    return (n / 1048576).toFixed(2) + ' MB';
+  }
   function fmtUptime(sec) {
     sec = num(sec);
     const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
@@ -286,6 +292,27 @@
         '<div class="grid cols-2" style="margin-top:14px">' +
         metricCard('服务器状态 · 管理后台容器', mon) +
         metricCard('服务器状态 · MCP 网关容器', gatewayMon) +
+        '</div>' +
+        '<div class="grid cols-2" style="margin-top:14px">' +
+        card('磁盘与文件服务', kv([
+          ['受管文件根目录', esc((d.file_root_disk || {}).path || '—')],
+          ['磁盘总容量', fmtBytes((d.file_root_disk || {}).total_bytes)],
+          ['已用 / 可用', fmtBytes((d.file_root_disk || {}).used_bytes) + ' / ' +
+            fmtBytes((d.file_root_disk || {}).free_bytes) + '（' +
+            esc((d.file_root_disk || {}).percent === undefined ? '—' : (d.file_root_disk || {}).percent) + ' %）'],
+          ['挂载点用量', (d.disks || []).length
+            ? (d.disks || []).map((x) => esc(x.mount) + ' ' + esc(x.percent) + '%').join('；') : '—'],
+          ['文件传输次数', esc((d.files || {}).transfers || 0) + '（失败 ' + esc((d.files || {}).failed || 0) + '）'],
+          ['累计传输字节', fmtBytes((d.files || {}).total_bytes)]
+        ]), '磁盘指标来自容器自身可见的文件系统') +
+        card('后台任务持久状态', table([
+          { key: 'task_id', label: '任务 ID', render: (r) => '<span class="mono">' + tr(r.task_id, 20) + '</span>' },
+          { key: 'status', label: '状态', render: (r) => statusBadge(String(r.status || '').toUpperCase()) },
+          { key: 'exit_code', label: '退出码', render: (r) => r.exit_code === null || r.exit_code === undefined ? 'unknown' : esc(r.exit_code) },
+          { key: 'command', label: '命令', render: (r) => tr(r.command, 50) },
+          { key: 'detail', label: '说明', render: (r) => tr(r.detail, 50) }
+        ], d.tasks || [], { empty: '暂无持久化的后台任务' }),
+        'unknown 表示重启后无法确认真实退出码，绝不按成功统计') +
         '</div>' +
         '<div style="margin-top:14px">' + card('最近异常调用', errors, '来自 tool_calls 终态记录') + '</div>' +
         '<p class="hint" style="margin-top:14px">说明：以上 CPU / 内存 / 磁盘指标分别来自两个容器自身，不是宿主机全机指标；' +
@@ -546,6 +573,38 @@
     await load();
   }
 
+  async function renderFiles(alive) {
+    rootEl.innerHTML = '<div class="controls"><input id="files-keyword" type="search" placeholder="按路径 / 工具过滤">' +
+      '<button class="btn primary" id="files-apply">查询</button></div>' +
+      '<div id="files-body"><div class="loading">正在加载…</div></div>';
+    const load = async () => {
+      const keyword = $('#files-keyword').value.trim();
+      const d = await api('/api/files?keyword=' + encodeURIComponent(keyword));
+      if (!alive()) return;
+      const s = d.summary || {};
+      $('#files-body').innerHTML =
+        '<div class="grid kpis">' +
+        kpi('传输记录', s.transfers, '最近 200 条') +
+        kpi('上传 / 下载', num(s.uploads) + ' / ' + num(s.downloads), '按方向统计') +
+        kpi('累计字节', fmtBytes(s.total_bytes), '仅统计已记录的真实大小') +
+        kpi('失败次数', s.failed, '摘要校验 / 越权 / 覆盖拒绝') +
+        '</div><div style="margin-top:14px">' +
+        card('文件传输记录', table([
+          { key: 'ts', label: '时间', render: (r) => fmtTime(r.ts) },
+          { key: 'tool_name', label: '工具' },
+          { key: 'direction', label: '方向' },
+          { key: 'path', label: '路径', render: (r) => '<span class="mono">' + tr(r.path, 70) + '</span>' },
+          { key: 'size', label: '大小', render: (r) => fmtBytes(r.size) },
+          { key: 'sha256', label: 'SHA-256', render: (r) => '<span class="mono">' + tr(r.sha256, 20) + '</span>' },
+          { key: 'status', label: '状态', render: (r) => statusBadge(r.status) },
+          { key: 'duration_ms', label: '耗时', render: (r) => fmtDuration(r.duration_ms) },
+          { key: 'error_message', label: '错误', render: (r) => tr(r.error_message, 60) }
+        ], d.rows, { empty: '暂无文件传输记录' }), esc(d.note || '')) + '</div>';
+    };
+    $('#files-apply').addEventListener('click', () => load().catch(showError));
+    await load();
+  }
+
   async function renderExperiments(alive) {
     rootEl.innerHTML = '<div class="card"><h3>科研实验 / 后台任务监控<span class="sub">启动工具的调用结果与任务真实运行结果分开记录</span></h3>' +
       '<div id="exp-body"><div class="loading">正在加载…</div></div></div>';
@@ -693,6 +752,7 @@
     calls: { title: '完整调用记录', sub: '组合筛选、排序、分页、详情与导出', render: renderCalls },
     call: { title: '调用详情', sub: '参数、结果、时间线与关联记录', render: renderCallDetail },
     git: { title: 'Git 操作审计', sub: 'commit / push / status 等命令推导', render: renderGit },
+    files: { title: '文件传输记录', sub: '分片上传下载、SHA-256 与失败原因', render: renderFiles },
     experiments: { title: '科研实验监控', sub: '后台任务生命周期与日志', render: renderExperiments },
     server: { title: '服务器状态', sub: '容器指标来源明确区分', render: renderServer },
     clients: { title: '客户端与会话', sub: '令牌指纹、管理员会话与强制下线', render: renderClients },

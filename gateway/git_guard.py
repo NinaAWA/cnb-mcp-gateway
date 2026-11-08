@@ -35,7 +35,8 @@ from typing import Any, Callable, Iterable
 
 __all__ = [
     "Decision", "ALLOW", "check_command", "check_argv", "check_write_path",
-    "run_git", "register_git_tools", "GitGuardError",
+    "run_git", "run_git_checked", "verify_remote_push",
+    "register_git_tools", "GitGuardError",
 ]
 
 
@@ -94,12 +95,15 @@ KNOWN_GIT_SUBCOMMANDS = frozenset({
     "write-tree",
 })
 
-# 仓库 pre-push 钩子会调用 `git lfs pre-push`。只放行不会删除 LFS 对象、
-# 不重写历史的子操作；prune / uninstall / migrate 等一律拒绝，与 Git 删除硬防护一致。
+# 仓库 pre-push 钩子会调用 `git lfs pre-push`。放行所有不改变 ref 拓扑的正常
+# LFS 操作（含 install / pull / checkout / clone / lock 等），保证 LFS 开箱可用：
+# `git lfs install` 只安装或更新 pre-push 等钩子，并不删除任何已有 Git Hook。
+# prune / uninstall / migrate 会删对象、卸钩子或重写历史，一律拒绝，与 Git 删除硬防护一致。
 LFS_SAFE_SUBCOMMANDS = frozenset({
-    "clean", "env", "fetch", "filter-process", "fsck", "logs", "ls-files",
-    "pointer", "post-checkout", "post-commit", "post-merge", "pre-push",
-    "push", "smudge", "status", "track", "version",
+    "checkout", "clean", "clone", "env", "fetch", "filter-process", "fsck",
+    "install", "lock", "locks", "logs", "ls-files", "pointer",
+    "post-checkout", "post-commit", "post-merge", "pre-push", "pull", "push",
+    "smudge", "status", "track", "unlock", "untrack", "version",
 })
 
 _GLOBAL_NO_VALUE = frozenset({
@@ -223,6 +227,16 @@ def check_argv(argv: list[str]) -> Decision:
     if sub == "config" and re.search(r"--unset-all\b|--remove-section\b", flat, re.IGNORECASE):
         if "alias." in flat.lower():
             return _deny("禁止通过 git config 隐藏/清除分支删除 alias")
+    # 结构化新工具只暴露安全形式；这里在 wrapper 层同步收口，避免手写命令绕过。
+    if sub == "rebase" and re.search(
+            r"--onto\b|--force\b|--force-rebase\b|--exec\b|--autosquash\b|--root\b|"
+            r"--strategy\b|--strategy-option\b|(?:^|\s)-(?:i|f)\b", flat, re.IGNORECASE):
+        return _deny("git rebase 只放行 <ref> / --continue / --abort 这类安全形式")
+    if sub == "stash" and re.search(
+            r"(?:^|\s)(?:drop|clear|create|branch)\b|--all\b", flat, re.IGNORECASE):
+        return _deny("git stash 的删除类子操作（drop / clear / create / branch）")
+    if sub == "checkout" and re.search(r"--force\b|(?:^|\s)-f\b", flat, re.IGNORECASE):
+        return _deny("git checkout --force 会丢弃工作区改动")
     return ALLOW
 
 
@@ -237,14 +251,21 @@ _INTERPRETER_RE = re.compile(
     r"^(?:ba|da|z|k|fi|r)?sh|python[0-9.]*|perl|ruby|node|php|lua$", re.IGNORECASE
 )
 _INTERPRETER_FLAG_RE = re.compile(r"^-[a-z]*[ce]$|^--command$|^-[a-z]*e$", re.IGNORECASE)
+# 注意：这里不能把裸 `.git` 当作危险 token。真实推送的远端 URL 常以
+# https://host/team/repo.git 结尾，`sh -c 'git lfs pre-push origin <url>'` 会被
+# 解释器的 token 检查误杀。`.git` 目录删除意图只在文件操作上下文判定：
+# _check_fs_segment 的 _GIT_DOT_RE、重定向写入 .git 的检查，以及下面仅供
+# 「写脚本再执行」组合使用的 _SCRIPT_DANGER_RE。
 _DANGEROUS_TOKEN_RE = re.compile(
     r"git\s+(?:-[-a-zA-Z =./]+\s+)*(?:branch\b[^;\n]*-(?:d|D|m|M)\b|"
     r"push\b[^;\n]*(?:--delete|--mirror|--prune|:\s*\S+\s*$)|"
     r"update-ref\b|worktree\s+(?:remove|prune)\b|remote\s+(?:remove|prune)\b|"
     r"symbolic-ref\b[^\n]*--delete)|"
-    r"refs/heads/|\.git(?:/|\b)|--delete\b|--mirror\b|update-ref\b",
+    r"refs/heads/|--delete\b|--mirror\b|update-ref\b",
     re.IGNORECASE,
 )
+_SCRIPT_DANGER_RE = re.compile(
+    _DANGEROUS_TOKEN_RE.pattern + r"|(?<![\w.-])\.git(?:/|\b)", re.IGNORECASE)
 _DECODER_RE = re.compile(r"\bbase64\b|\bxxd\b[^;\n]*-r\b|\bopenssl\b[^;\n]*\benc\b", re.IGNORECASE)
 _GIT_DOT_RE = re.compile(r"(?<![\w.-])\.git(?:/|\b)", re.IGNORECASE)
 
@@ -439,7 +460,7 @@ def check_command(command: str, cwd: str = "", *, depth: int = 0) -> Decision:
     # 把删除命令写进脚本再执行：git wrapper 可拦 git 子命令，但脚本也可能
     # 直接删除 .git 目录，因此在命令层面拒绝这种组合。
     if (_SCRIPT_WRITE_RE.search(text) and _SCRIPT_RUN_RE.search(text)
-            and _DANGEROUS_TOKEN_RE.search(text)):
+            and _SCRIPT_DANGER_RE.search(text)):
         return _deny("禁止把 Git 删除命令写入脚本后执行")
 
     for segment in segments:
@@ -498,16 +519,61 @@ def _check_cwd(cwd: str, workdir: str) -> str:
     return str(target)
 
 
-def run_git(args: list[str], *, cwd: str, timeout: int = 60) -> str:
-    """参数化执行 git；先过 check_argv，再由容器 wrapper 二次校验。"""
+def run_git_checked(args: list[str], *, cwd: str,
+                    timeout: int = 60) -> tuple[int, str, str]:
+    """参数化执行 git 并返回 (真实退出码, stdout, stderr)，绝不把失败包装成成功。"""
     decision = check_argv(args)
     if not decision.allowed:
         raise GitGuardError(decision.reason)
-    proc = subprocess.run(
-        ["git", *args], shell=False, cwd=cwd, capture_output=True,
-        text=True, timeout=timeout, check=False,
-    )
-    return f"exit={proc.returncode}\n--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+    try:
+        proc = subprocess.run(
+            ["git", *args], shell=False, cwd=cwd, capture_output=True,
+            text=True, timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GitGuardError(f"git 执行失败: {exc}") from exc
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def run_git(args: list[str], *, cwd: str, timeout: int = 60) -> str:
+    """参数化执行 git；先过 check_argv，再由容器 wrapper 二次校验。"""
+    rc, out, err = run_git_checked(args, cwd=cwd, timeout=timeout)
+    return f"exit={rc}\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+
+
+def verify_remote_push(cwd: str, remote: str, branch: str, *,
+                       timeout: int = 60) -> tuple[bool, str]:
+    """核验远端分支 HEAD 确实等于本地 HEAD；不相等/查不到都返回失败。
+
+    判定链：git push 真实退出码 -> git rev-parse HEAD -> git ls-remote，
+    三者一致才允许工具回报成功。绝不因 push 命令未报错就宣称推送成功。
+    """
+    try:
+        _check_ref(remote, "remote")
+        _check_ref(branch, "branch")
+        local_rc, local_out, local_err = run_git_checked(
+            ["rev-parse", "HEAD"], cwd=cwd, timeout=timeout)
+        if local_rc != 0:
+            return False, (f"读取本地 HEAD 失败: exit_code={local_rc} "
+                           f"stderr={local_err.strip()}")
+        local_sha = local_out.strip()
+        ls_rc, ls_out, ls_err = run_git_checked(
+            ["ls-remote", remote, f"refs/heads/{branch}"], cwd=cwd, timeout=timeout)
+        if ls_rc != 0:
+            return False, (f"查询远端 {remote}/{branch} 失败: exit_code={ls_rc} "
+                           f"stderr={ls_err.strip()}")
+        lines = [line for line in ls_out.splitlines() if line.strip()]
+        remote_sha = lines[0].split()[0] if lines else ""
+        if not remote_sha:
+            return False, (f"远端 {remote}/{branch} 无 HEAD（ls-remote 返回空），"
+                           "不能认定推送成功")
+        if remote_sha != local_sha:
+            return False, (f"远端 HEAD 与本地提交不一致: local={local_sha} "
+                           f"remote={remote_sha} ({remote}/{branch})")
+        return True, (f"远端核验通过: {remote}/{branch} HEAD={remote_sha} "
+                      "与本地 HEAD 一致")
+    except GitGuardError as exc:
+        return False, f"远端核验被拒绝: {exc}"
 
 
 def register_git_tools(mcp: Any, workdir: str, audit: Callable[[str], None]) -> None:
@@ -573,14 +639,26 @@ def register_git_tools(mcp: Any, workdir: str, audit: Callable[[str], None]) -> 
         return _run(["switch", "-c", name] if create else ["switch", name], cwd)
 
     @mcp.tool()
-    def git_add(paths: str, cwd: str = workdir) -> str:
-        """暂存文件改动。Args: paths: 以空格分隔的路径（支持 . 表示全部）；cwd: 仓库路径。"""
-        items = [p for p in paths.split() if p]
+    def git_add(paths: list[str] | str, cwd: str = workdir) -> str:
+        """暂存显式路径数组（禁止 . / 通配符 / 选项参数，避免混入无关文件）。
+
+        Args:
+            paths: 显式路径数组，例如 ["src/app.py", "README.md"]；
+                   兼容旧客户端传入以空格分隔的字符串，但 "." 仍一律拒绝。
+            cwd: 仓库路径。
+        """
+        items = [p for p in paths.split() if p] if isinstance(paths, str) else [
+            str(p) for p in (paths or [])
+        ]
         if not items:
-            return "ERROR: 请提供至少一个路径"
+            return "ERROR: 请提供至少一个显式路径（list[str]）"
         for item in items:
-            if item.startswith("-") or ":" in item:
-                return deny_message(_deny(f"非法路径参数: {item!r}"))
+            if item.strip() in (".", "./", "..", "../", "*", "./*"):
+                return deny_message(_deny("禁止 git add . / 通配符；必须显式列出路径数组"))
+            if item.startswith("-") or ":" in item or any(ch in item for ch in "*?["):
+                return deny_message(_deny(f"非法路径参数（选项/通配符）: {item!r}"))
+            if ".git" in Path(item).parts:
+                return deny_message(_deny("禁止暂存 .git 内部文件"))
         return _run(["add", "--", *items], cwd)
 
     @mcp.tool()
@@ -610,18 +688,113 @@ def register_git_tools(mcp: Any, workdir: str, audit: Callable[[str], None]) -> 
         return _run(["pull", *([name] if name else []), *([ref] if ref else [])], cwd)
 
     @mcp.tool()
-    def git_push(cwd: str = workdir, remote: str = "origin", branch: str = "") -> str:
-        """推送分支到远端。严禁 --force / --delete / 删除型 refspec；如需强推请走管理员手动流程。
-        Args: cwd: 仓库路径；remote: 远端名；branch: 要推送的本地分支名，留空则推送当前分支。
+    def git_push(cwd: str = workdir, remote: str = "origin", branch: str = "",
+                 verify_remote: bool = True) -> str:
+        """推送分支并核验远端 HEAD 确实等于本地提交，未核验通过绝不报成功。
+
+        严禁 --force / --delete / 删除型 refspec；如需强推请走管理员手动流程。
+        Args:
+            cwd: 仓库路径。
+            remote: 远端名。
+            branch: 要推送的本地分支名，留空则推送当前分支。
+            verify_remote: 默认 true；关闭时只回报 push 的真实退出码（不宣称已核验）。
         """
+        argv: list[str] = []
         try:
             name = _check_ref(remote, "remote")
             ref = _check_ref(branch, "branch")
+            target = _check_cwd(cwd, root)
+            argv = ["push", *([name] if name else []), *([ref] if ref else [])]
+            decision = check_argv(argv)
+            if not decision.allowed:
+                return deny_message(decision)
+            rc, out, err = run_git_checked(argv, cwd=target)
         except GitGuardError as exc:
+            audit(f"GIT DENIED(push) argv={argv!r} reason={exc}")
             return deny_message(_deny(str(exc)))
-        return _run(["push", *([name] if name else []), *([ref] if ref else [])], cwd)
+        audit(f"GIT PUSH argv={argv!r} exit_code={rc}")
+        report = (f"exit_code={rc}\n--- stdout ---\n{out}\n--- stderr ---\n{err}")
+        if rc != 0:
+            return report + "\nERROR: git push 失败（真实退出码非 0），未进行远端核验。"
+        if not verify_remote:
+            return report + "\nremote_verification=SKIPPED (verify_remote=false)"
+        try:
+            actual = ref or run_git_checked(
+                ["rev-parse", "--abbrev-ref", "HEAD"], cwd=target)[1].strip()
+            if not actual:
+                return report + "\nERROR: 无法确定当前本地分支，远端核验未通过。"
+        except GitGuardError as exc:
+            return report + f"\nERROR: 无法确定当前本地分支: {exc}"
+        ok, detail = verify_remote_push(target, name or "origin", actual)
+        if not ok:
+            return report + f"\nremote_verification=FAIL\nERROR: 推送命令返回成功但远端核验失败: {detail}"
+        return report + f"\nremote_verification=PASS\n{detail}"
 
     @mcp.tool()
     def git_remote_list(cwd: str = workdir) -> str:
         """列出远端（只读）。Args: cwd: 仓库路径。"""
         return _run(["remote", "-v"], cwd)
+
+    def _ref_tool(argv_builder, label: str, value: str, cwd: str) -> str:
+        """公共参数校验：所有新结构化工具都必须走 _run -> check_argv。"""
+        try:
+            name = _check_ref(value, label)
+            if not name:
+                raise GitGuardError(f"{label} 不能为空")
+        except GitGuardError as exc:
+            return deny_message(_deny(str(exc)))
+        return _run(argv_builder(name), cwd)
+
+    @mcp.tool()
+    def git_merge(ref: str, cwd: str = workdir) -> str:
+        """把指定 ref 合并进当前分支（不提供删除或强制重写接口）。
+        Args: ref: 分支名/提交号；cwd: 仓库路径。
+        """
+        return _ref_tool(lambda name: ["merge", name], "ref", ref, cwd)
+
+    @mcp.tool()
+    def git_rebase(cwd: str = workdir, ref: str = "", action: str = "") -> str:
+        """安全形式的 rebase：指定 ref，或 continue / abort；禁止 -i/--onto/--force 等重写形式。
+        Args: cwd: 仓库路径；ref: 基线 ref；action: continue 或 abort。
+        """
+        act = (action or "").strip().lower()
+        if act and act not in ("continue", "abort"):
+            return deny_message(_deny(f"只支持 rebase continue / abort，拒绝 {action!r}"))
+        if act:
+            return _run(["rebase", "--" + act], cwd)
+        return _ref_tool(lambda name: ["rebase", name], "ref", ref, cwd)
+
+    @mcp.tool()
+    def git_stash(cwd: str = workdir, action: str = "list", message: str = "") -> str:
+        """stash 安全子操作：list / push / apply / pop / show（拒绝 drop / clear / create）。
+        Args: cwd: 仓库路径；action: 子操作；message: push 时的说明。
+        """
+        act = (action or "list").strip().lower()
+        if act not in ("list", "push", "apply", "pop", "show"):
+            return deny_message(_deny(f"git stash 仅允许 list/push/apply/pop/show，拒绝 {act!r}"))
+        argv = ["stash", act]
+        if act == "push" and message.strip():
+            argv += ["-m", message.strip()]
+        return _run(argv, cwd)
+
+    @mcp.tool()
+    def git_show(cwd: str = workdir, ref: str = "HEAD") -> str:
+        """查看某个提交/引用的摘要（只读）。Args: cwd: 仓库路径；ref: 默认 HEAD。"""
+        return _ref_tool(lambda name: ["show", "--stat", "--oneline", name],
+                         "ref", ref, cwd)
+
+    @mcp.tool()
+    def git_cherry_pick(commit: str, cwd: str = workdir) -> str:
+        """把指定提交应用到当前分支（不删除任何分支）。
+        Args: commit: 提交号或 ref；cwd: 仓库路径。
+        """
+        return _ref_tool(lambda name: ["cherry-pick", name], "commit", commit, cwd)
+
+    @mcp.tool()
+    def git_checkout(ref: str, cwd: str = workdir, create: bool = False) -> str:
+        """检出 ref 或创建并检出新分支；禁止 --force。
+        Args: ref: 目标分支/提交；cwd: 仓库路径；create: 是否以 -b 创建新分支。
+        """
+        return _ref_tool(
+            lambda name: (["checkout", "-b", name] if create else ["checkout", name]),
+            "ref", ref, cwd)

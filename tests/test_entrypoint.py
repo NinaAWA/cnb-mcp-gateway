@@ -33,14 +33,22 @@ class TestEntrypoint(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, f"{code!r} -> {proc.stderr}")
             self.assertTrue(proc.stdout.strip())
 
-    def test_admin_password_defaults_and_ignores_stale_file(self):
+    def test_admin_password_is_generated_randomly_and_persisted(self):
         text = SCRIPT.read_text(encoding="utf-8")
-        self.assertIn('ADMIN_PASSWORD="admin"', text,
-                      "未配置 ADMIN_PASSWORD 时必须回落到固定默认口令")
-        self.assertNotIn('cat "$PASS_FILE"', text,
-                         "升级后不得读取旧卷里残留的随机口令")
+        self.assertNotIn('ADMIN_PASSWORD="admin"', text,
+                         "不得再内置硬编码弱口令")
+        self.assertIn("generate_secret", text, "未配置时必须调用强随机生成")
+        self.assertIn('cat "$PASS_FILE"', text,
+                      "容器重建应复用持久卷里已生成的口令")
         self.assertIn('> "$PASS_FILE"', text,
                       "仍须把生效口令写入受保护文件，兼容既有取口令命令")
+        self.assertIn("umask 077", text, "口令文件必须是 600 权限")
+
+    def test_generated_token_is_reused_after_restart(self):
+        text = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('cat "$TOKEN_FILE"', text,
+                      "重启必须复用持久卷中的令牌，否则客户端与自检会 401")
+        self.assertIn("复用持久卷中的 MCP_TOKEN", text)
 
     def test_generated_token_is_48_alnum(self):
         token_code = [s for s in _snippets() if "ascii_letters" in s]

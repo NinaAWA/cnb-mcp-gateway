@@ -34,14 +34,23 @@ RUN chmod 755 /usr/bin/git /app/entrypoint.sh
 # 仓库的 pre-push 钩子会调用 `git lfs pre-push`。镜像内置 git-lfs 并做系统级初始化，
 # 运行时无需 agent 执行安装命令，也不必放宽 MCP_ALLOWED_PREFIXES 白名单。
 # 必须放在 wrapper 与 gateway/ 复制完成之后：此前 /usr/bin/git 已被移走，
-# 且 wrapper 需要 import /app/gateway/git_guard.py。用二进制全路径是因为
-# `git lfs install` 不在允许的安全子操作内；--system 只写 /etc/gitconfig，不改仓库钩子。
+# 且 wrapper 需要 import /app/gateway/git_guard.py。
+# `git lfs install` 已由 git_guard.LFS_SAFE_SUBCOMMANDS 放行（只装钩子、不删钩子）；
+# 构建期仍用二进制全路径，仅为避免此刻依赖 wrapper 的 Python 导入链。
+# --system 只写 /etc/gitconfig，不会删除任何仓库 Hook。
 RUN /usr/bin/git-lfs install --system \
  && /usr/bin/git-lfs version
 
-# 管理后台默认口令；部署时用 -e ADMIN_PASSWORD=强口令 覆盖（默认值仅限隔离环境）
-ENV ADMIN_PASSWORD=admin
+# v1.1 持久目录：二进制文件与长任务日志。Compose 用命名卷覆盖，
+# 直接 docker run 时也应把这两个目录挂到宿主机，重建容器才不会丢数据。
+RUN mkdir -p /data/audit/task-logs /data/files
+ENV MCP_FILE_ROOT=/data/files \
+    MCP_TASK_LOG_DIR=/data/audit/task-logs
 
+# 管理后台不内置硬编码口令：首次启动由 entrypoint.sh 随机生成并写入
+# /data/audit/.admin_password（umask 077、持久卷），显式 ADMIN_PASSWORD 优先。
+
+# 生产依赖只来自 docker/requirements.txt；不把任何科研项目依赖硬编码进镜像。
 # 8765 = MCP API（仅容器网络 / 隧道可达），8788 = Admin Web（默认仅绑定宿主 127.0.0.1）
 EXPOSE 8765 8788
 CMD ["/app/entrypoint.sh"]

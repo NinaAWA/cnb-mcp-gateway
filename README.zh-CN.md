@@ -10,6 +10,60 @@
    └─ cloudflared 快速隧道（随机 https 地址） ◄── 鉴权：Bearer 令牌 / OAuth2 PKCE
 ```
 
+## v1.1 — 通用、自托管的 Linux 云服务器远程控制
+
+两种部署方式、同一套工具能力。不绑定任何特定研究项目、目录、仓库或依赖栈；不引入任务编排、多租户体系，也不依赖 Redis / Celery / Kubernetes。
+
+- **默认管理员模式**：`MCP_ALLOWED_PREFIXES` 现在只是「可选的收紧开关」，留空即放行全部日常管理命令（`apt`/`dpkg`、`pip`/`uv`/`conda`、`bash`、Python、`gcc`/`cmake`、Git/Git LFS、Docker/Compose）。始终保留：Bearer/OAuth 鉴权、全量审计、Git 分支/仓库删除硬禁（含 shell、Python、编码绕过）、毁灭级黑名单、破坏性指令 `confirm=true` 确认门。同步 `run_command`、后台 `run_command_background`、REST `/run_command` 共用同一个 `_authorize()` 闸门，规则不会漂移。
+- **真实命令结果**：`run_command` 返回 `exit_code`、`duration_ms`、`timed_out`、`stdout`、`stderr`，并支持 `env` 与 `stdin`；输出受 `MCP_MAX_OUTPUT_BYTES` 上限保护。超时返回约定码 `124` 并明确说明「并非进程真实退出码」。环境变量值、标准输入、分片内容一律不写审计。
+- **任意二进制文件**：`upload_file` / `download_file` / `file_info` / `file_checksum`：base64 分片（默认 1 MiB）、`.part` 暂存、流式 SHA-256、`os.replace()` 原子落盘、覆盖检测、失败删除 `.part` 并保留原文件。`download_file` 同时返回 HMAC 签名、短时效的绝对链接（`GET /files/download`），浏览器或 `curl` 可直接打开并支持 HTTP `Range`。所有路径必须位于 `MCP_FILE_ROOT` 内；`.git`、`.ssh`、`.env`、私钥与令牌文件一律拒绝。
+- **Git**：19 个 `shell=False` 结构化工具。`git_add` 改为显式路径数组（拒绝 `.` 与通配符）；`git_push` 用 `git rev-parse HEAD` + `git ls-remote` 核验远端 HEAD 后才报成功。新增 `git_merge`、`git_rebase`（安全形式）、`git_stash`、`git_show`、`git_cherry_pick`、`git_checkout`。删除本地/远端分支、强制 refspec 重写、`git lfs prune`/`uninstall`/`migrate` 始终拒绝。已修复 `sh -c 'git lfs pre-push ... repo.git'` 的 `.git` URL 误杀。
+- **长任务**：元数据落在 SQLite WAL（`mcp_tasks`），日志落在 `MCP_TASK_LOG_DIR` 持久卷，重启后仍可读。无法确认存活（pid + `/proc` 启动时间）的 `running` 任务一律标为 `unknown`、退出码保持 NULL，**绝不**写成 `done` 或成功。取消任务同样校验 pid 身份，避免误杀被复用的 pid。
+- **Docker**：常规 Docker 操作由 `run_command` 覆盖，另提供轻量 `docker_status` 状态视图。容器化部署默认**不**挂载宿主机 Docker socket。
+- **管理网站**：首页仪表盘、完整调用记录、后台任务、Git 记录、文件传输记录五个页面；首页补受管文件根目录的磁盘指标。所有页面读取同一份已脱敏审计库：不记录口令、私钥、完整令牌、`env` 值、`stdin`、base64 分片与签名材料。
+
+### 部署 v1.1 —— 一条命令，无需预先填任何秘密
+
+```bash
+# A. 原生 Linux + systemd（推荐：直接复用宿主机软件、GPU、驱动与 Docker）
+git clone https://cnb.cool/webgamer-2026/cnb-mcp-gateway.git && cd cnb-mcp-gateway && sudo ./scripts/install-native.sh
+
+# B. Docker / Compose（MCP_TOKEN 与 ADMIN_PASSWORD 首次启动自动生成）
+git clone https://cnb.cool/webgamer-2026/cnb-mcp-gateway.git && cd cnb-mcp-gateway && cp .env.example .env && docker compose up -d --build
+
+# 验证任一部署：T01–T12 真实自检，逐项 PASS / FAIL / SKIP，不虚构
+python3 scripts/selfcheck_v11.py
+```
+
+读取自动生成的凭据（绝不写入本仓库，默认也不打印到容器日志）：
+
+```bash
+sudo cat /etc/mcp-gateway/env                              # 原生，600 权限
+docker exec cnb-mcp-gateway cat /app/.env                 # Compose，MCP_TOKEN
+docker exec cnb-mcp-admin-web cat /data/audit/.admin_password   # Compose，管理员口令
+```
+
+需要**固定公网 HTTPS 入口**时设置 `MCP_PUBLIC_BASE_URL=https://mcp.example.com`，
+并在前面放 nginx 或 Cloudflare 命名隧道；默认只把端口发布到 `127.0.0.1`。
+未配置时 `download_file` 仍返回真实可用的链接，但会标注 `link_scope=local`，
+不假装是公网地址。
+
+两种方式都保留 Bearer + OAuth 2.1 PKCE/DCR、内置 Git LFS、SQLite WAL 审计，以及文件与任务日志持久卷。升级/回滚见下节；宿主机 Docker 授权需按后文显式叠加 override 文件。
+
+### 升级与回滚
+
+- 原生：`sudo ./scripts/install-native.sh --upgrade` 会把旧代码备份到 `/opt/mcp-gateway/app.previous`，`--rollback` 恢复备份并重启两个单元；数据与 `/etc/mcp-gateway/env` 从不动。
+- Compose：修改 `.env` 中的 `MCP_IMAGE` 标签后 `docker compose up -d`；回滚把标签改回上一个可用值（如 `ghcr.io/ninaawa/cnb-mcp-gateway-plus:v3.1.1`）再 `up -d`。升级前先记录当前镜像 digest 与 `docker inspect` 启动参数作为回滚锚点。
+- 有意不覆盖 `v3.1.0` 标签与旧 package `cnb-mcp-gateway`。
+
+### Docker socket 权限（务必阅读）
+
+容器内 root **不等于**宿主机 root。只有挂载 `/var/run/docker.sock` 才实质获得宿主机 root 能力（可启动特权容器、挂载宿主根目录、读取任意文件）。默认关闭，且必须同时设置 `MCP_DOCKER_SOCKET=1` 并叠加 override 文件。该 override 还会只读挂载宿主机的静态 `docker` CLI（路径不同时用 `MCP_HOST_DOCKER_CLI` 指定 `command -v docker` 的结果），因此授权后 `run_command` 里的 `docker ps` / `docker build` 确实可执行；即使不挂 CLI，`docker_status` 也会用标准库直接读 socket 的 Engine API 返回真实容器状态。原生 systemd 部署直接复用宿主机 Docker，无需该授权。
+
+### 验证
+
+`python3 scripts/selfcheck_v11.py` 会对真实运行的服务执行 T01–T12，逐项打印真实命令、输出摘录与 PASS/FAIL/SKIP；任何失败或跳过都明确说明，绝不虚构。凭据优先取 `MCP_TOKEN` / `ADMIN_PASSWORD` 环境变量，未设置时自动从容器内的 `/app/.env` 与 `/data/audit/.admin_password` 读取首次启动生成的值。`--skip-restart` 会跳过 T10 的真实容器重启并标记为 SKIP。单元测试：`pytest -q`。
+
 ## 为什么做这个
 
 你想让 AI agent 能**从任意位置在你的服务器上执行命令**，但又不想直接给一个开放 shell。这个网关把一组受控工具（带令牌门、确认门与危险黑名单安全网、完整审计日志）暴露出来，而不是裸 shell。
@@ -152,11 +206,26 @@ Authorization: Bearer <MCP_TOKEN>
 | `MCP_GIT_EXTRA_SUBCOMMANDS` | （空） | 额外放行的 git 子命令（逗号分隔）；未知子命令默认拒绝，防止 alias 隐藏删除操作。 |
 | `MCP_PRINT_SECRETS` | `0` | `1` = 在容器日志打印 `MCP_TOKEN` 与管理员口令（仅隔离环境使用）；默认只写文件。 |
 
+### v1.1 命令 / 文件 / 长任务 / Docker 变量
+
+| 变量 | 默认值 | 含义 |
+|---|---|---|
+| `MCP_IMAGE` | `.../plus:v1.1.0` | 镜像标签；升级/回滚只需切换该标签再 `up -d`。 |
+| `MCP_MAX_OUTPUT_BYTES` | `2000000` | 单次命令 stdout/stderr 上限（超出会在结果里明确标注截断）。 |
+| `MCP_FILE_ROOT` | `/data/files` | 二进制传输的受管根目录：所有路径 `resolve()` 后必须位于其中；`.git`、`.ssh`、`.env`、私钥与令牌文件一律拒绝。 |
+| `MCP_FILE_CHUNK_BYTES` | `1048576` | base64 分片上限（钳制在 4096..8 MiB）；签名 HTTP 下载为流式读取，不受此限制。 |
+| `MCP_TASK_LOG_DIR` | `/data/audit/task-logs` | 长任务日志持久目录，重启后仍可读。 |
+| `MCP_PUBLIC_BASE_URL` | （空） | `download_file` 绝对签名链接的公网 HTTPS 前缀；留空回落到请求 Host，仅适合本机 `curl` 验证。 |
+| `MCP_FILE_SIGNING_SECRET` | （空 → `MCP_TOKEN`） | 短时效下载链接的 HMAC 密钥；网关与管理后台必须看到同一个值。 |
+| `MCP_DOCKER_SOCKET` | `0` | `1` 且叠加 `docker-compose.host-docker.yml` 才挂载 `/var/run/docker.sock`；该权限等价宿主机 root。 |
+| `MCP_HOST_PORT` / `MCP_BIND_HOST` | `8765` / `127.0.0.1` | 网关发布到宿主机的端口与绑定地址（默认仅回环）。 |
+| `MCP_ALLOWED_PREFIXES` | （空 = 全部允许） | **仅是可选取紧开关**：留空即 v1.1 默认管理员模式；无论是否设置，Git 删除硬禁、毁灭级黑名单、`confirm` 确认门与全量审计都始终生效。 |
+
 ### Admin Dashboard 与审计变量（Compose 读取项目根目录 `.env`）
 
 | 变量 | 默认值 | 含义 |
 |---|---|---|
-| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / `admin` | 后台独立管理员账号；默认弱口令仅限隔离环境，建议用强 `ADMIN_PASSWORD` 覆盖。生效口令以 600 权限持久化在 `audit-data` 卷。 |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / 随机生成 | 后台独立管理员账号；不再内置弱口令。留空即首次启动生成强随机口令，以 600 权限持久化在 `audit-data` 卷并在容器重建时复用；显式指定优先。 |
 | `ADMIN_SESSION_SECRET` | （空 = 重启后旧会话失效） | 会话 Cookie 的 HMAC 签名密钥。 |
 | `ADMIN_SESSION_TTL` | `28800` | 会话有效期（秒）。 |
 | `ADMIN_LOGIN_MAX_FAILURES` / `ADMIN_LOGIN_LOCK_MINUTES` | `5` / `15` | 失败次数上限与锁定窗口。 |
@@ -167,7 +236,7 @@ Authorization: Bearer <MCP_TOKEN>
 | `AUDIT_STRICT` | `0` | `1` = 审计存储不可用时拒绝高风险工具；默认降级放行，不中断实验。 |
 | `AUDIT_RETENTION_DAYS` / `AUDIT_MAX_DB_MB` | `90` / `512` | 归档保留天数与数据库配额。 |
 | `AUDIT_BACKUP_KEEP` / `AUDIT_MAINTENANCE_INTERVAL` | `7` / `300` | 备份保留数量与维护间隔（秒）。 |
-| `MCP_TUNNEL_DISABLED` | `0` | 启用独立 `cloudflared` 服务时设为 `1`。 |
+| `MCP_TUNNEL_DISABLED` | `1` | 内置随机 quick tunnel 默认关闭（域名每次变化、且会把默认管理员模式直接暴露公网）。固定入口请用 nginx 反代，或填 `CF_TUNNEL_TOKEN` 并 `docker compose --profile tunnel up -d`；仅确实需要随机临时域名时才设为 `0`。 |
 
 完整变量见 [`docker/.env.template`](./docker/.env.template)，部署细节见
 [部署与运维文档](./docs/admin-dashboard.zh-CN.md)。
@@ -320,9 +389,10 @@ read_image(path="/workspace/results/loss_curve.png", max_dim=1024)
 ## 安全说明
 
 - `MCP_TOKEN` 本质上是一把**远程 shell 钥匙**。像密码一样对待它，只分享给你信任的 agent。默认网关是**开放**的（无白名单）；如果你更保守，可以用 `MCP_ALLOWED_PREFIXES` 收紧。
-- 单容器模式只监听 `127.0.0.1`；Compose 模式下网关监听容器网络 `0.0.0.0` 但**不发布宿主端口**，
-  由 Cloudflare 终结 TLS 并暴露公网端点。管理后台默认只发布到宿主 `127.0.0.1:8788`，
-  且始终要求独立管理员登录。
+- 单容器模式只监听 `127.0.0.1`。v1.1 Compose 为了方便本机自检与反向代理，把网关发布到
+  `127.0.0.1:${MCP_HOST_PORT:-8765}`；这**不是**开放服务——`/mcp`、`/run_command` 及所有工具路由
+  仍强制校验 Bearer 令牌。管理后台默认只发布到宿主 `127.0.0.1:8788`，且始终要求独立管理员登录。
+  两者都保持回环绑定，公网固定 HTTPS 入口请用 nginx 或 Cloudflare 隧道。
 - 检索工具只访问固定域名白名单，限制响应体积并按来源限速；`read_web_page` 默认关闭，开启后也会拦截非 HTTPS、IP 字面量与私网地址（含跳转目标）。
 - 外部数据源返回的标题、摘要与正文都是**不可信数据**，工具输出会明确标注，避免提示注入；不要把它们当作指令执行。
 - 被执行过的命令，以及检索活动（查询词、来源、耗时、结果条数）都会写入容器内的 `/app/audit.log`；写入前统一脱敏并截断，命令里的 `TOKEN=...` / 连接串口令不会以明文落盘。
@@ -332,7 +402,7 @@ read_image(path="/workspace/results/loss_curve.png", max_dim=1024)
   后台写操作额外校验 Origin / Sec-Fetch-Site，登录锁定默认不信任可伪造的 `X-Forwarded-For`。
   详见 [部署与运维文档](./docs/admin-dashboard.zh-CN.md)。
 - 公网免鉴权的 `/health` 只返回最小存活状态；系统指标与工具数量改由需 Bearer 的 `/internal/metrics` 提供，后台用 `MCP_TOKEN` 读取。
-- `MCP_TOKEN` 与生效管理员口令**默认不再打印到容器日志**，分别从 `/app/.env` 与 `/data/audit/.admin_password` 读取；后台默认口令为 `admin`，任何网络可达的部署都应覆盖为强口令。OAuth 默认强制 S256 PKCE、校验 `redirect_uri`、签发的 token 有过期并会回收。
+- `MCP_TOKEN` 与生效管理员口令**默认不再打印到容器日志**，分别从 `/app/.env` 与 `/data/audit/.admin_password` 读取；后台不再内置弱口令，留空时首次启动生成强随机值、以 600 权限持久化并在容器重建时复用。OAuth 默认强制 S256 PKCE、校验 `redirect_uri`、签发的 token 有过期并会回收。
 - ⚠️ **密钥提醒**：如果你用的是共享/明文出现的 PAT 或令牌，建议用完后立即在对应平台撤销并轮换；agent 用的 Git 凭据务必最小权限，并在远端开启分支保护（见 [Git 删除保护](#git-删除保护硬约束)）。
 
 ## 从源码构建

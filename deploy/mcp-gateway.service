@@ -1,0 +1,28 @@
+[Unit]
+Description=CNB MCP Gateway v1.1 (self-hosted Linux remote control)
+Documentation=https://github.com/NinaAWA/cnb-mcp-gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 默认管理员模式：以 root 运行才能安装软件、管理容器与复用宿主机 GPU/驱动。
+# 如需降权，用 scripts/install-native.sh 的 MCP_SERVICE_USER=<user> 覆盖，
+# 并自行把该用户加入 docker 组、配置免密 sudo（降权后 apt 等操作会失败）。
+User=root
+WorkingDirectory=/opt/mcp-gateway/app
+EnvironmentFile=/etc/mcp-gateway/env
+Environment=PYTHONPATH=/opt/mcp-gateway/app
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/mcp-gateway/venv/bin/uvicorn server:app --host 127.0.0.1 --port 8765 --log-level info
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+# 防止 fork bomb 拖垮宿主机；不启用 privileged 等价能力
+LimitNPROC=2048
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

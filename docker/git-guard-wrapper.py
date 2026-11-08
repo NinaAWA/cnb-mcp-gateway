@@ -21,6 +21,8 @@ except Exception as exc:  # fail-closed：防护不可用时不执行任何 git 
     print(f"[git-guard] 防护模块不可用，拒绝执行 git: {exc!r}", file=sys.stderr)
     raise SystemExit(128)
 
+# LFS 放行清单（install / pull / checkout / pre-push 等）由 gateway.git_guard 统一维护：
+# 工具层、REST 层与本 wrapper 进程层共用同一 check_argv 判定，不会出现两层结论冲突。
 decision = check_argv(sys.argv[1:])
 if not decision.allowed:
     print(deny_message(decision), file=sys.stderr)

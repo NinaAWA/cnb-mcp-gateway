@@ -3,21 +3,34 @@
 # 本地构建使用仓库根作为 context，包含 gateway/ 统一采集层。
 services:
   mcp-gateway:
-    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway:latest}
+    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway-plus:v1.1.0}
     build:
       context: .
       dockerfile: docker/Dockerfile
     container_name: cnb-mcp-gateway
     restart: unless-stopped
     environment:
-      # 只监听容器网络：宿主端口不发布，公网入口由 cloudflared 提供。
+      # v1.1：网关只发布到宿主回环（见下方 ports），公网入口由 HTTPS 反代 / 隧道提供；
+      # 容器内监听 0.0.0.0 便于同网络服务访问，但 /mcp 始终强制 Bearer。
       - MCP_BIND=0.0.0.0
       - MCP_PORT=8765
       - MCP_WORKDIR=/workspace
       - MCP_TOKEN=${MCP_TOKEN:-}
+      # v1.1 默认管理员模式：留空即放行全部日常管理命令。这里只是可选的收紧开关，
+      # 绝不要填成 "git status|ls|python3 /workspace" 这类过窄白名单。
       - MCP_ALLOWED_PREFIXES=${MCP_ALLOWED_PREFIXES:-}
       - MCP_DENY_PREFIXES=${MCP_DENY_PREFIXES:-}
       - MCP_REQUIRE_CONFIRM=${MCP_REQUIRE_CONFIRM:-}
+      - MCP_MAX_OUTPUT_BYTES=${MCP_MAX_OUTPUT_BYTES:-2000000}
+      - MCP_FILE_ROOT=/data/files
+      - MCP_FILE_CHUNK_BYTES=${MCP_FILE_CHUNK_BYTES:-1048576}
+      # 网关与管理后台必须看到同一个签名密钥，否则 download_file 返回的链接跨服务无法校验。
+      # 留空时两侧一致回落到 MCP_TOKEN；显式配置时必须两个服务都注入。
+      - MCP_FILE_SIGNING_SECRET=${MCP_FILE_SIGNING_SECRET:-}
+      - MCP_PUBLIC_BASE_URL=${MCP_PUBLIC_BASE_URL:-}
+      # 只有叠加 docker-compose.host-docker.yml 并显式设为 1 时才挂载宿主机 docker.sock。
+      # 该权限等价于宿主机 root，默认必须关闭。
+      - MCP_DOCKER_SOCKET=${MCP_DOCKER_SOCKET:-0}
       - MCP_SEARCH_TIMEOUT=${MCP_SEARCH_TIMEOUT:-}
       - MCP_SEARCH_MAX_RESULTS=${MCP_SEARCH_MAX_RESULTS:-}
       - MCP_SEARCH_MAX_BYTES=${MCP_SEARCH_MAX_BYTES:-}
@@ -53,7 +66,14 @@ services:
     volumes:
       - ./workspace:/workspace
       - audit-data:/data/audit
-    # 不给 docker.sock、不启用 privileged；仅限制提权与进程数（防 fork bomb）。
+      - files-data:/data/files
+    # 仅发布到宿主回环地址，方便本机自检 / 反向代理；公网入口仍由 HTTPS 隧道或反代提供。
+    # 网关自身对 /mcp 等路径强制 Bearer，不会因回环发布而变成开放服务。
+    ports:
+      - "${MCP_BIND_HOST:-127.0.0.1}:${MCP_HOST_PORT:-8765}:8765"
+    # 默认不给 docker.sock、不启用 privileged；仅限制提权与进程数（防 fork bomb）。
+    # 需要控制宿主机 Docker 时叠加 -f docker-compose.host-docker.yml，并显式设置
+    # MCP_DOCKER_SOCKET=1；该授权等价于宿主机 root，请自行评估风险。
     # 保留 root 是为了让 agent 能装依赖/跑实验；生产可改用非 root + UID 映射挂载。
     security_opt:
       - no-new-privileges:true
@@ -66,7 +86,7 @@ services:
       start_period: 20s
 
   mcp-admin-web:
-    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway:latest}
+    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway-plus:v1.1.0}
     container_name: cnb-mcp-admin-web
     restart: unless-stopped
     depends_on:
@@ -77,8 +97,8 @@ services:
       - ADMIN_BIND=0.0.0.0
       - ADMIN_PORT=8788
       - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
-      # 留空回落到镜像默认 admin；公网 / 生产环境务必设置强口令。
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
+      # 留空 = entrypoint 首次启动随机生成并持久化到 600 权限文件；不再内置弱口令
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
       - ADMIN_SESSION_SECRET=${ADMIN_SESSION_SECRET:-}
       - ADMIN_SESSION_TTL=${ADMIN_SESSION_TTL:-28800}
       - ADMIN_LOGIN_MAX_FAILURES=${ADMIN_LOGIN_MAX_FAILURES:-5}
@@ -91,6 +111,11 @@ services:
       - AUDIT_DB_DSN=${AUDIT_DB_DSN:-}
       - AUDIT_EXPORT_DIR=/data/audit/exports
       - MCP_TASK_LOG_DIR=/data/audit/task-logs
+      - MCP_FILE_ROOT=/data/files
+      - MCP_FILE_CHUNK_BYTES=${MCP_FILE_CHUNK_BYTES:-1048576}
+      - MCP_FILE_SIGNING_SECRET=${MCP_FILE_SIGNING_SECRET:-}
+      - MCP_PUBLIC_BASE_URL=${MCP_PUBLIC_BASE_URL:-}
+      - MCP_DOCKER_SOCKET=${MCP_DOCKER_SOCKET:-0}
       # 后台用 MCP_TOKEN 读取网关的受保护内部指标（不能用于登录后台）
       - MCP_TOKEN=${MCP_TOKEN:-}
       - ADMIN_TRUST_PROXY=${ADMIN_TRUST_PROXY:-0}
@@ -104,6 +129,7 @@ services:
       - "${ADMIN_BIND_HOST:-127.0.0.1}:${ADMIN_HOST_PORT:-8788}:8788"
     volumes:
       - audit-data:/data/audit
+      - files-data:/data/files
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8788/healthz"]
       interval: 30s
@@ -112,7 +138,7 @@ services:
       start_period: 15s
 
   audit-storage:
-    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway:latest}
+    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway-plus:v1.1.0}
     container_name: cnb-audit-storage
     restart: unless-stopped
     environment:
@@ -139,7 +165,7 @@ services:
   # 可选 HTTPS 入口：docker compose --profile tunnel up -d
   # 同时在 .env 设置 MCP_TUNNEL_DISABLED=1，避免网关内置 quick tunnel 重复暴露。
   cloudflared:
-    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway:latest}
+    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway-plus:v1.1.0}
     profiles: ["tunnel"]
     container_name: cnb-mcp-cloudflared
     restart: unless-stopped
@@ -173,4 +199,6 @@ services:
 
 volumes:
   audit-data:
+  # 分片上传、原子落盘后的二进制文件与上传票据都在这里，重建容器不丢
+  files-data:
   pg-data:

@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
 os.environ.update({
     "AUDIT_DB_PATH": "/tmp/mcp-audit-tests/audit.db",
     "AUDIT_EXPORT_DIR": "/tmp/mcp-audit-tests/exports",
+    "MCP_TASK_LOG_DIR": "/tmp/mcp-audit-tests/task-logs",
     "ADMIN_USERNAME": "admin",
     "ADMIN_PASSWORD": "TestPassword-123",
     "ADMIN_SESSION_SECRET": "test-session-secret",

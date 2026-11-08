@@ -14,6 +14,7 @@ import io
 import json
 import os
 import re
+import shutil
 import threading
 import time
 import urllib.parse
@@ -34,7 +35,10 @@ from pydantic import BaseModel
 
 from gateway.audit.redaction import redact_text
 from gateway.audit.storage import get_storage
+from gateway.files import service as file_service
+from gateway.files.service import FileTransferError
 from gateway.monitoring.system import collect
+from gateway.tasks.store import get_task_store
 from .auth import COOKIE_NAME, get_auth
 
 BASE_DIR = Path(__file__).parent
@@ -118,14 +122,16 @@ CONFIG_WHITELIST = (
     "MCP_SEARCH_CACHE_TTL", "MCP_SEARCH_ARXIV_MIN_INTERVAL",
     "MCP_SEARCH_WEB_PROVIDERS", "MCP_SEARCH_FETCH_ENABLED",
     "MCP_OAUTH_REQUIRE_PKCE", "MCP_TRUST_PROXY", "ADMIN_TRUST_PROXY",
-    "MCP_GIT_EXTRA_SUBCOMMANDS",
+    "MCP_GIT_EXTRA_SUBCOMMANDS", "MCP_MAX_OUTPUT_BYTES", "MCP_FILE_ROOT",
+    "MCP_FILE_CHUNK_BYTES", "MCP_TASK_LOG_DIR", "MCP_PUBLIC_BASE_URL",
+    "MCP_DOCKER_SOCKET",
     "AUDIT_STRICT", "AUDIT_RETENTION_DAYS", "AUDIT_MAX_DB_MB",
     "ADMIN_SESSION_TTL", "ADMIN_LOGIN_MAX_FAILURES", "ADMIN_LOGIN_LOCK_MINUTES",
 )
 SENSITIVE_CONFIG = (
     "MCP_TOKEN", "ADMIN_PASSWORD", "ADMIN_SESSION_SECRET", "ADMIN_TOTP_SECRET",
     "CF_TUNNEL_TOKEN", "MCP_SEARCH_TAVILY_KEY", "MCP_SEARCH_MAILTO",
-    "MCP_SEARCH_SEARXNG_URL", "AUDIT_DB_DSN",
+    "MCP_SEARCH_SEARXNG_URL", "AUDIT_DB_DSN", "MCP_FILE_SIGNING_SECRET",
 )
 EDITABLE_SETTINGS = ("default_range", "page_size", "theme")
 
@@ -289,6 +295,32 @@ def _filters(request: Request) -> dict[str, Any]:
 
 
 # ------------------------------------------------------------------ dashboard
+def _file_root_disk() -> dict[str, Any]:
+    """受管文件目录所在文件系统的容量（不扫描全盘，只做一次 statvfs）。"""
+    try:
+        usage = shutil.disk_usage(str(file_service.file_root()))
+        total = usage.total
+        return {
+            "path": str(file_service.file_root()),
+            "total_bytes": total,
+            "used_bytes": usage.used,
+            "free_bytes": usage.free,
+            "percent": round(usage.used / total * 100, 1) if total else 0,
+        }
+    except OSError as exc:
+        return {"path": "", "available": False, "error": str(exc)}
+
+
+def _file_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "transfers": len(rows),
+        "uploads": sum(1 for r in rows if r.get("direction") == "upload"),
+        "downloads": sum(1 for r in rows if r.get("direction") == "download"),
+        "failed": sum(1 for r in rows if r.get("status") == "FAILED"),
+        "total_bytes": sum(int(r.get("size") or 0) for r in rows),
+    }
+
+
 @app.get("/api/dashboard")
 def dashboard(request: Request, session: dict = Depends(require_admin)):
     storage = get_storage()
@@ -319,6 +351,15 @@ def dashboard(request: Request, session: dict = Depends(require_admin)):
         "monitoring": monitoring,
         "recent_errors": storage.recent_errors(12),
         "audit": storage.health(),
+        "file_root_disk": _file_root_disk(),
+        "disks": monitoring.get("disks") or [],
+        "files": _file_summary(storage.file_transfers(200)),
+        "tasks": [
+            {"task_id": t.task_id, "status": t.status, "exit_code": t.exit_code,
+             "command": redact_text(t.command), "started_at": t.started_at,
+             "finished_at": t.finished_at, "detail": redact_text(t.detail)}
+            for t in get_task_store().list_recent(100)
+        ],
     }
 
 
@@ -394,7 +435,8 @@ async def live_stream(request: Request, session: dict = Depends(require_admin)):
             events = storage.recent_events(last, 100)
             for event in events:
                 last = event["id"]
-                if event["kind"] in ("tool_call", "task_lifecycle", "admin_auth"):
+                if event["kind"] in ("tool_call", "task_lifecycle", "admin_auth",
+                                    "file_transfer"):
                     yield "data: " + json.dumps(
                         {k: str(v) if not isinstance(v, (int, float, bool, type(None))) else v
                          for k, v in event.items()}, ensure_ascii=False
@@ -412,7 +454,13 @@ async def live_stream(request: Request, session: dict = Depends(require_admin)):
 
 @app.get("/api/git")
 def git_ops(request: Request, session: dict = Depends(require_admin)):
-    return {"rows": get_storage().git_ops(request.query_params.get("repo", ""), 200)}
+    rows = get_storage().git_ops(request.query_params.get("repo", ""), 200)
+    return {
+        "rows": rows,
+        "recent_commits": [r for r in rows if r.get("operation") == "commit"][:10],
+        "recent_pushes": [r for r in rows if r.get("operation") == "push"][:10],
+        "note": "提交与推送记录来自统一采集层；git_push 工具另以 ls-remote 核验远端 HEAD。",
+    }
 
 
 @app.get("/api/experiments")
@@ -441,7 +489,102 @@ def experiment_logs(task_id: str, request: Request,
 
 @app.get("/api/tasks")
 def tasks(session: dict = Depends(require_admin)):
-    return {"rows": get_storage().tasks(200)}
+    """后台任务视图：生命周期事件 + SQLite 持久状态（含重启后的 unknown）。"""
+    rows = get_storage().tasks(200)
+    persisted = {t.task_id: t for t in get_task_store().list_recent(500)}
+    latest: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        tid = str(row.get("task_id") or "")
+        if tid:
+            latest[tid] = row
+    merged = []
+    for tid, row in latest.items():
+        state = persisted.get(tid)
+        merged.append({
+            **row,
+            "persisted_status": state.status if state else "",
+            "exit_code": state.exit_code if state else None,
+            "started_at": state.started_at if state else None,
+            "finished_at": state.finished_at if state else None,
+            "detail": state.detail if state else "",
+        })
+    merged.sort(key=lambda row: str(row.get("ts") or ""), reverse=True)
+    known = set(latest)
+    return {
+        "rows": merged,
+        "orphaned": [
+            {"task_id": t.task_id, "status": t.status, "exit_code": t.exit_code,
+             "command": redact_text(t.command), "log_path": t.log_path,
+             "started_at": t.started_at, "finished_at": t.finished_at,
+             "detail": redact_text(t.detail)}
+            for t in persisted.values() if t.task_id not in known
+        ],
+        "note": "unknown 表示服务重启后无法确认真实退出码，绝不按成功统计。",
+    }
+
+
+@app.get("/api/files")
+def files(request: Request, session: dict = Depends(require_admin)):
+    """文件传输记录：只展示路径、大小、摘要、方向与终态，绝不展示分片内容。"""
+    rows = get_storage().file_transfers(200, request.query_params.get("keyword", ""))
+    return {"rows": rows, "summary": _file_summary(rows),
+            "note": "分片内容、环境变量、标准输入与签名 token 不写入审计。"}
+
+
+class FileUploadBody(BaseModel):
+    path: str
+    content_base64: str = ""
+    offset: int = 0
+    total_size: int = 0
+    sha256: str = ""
+    overwrite: bool = False
+    finish: bool = True
+    ticket: str = ""
+
+
+@app.post("/files/upload")
+def admin_file_upload(body: FileUploadBody, session: dict = Depends(require_admin)):
+    """管理网站分片上传（管理员会话鉴权）；与 MCP 工具共用同一服务与审计。"""
+    started = time.monotonic()
+    try:
+        if not body.ticket:
+            begun = file_service.upload_begin(
+                body.path, body.total_size, body.sha256, body.overwrite)
+            ticket, display = begun["ticket"], begun["path"]
+        else:
+            ticket, display = body.ticket, body.path
+        chunk = (file_service.upload_chunk(ticket, body.offset, body.content_base64)
+                 if body.content_base64 else file_service.upload_state(ticket))
+        info = (file_service.upload_finish(ticket) if body.finish
+                else {"path": chunk["path"], "size": chunk["offset"], "sha256": ""})
+        result = info if body.finish else {**info, "ticket": ticket,
+                                           "offset": chunk["offset"], "finish": False}
+        file_service.record_transfer(
+            "admin_file_upload", display, direction="upload", status="SUCCESS",
+            size=int(result.get("size") or 0), sha256=str(result.get("sha256") or ""),
+            duration_ms=int((time.monotonic() - started) * 1000))
+        return result
+    except (FileTransferError, OSError, ValueError) as exc:
+        message = f"ERROR: {exc}"
+        file_service.record_transfer("admin_file_upload", body.path, direction="upload",
+                                     status="FAILED", error_message=message)
+        raise HTTPException(status_code=400, detail=message) from exc
+
+
+@app.get("/files/download")
+def admin_file_download(request: Request, session: dict = Depends(require_admin)):
+    """管理网站内下载（需登录）；支持浏览器 Range 续传。公网免登录链接由网关
+    /files/download 的 HMAC 签名 token 提供，两者鉴权路径彼此独立。"""
+    key = request.query_params.get("path", "")
+    try:
+        target = file_service.resolve_path(key)
+    except FileTransferError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    get_storage().add_event("file_transfer", status="DOWNLOAD", source="admin",
+                            tool_name="admin_file_download", detail={"path": key})
+    return FileResponse(target, filename=target.name)
 
 
 @app.get("/api/clients")

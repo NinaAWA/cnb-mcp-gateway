@@ -20,8 +20,14 @@ SENSITIVE_KEY_PARTS = (
     "token", "password", "passwd", "secret", "api_key", "apikey", "access_key",
     "private_key", "credential", "authorization", "auth_header", "cookie",
     "session_key", "ssh_key", "bearer", "otp", "totp", "mfa", "passphrase",
-    "dsn", "connection_string", "conn_str", "database_url",
+    "dsn", "connection_string", "conn_str", "database_url", "content_base64",
+    "chunk_base64", "base64",
 )
+
+# 这些参数名下的整个值一律不入库：环境变量值、标准输入、分片内容、签名材料。
+SENSITIVE_EXACT_KEYS = frozenset({
+    "env", "stdin", "content_base64", "chunk_base64", "upload_chunk", "signature",
+})
 
 # 值内容特征：即使键名无害也要替换
 SECRET_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
@@ -52,6 +58,15 @@ _ASSIGNMENT_SECRET_RE = re.compile(
     r"DSN|CONNECTION|DATABASE_URL)[A-Z0-9_]*)\s*=\s*(['\"]?)([^\s'\"&,;]{1,})\2"
 )
 
+# 工具返回文本里的 base64 分片（整行）绝不入库：保留键名、替换值。
+_BASE64_PAYLOAD_RE = re.compile(
+    r"(?m)^((?:content_base64|chunk_base64|data_base64|file_base64)\s*[=:]\s*)"
+    r"[A-Za-z0-9+/=]{16,}\s*$", re.IGNORECASE,
+)
+
+# 签名下载链接里的短时效 token 也是凭据：保留链接其余部分，只替换该参数值。
+_DOWNLOAD_TOKEN_RE = re.compile(r"([?&]token=)[A-Za-z0-9._~+/-]+", re.IGNORECASE)
+
 _MAX_DEPTH = 12
 
 
@@ -60,6 +75,8 @@ def redact_text(value: Any, *, limit: int = 0) -> str:
     if value is None:
         return ""
     text = value if isinstance(value, str) else str(value)
+    text = _BASE64_PAYLOAD_RE.sub(lambda m: f"{m.group(1)}{REDACTED}", text)
+    text = _DOWNLOAD_TOKEN_RE.sub(lambda m: f"{m.group(1)}{REDACTED}", text)
     text = _ASSIGNMENT_SECRET_RE.sub(lambda m: f"{m.group(1)}={REDACTED}", text)
     for pattern in SECRET_PATTERNS:
         text = pattern.sub(REDACTED, text)
@@ -77,7 +94,8 @@ def redact_structure(value: Any, _depth: int = 0) -> Any:
         out = {}
         for key, item in value.items():
             keyname = str(key)
-            if any(part in keyname.lower() for part in SENSITIVE_KEY_PARTS):
+            lowered = keyname.lower()
+            if lowered in SENSITIVE_EXACT_KEYS or any(part in lowered for part in SENSITIVE_KEY_PARTS):
                 out[key] = REDACTED
             else:
                 out[key] = redact_structure(item, _depth + 1)
