@@ -34,43 +34,14 @@
 **Docker / Compose（无 systemd 的主机推荐）** —— 整块粘贴，部署、等就绪、打印配置一次完成：
 
 ```bash
-(
-set -e
-DEST=/workspace/mcp-gateway-v11
-
-# 先删除之前的部署：compose 里容器名写死，来自其他项目目录的旧实例也会冲突
-for name in cnb-mcp-gateway cnb-mcp-admin-web cnb-audit-storage cnb-mcp-cloudflared cnb-mcp-postgres; do
-  docker rm -f "$name" >/dev/null 2>&1 || true
-done
-
-if [ -d "$DEST/.git" ]; then git -C "$DEST" pull --ff-only; else git clone https://github.com/NinaAWA/cnb-mcp-gateway.git "$DEST"; fi
-cd "$DEST"
-for f in .env.example docker-compose.yml; do [ -f "$f" ] || { echo "缺少 $f：请确认代码来源包含 v1.1"; exit 1; }; done
-# 需要连数据卷一起清空时加 PURGE_DATA=1（会丢失审计记录、文件与自动生成的凭据）
-if [ "${PURGE_DATA:-0}" = "1" ]; then docker compose down -v --remove-orphans; fi
-[ -f .env ] || cp .env.example .env && docker compose up -d --build
-for i in $(seq 1 60); do curl -fsS http://127.0.0.1:8765/health >/dev/null 2>&1 && curl -fsS http://127.0.0.1:8788/healthz >/dev/null 2>&1 && break; sleep 2; done
-if [ -f scripts/show-config.sh ]; then
-  bash scripts/show-config.sh
-else
-  # 该 main 尚未合并 show-config.sh 时，用最小内联方式打印同一批信息（默认端口）
-  TOKEN="$(docker exec cnb-mcp-gateway sed -n 's/^MCP_TOKEN=//p' /app/.env | head -1)"
-  PASS="$(docker exec cnb-mcp-admin-web cat /data/audit/.admin_password)"
-  printf 'MCP_URL    http://127.0.0.1:8765/mcp\nBearer     %s\n客户端配置:\n{\n  "mcpServers": {\n    "cnb-gateway": {\n      "url": "http://127.0.0.1:8765/mcp",\n      "headers": {\n        "Authorization": "Bearer %s"\n      }\n    }\n  }\n}\nAdmin Web  http://127.0.0.1:8788/\n账号       admin\n口令       %s\n' "$TOKEN" "$TOKEN" "$PASS"
-fi
-)
+# 初次部署（已部署时从项目目录重新执行同一脚本即可）
+git clone https://github.com/NinaAWA/cnb-mcp-gateway.git /workspace/mcp-gateway-v11
+bash /workspace/mcp-gateway-v11/scripts/deploy-docker.sh
 ```
 
-终端会直接打印：**可远程连接的公网 MCP 地址**（默认随机 `https://<域名>.trycloudflare.com/mcp`）、
-Bearer Token、分行缩进、可直接复制的 `mcpServers` JSON、管理网站地址、管理员账号与口令、
-两个健康检查地址。重复执行会复用同一目录且不会覆盖 `.env`。
+升级时直接重新运行 `bash /workspace/mcp-gateway-v11/scripts/deploy-docker.sh`。脚本拒绝接管其他 Compose 项目的同名容器，且不会删除数据卷。
 
-重复执行会**先删除之前的部署**（按固定的 `cnb-*` 容器名清理，不论旧实例在哪个目录），
-再重新部署，因此不会再出现容器名冲突。默认保留命名卷；需要连审计记录、文件与
-自动生成的凭据一起清空时，在命令前加 `PURGE_DATA=1`。
-
-**原生 Linux + systemd**（能力最完整：复用宿主机软件、GPU、驱动与 Docker；
-需要真实 systemd 与 root，不是 `sudo`）：
+**原生 Linux + systemd**（直接使用宿主机工具链、GPU 与 Docker；需要 root 和 systemd）：
 
 ```bash
 git clone https://github.com/NinaAWA/cnb-mcp-gateway.git && cd cnb-mcp-gateway && ./scripts/install-native.sh

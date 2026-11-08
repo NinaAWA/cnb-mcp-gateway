@@ -17,6 +17,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r docker/requirements.txt -r requirements-dev.txt
+      - name: Validate deployment shell scripts
+        run: |
+          bash -n scripts/deploy-docker.sh scripts/install-native.sh docker/entrypoint.sh
       - name: Lint (syntax / undefined names)
         run: ruff check .
       - name: Tests
