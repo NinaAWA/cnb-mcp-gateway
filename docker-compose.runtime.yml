@@ -39,28 +39,21 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${MCP_HOST_DOCKER_CLI:-/usr/local/bin/docker}:/usr/local/bin/docker:ro
 
+  # Cloudflare 官方镜像：独立隧道不再依赖 MCP 镜像中的 cloudflared 文件。
+  # pinned version prevents unexpected update; distroless entrypoint is
+  # cloudflared --no-autoupdate, so command contains only its subcommands.
   gateway-tunnel:
-    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway-plus:v1.1.0}
+    image: cloudflare/cloudflared:2026.10.7
     container_name: cnb-mcp-gateway-tunnel
     restart: unless-stopped
     depends_on:
       - mcp-gateway
-    environment:
-      - MCP_SERVICE_ROLE=cloudflared
-      # compose 主文件里的同名变量是硬编码的，必须在这里显式声明。
-      - MCP_UPSTREAM_URL=http://mcp-gateway:8765
-      # 必须为空，否则 entrypoint 走命名隧道分支并忽略上游地址。
-      - CF_TUNNEL_TOKEN=
-    command: ["/app/entrypoint.sh"]
+    command: ["tunnel", "--url", "http://mcp-gateway:8765"]
 
   admin-tunnel:
-    image: ${MCP_IMAGE:-ghcr.io/ninaawa/cnb-mcp-gateway-plus:v1.1.0}
+    image: cloudflare/cloudflared:2026.10.7
     container_name: cnb-mcp-admin-tunnel
     restart: unless-stopped
     depends_on:
       - mcp-admin-web
-    environment:
-      - MCP_SERVICE_ROLE=cloudflared
-      - MCP_UPSTREAM_URL=http://mcp-admin-web:8788
-      - CF_TUNNEL_TOKEN=
-    command: ["/app/entrypoint.sh"]
+    command: ["tunnel", "--url", "http://mcp-admin-web:8788"]
